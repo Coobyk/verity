@@ -28,6 +28,16 @@ pub struct TopicInfo {
 }
 
 #[derive(Debug, Clone)]
+pub struct GroupInfo {
+    /// Bot-API style chat id (`-100…` for supergroups, `-…` for basic).
+    pub chat_id: i64,
+    pub title: String,
+    /// `forum` (topics enabled), `group` (megagroup), `chat` (basic group),
+    /// `channel` (broadcast).
+    pub kind: &'static str,
+}
+
+#[derive(Debug, Clone)]
 pub struct TopicMessage {
     pub id: i32,
     pub date: i64,
@@ -131,6 +141,60 @@ impl Tg {
             }
         }
         Err(Error::Mtproto(format!("no group matches '{id_or_title}'")))
+    }
+
+    /// List every group/channel in your dialogs with Bot-API chat ids —
+    /// answers "what's my group_id" without external tools.
+    pub async fn list_groups(&self) -> Result<Vec<GroupInfo>> {
+        use grammers_client::types::Peer;
+        let mut out = Vec::new();
+        let mut dialogs = self.client.iter_dialogs();
+        while let Some(dialog) = dialogs
+            .next()
+            .await
+            .map_err(|e| Error::Mtproto(format!("dialogs: {e}")))?
+        {
+            let peer = dialog.peer();
+            let bare = peer.id().bare_id();
+            let info = match peer {
+                Peer::Group(g) if g.is_megagroup() => {
+                    let is_forum =
+                        matches!(&g.raw, tl::enums::Chat::Channel(c) if c.forum);
+                    GroupInfo {
+                        // supergroup chat_id = -100 concat bare channel id
+                        chat_id: -(1_000_000_000_000 + bare),
+                        title: peer.name().unwrap_or_default().to_string(),
+                        kind: if is_forum { "forum" } else { "group" },
+                    }
+                }
+                Peer::Group(_) => GroupInfo {
+                    chat_id: -bare,
+                    title: peer.name().unwrap_or_default().to_string(),
+                    kind: "chat",
+                },
+                Peer::Channel(_) => GroupInfo {
+                    chat_id: -(1_000_000_000_000 + bare),
+                    title: peer.name().unwrap_or_default().to_string(),
+                    kind: "channel",
+                },
+                Peer::User(_) => continue,
+            };
+            out.push(info);
+        }
+        Ok(out)
+    }
+
+    /// Rename a supergroup/channel via `channels.editTitle`.
+    /// (Basic groups would need `messages.editChatTitle` — not needed here.)
+    pub async fn rename_chat(&self, peer: PeerRef, title: &str) -> Result<()> {
+        self.client
+            .invoke(&tl::functions::channels::EditTitle {
+                channel: peer.into(),
+                title: title.to_string(),
+            })
+            .await
+            .map_err(|e| Error::Mtproto(format!("editTitle: {e}")))?;
+        Ok(())
     }
 
     /// List forum topics of a group via `messages.getForumTopics`.

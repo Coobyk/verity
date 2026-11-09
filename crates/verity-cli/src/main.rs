@@ -42,6 +42,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: BotCmd,
     },
+    /// List your supergroups with Bot-API chat ids (find your group_id)
+    Groups,
+    /// Rename the configured group (or one by id/title)
+    Rename {
+        title: String,
+        group: Option<String>,
+    },
     /// List forum topics in the configured group
     Topics {
         /// Group id or title substring (defaults to config group_id)
@@ -200,6 +207,20 @@ async fn main() -> Result<()> {
             .await?;
             tg.save_session(&Config::session_path()?)?;
             println!("logged in; session saved");
+        }
+
+        Cmd::Groups => {
+            let (tg, _) = authorized_tg().await?;
+            for g in tg.list_groups().await? {
+                println!("{:<16} {:<8} {}", g.chat_id, g.kind, g.title);
+            }
+        }
+
+        Cmd::Rename { title, group } => {
+            let (tg, cfg) = authorized_tg().await?;
+            let peer = tg.peer(&group_of(&cfg, group)?).await?;
+            tg.rename_chat(peer, &title).await?;
+            println!("renamed to {title}");
         }
 
         Cmd::Topics { group } => {
