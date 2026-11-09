@@ -465,18 +465,26 @@ async fn do_turn(env: &Env, bot: &Bot, topic_id: i64, text: &str, depth: u8) -> 
         (Some(tg), Some(peer)) => fetch_history(tg, peer, topic_id).await,
         _ => Vec::new(),
     };
+    let gkey = format!("greeted:{}", bot.name);
+    let first_contact = depth == 0
+        && matches!(db_call(&env.db, move |s| s.kv_get(&gkey)).await, Ok(None));
     let ctx = TurnContext {
         bot_name: bot.name.clone(),
         instructions: bot.instructions.clone(),
         memory,
         history,
         peers,
+        first_contact,
         cwd: std::env::current_dir().unwrap_or_else(|_| "/".into()),
         model: bot.model.clone(),
     };
 
     // 2. Work.
     let out = harness.run_turn(&ctx, text).await?;
+    if first_contact {
+        let gkey = format!("greeted:{}", bot.name);
+        let _ = db_call(&env.db, move |s| s.kv_set(&gkey, "1")).await;
+    }
     let (mut reply, markers) = extract_markers(&out.reply);
 
     // 3. Memory markers persist under the acting bot's name.
@@ -504,6 +512,7 @@ async fn do_turn(env: &Env, bot: &Bot, topic_id: i64, text: &str, depth: u8) -> 
             memory: vec![],
             history: vec![],
             peers: vec![],
+            first_contact: false,
             cwd: ctx.cwd.clone(),
             model: ctx.model.clone(),
         };

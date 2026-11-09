@@ -149,6 +149,23 @@ impl Store {
         Ok(())
     }
 
+    pub fn clear_memory(&self, name: &str) -> Result<()> {
+        let mut s = self.conn.prepare("DELETE FROM memory WHERE bot = ?")?;
+        s.bind((1, name))?;
+        s.next()?;
+        Ok(())
+    }
+
+    /// Forget a bot's forum topic (next turn recreates it).
+    pub fn clear_bot_topic(&self, name: &str) -> Result<()> {
+        let mut s = self
+            .conn
+            .prepare("UPDATE bots SET topic_id = NULL WHERE name = ?")?;
+        s.bind((1, name))?;
+        s.next()?;
+        Ok(())
+    }
+
     pub fn get_bot(&self, name: &str) -> Result<Option<Bot>> {
         Ok(self.list_bots()?.into_iter().find(|b| b.name == name))
     }

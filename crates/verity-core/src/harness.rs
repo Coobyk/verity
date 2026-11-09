@@ -37,6 +37,9 @@ pub struct TurnContext {
     /// Names of the other bots sharing the group (this bot excluded) —
     /// teammates reachable via `:::tell name: …:::`.
     pub peers: Vec<String>,
+    /// True on the bot's first-ever user turn: greet the sender by name
+    /// this once; never repeat it later.
+    pub first_contact: bool,
     /// Working directory for the agent.
     pub cwd: std::path::PathBuf,
     pub model: Option<String>,
@@ -59,6 +62,13 @@ fn system_prompt(ctx: &TurnContext) -> String {
          Follow these standing instructions:\n{}\n",
         ctx.bot_name, ctx.instructions
     );
+    if ctx.first_contact {
+        s.push_str(
+            "\nThis is the first message this user has ever sent you — \
+             open by addressing them by name with a quick warm hello, \
+             then be casual. Only this once.\n",
+        );
+    }
     if !ctx.memory.is_empty() {
         s.push_str("\nWhat you remember:\n");
         for (k, v) in &ctx.memory {

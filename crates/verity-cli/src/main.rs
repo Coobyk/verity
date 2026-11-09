@@ -42,6 +42,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: BotCmd,
     },
+    /// Wipe everything: bots, memory, state — clean slate (stop serve first)
+    Reset,
+    /// Clear a bot's memory
+    Clear { name: String },
+    /// Delete a bot's chat topic too (it recreates fresh on next message)
+    ClearChat { name: String },
     /// List your supergroups with Bot-API chat ids (find your group_id)
     Groups,
     /// Rename the configured group (or one by id/title)
@@ -241,6 +247,36 @@ async fn main() -> Result<()> {
             .await?;
             tg.save_session(&Config::session_path()?)?;
             println!("logged in; session saved");
+        }
+
+        Cmd::Reset => {
+            let db = Config::db_path()?;
+            if db.exists() {
+                std::fs::remove_file(&db)?;
+            }
+            println!("wiped {db:?} — clean slate (re-register bots, restart serve)");
+        }
+
+        Cmd::Clear { name } => {
+            let store = Store::open(&Config::db_path()?)?;
+            store.clear_memory(&name)?;
+            store.kv_del(&format!("greeted:{name}"))?;
+            store.kv_del(&format!("pending:{name}"))?;
+            println!("cleared {name}'s memory");
+        }
+
+        Cmd::ClearChat { name } => {
+            let store = Store::open(&Config::db_path()?)?;
+            let b = store.get_bot(&name)?.context("no such bot")?;
+            if let Some(t) = b.topic_id {
+                let gid = Config::load()?.group_id.context("no group_id")?;
+                BotApi::new(&b.token).delete_forum_topic(gid, t).await?;
+            }
+            store.clear_bot_topic(&name)?;
+            store.clear_memory(&name)?;
+            store.kv_del(&format!("greeted:{name}"))?;
+            store.kv_del(&format!("pending:{name}"))?;
+            println!("cleared {name}'s topic + memory — fresh start");
         }
 
         Cmd::Groups => {
