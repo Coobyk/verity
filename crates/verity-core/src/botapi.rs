@@ -146,7 +146,7 @@ impl BotApi {
             &json!({
                 "offset": offset,
                 "timeout": timeout,
-                "allowed_updates": ["message", "edited_message"],
+                "allowed_updates": ["message", "edited_message", "callback_query"],
             }),
         )
         .await

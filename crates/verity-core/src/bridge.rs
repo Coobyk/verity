@@ -243,6 +243,7 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
 /// Execute a confirmed destructive command (button click landed in our
 /// topic). `confirm_mid` is the prompt message to clean up after.
 async fn run_command(api: &BotApi, bot: &Bot, env: &Env, topic_id: i64, cmd: &str, confirm_mid: i64) {
+    info!(bot = %bot.name, %cmd, "confirmed command executing");
     let n = bot.name.clone();
     let wipe = move |s: &Store| -> Result<()> {
         s.clear_memory(&n)?;
