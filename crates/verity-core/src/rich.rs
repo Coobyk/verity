@@ -55,7 +55,8 @@ mod tests {
     fn splits_on_paragraphs() {
         let text = "a".repeat(60) + "\n\n" + &"b".repeat(60) + "\n\n" + &"c".repeat(60);
         let parts = split_markdown(&text, 100);
-        assert_eq!(parts.len(), 2);
-        assert!(parts.iter().all(|p| p.len() <= 104));
+        assert_eq!(parts.len(), 3);
+        assert!(parts.iter().all(|p| p.len() <= 100));
+        assert_eq!(parts.concat().replace("\n", ""), text.replace("\n", ""));
     }
 }
