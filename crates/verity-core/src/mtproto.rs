@@ -1,10 +1,11 @@
 //! User-side MTProto client (grammers). Logged in as *you*, it can do what
-//! bots can't: read full forum history, list topics, act as the GUI's eyes.
+//! bots can't: read full forum history, list topics, post into topics,
+//! act as the GUI's eyes and hands.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use grammers_client::{Client, SignInError};
+use grammers_client::{Client, InputMessage, SignInError};
 use grammers_mtsender::SenderPool;
 use grammers_session::defs::PeerRef;
 use grammers_session::storages::SqliteSession;
@@ -34,6 +35,20 @@ pub struct TopicMessage {
     pub text: String,
 }
 
+/// Normalize a Bot-API-style chat id to the bare peer id grammers uses.
+/// Supergroups are `-100<channel_id>`; basic groups are `-<chat_id>`;
+/// anything else (usernames, positive ids) passes through unchanged.
+pub fn chat_id_to_bare(id: i64) -> i64 {
+    if id >= 0 {
+        return id;
+    }
+    let s = id.to_string();
+    if let Some(rest) = s.strip_prefix("-100") {
+        return rest.parse().unwrap_or(id);
+    }
+    -id
+}
+
 impl Tg {
     /// Connect with a persisted session; may be unauthorized on first run.
     /// Spawns the sender-pool runner in the background — needs a tokio runtime.
@@ -42,10 +57,15 @@ impl Tg {
             SqliteSession::open(session_path)
                 .map_err(|e| Error::Mtproto(format!("session: {e}")))?,
         );
+        crate::config::chmod_private(session_path); // user session = full account access
         let pool = SenderPool::new(session.clone(), api_id);
         let client = Client::new(&pool);
         tokio::spawn(pool.runner.run());
-        Ok(Self { session, client, api_hash })
+        Ok(Self {
+            session,
+            client,
+            api_hash,
+        })
     }
 
     pub async fn is_authorized(&self) -> Result<bool> {
@@ -85,8 +105,11 @@ impl Tg {
         }
     }
 
-    /// Find a peer among your dialogs by bot-api-style id or title substring.
-    async fn find_peer(&self, id_or_title: &str) -> Result<PeerRef> {
+    /// Find a peer among your dialogs by Bot-API chat id or title substring.
+    /// Chat ids are normalized (see [`chat_id_to_bare`]) so a `-100…`
+    /// `group_id` from `verity config` resolves like the group title does.
+    pub async fn peer(&self, id_or_title: &str) -> Result<PeerRef> {
+        let want_id = id_or_title.parse::<i64>().ok().map(chat_id_to_bare);
         let mut dialogs = self.client.iter_dialogs();
         while let Some(dialog) = dialogs
             .next()
@@ -94,12 +117,16 @@ impl Tg {
             .map_err(|e| Error::Mtproto(format!("dialogs: {e}")))?
         {
             let peer = dialog.peer();
-            let title = peer.name().unwrap_or_default();
-            let id_match = id_or_title
-                .parse::<i64>()
+            let id_match = want_id
                 .map(|want| peer.id().bare_id() == want)
                 .unwrap_or(false);
-            if id_match || title.to_lowercase().contains(&id_or_title.to_lowercase()) {
+            if id_match
+                || peer
+                    .name()
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains(&id_or_title.to_lowercase())
+            {
                 return Ok(PeerRef::from(peer));
             }
         }
@@ -107,8 +134,7 @@ impl Tg {
     }
 
     /// List forum topics of a group via `messages.getForumTopics`.
-    pub async fn list_topics(&self, group: &str) -> Result<Vec<TopicInfo>> {
-        let peer = self.find_peer(group).await?;
+    pub async fn list_topics(&self, peer: PeerRef) -> Result<Vec<TopicInfo>> {
         let res = self
             .client
             .invoke(&tl::functions::messages::GetForumTopics {
@@ -136,13 +162,13 @@ impl Tg {
     }
 
     /// Read recent messages of one topic via `messages.getReplies`.
+    /// Returned oldest-first.
     pub async fn topic_history(
         &self,
-        group: &str,
+        peer: PeerRef,
         topic_id: i64,
         limit: i32,
     ) -> Result<Vec<TopicMessage>> {
-        let peer = self.find_peer(group).await?;
         let res = self
             .client
             .invoke(&tl::functions::messages::GetReplies {
@@ -201,5 +227,46 @@ impl Tg {
             .collect();
         out.reverse(); // API returns newest-first
         Ok(out)
+    }
+
+    /// Post a text message into a forum topic *as the logged-in user*.
+    /// The topic id doubles as the thread's root `reply_to` message id.
+    /// Pass `None` to post to the group's general stream.
+    pub async fn send_message(
+        &self,
+        peer: PeerRef,
+        topic_id: Option<i64>,
+        text: &str,
+    ) -> Result<()> {
+        self.client
+            .send_message(
+                peer,
+                InputMessage::new()
+                    .text(text)
+                    .reply_to(topic_id.map(|t| t as i32)),
+            )
+            .await
+            .map_err(|e| Error::Mtproto(format!("send: {e}")))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_supergroup_prefix() {
+        assert_eq!(chat_id_to_bare(-1001234567890), 1234567890);
+    }
+
+    #[test]
+    fn strips_basic_group_sign() {
+        assert_eq!(chat_id_to_bare(-987654321), 987654321);
+    }
+
+    #[test]
+    fn passes_positive_ids() {
+        assert_eq!(chat_id_to_bare(1234567890), 1234567890);
     }
 }

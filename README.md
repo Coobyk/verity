@@ -10,9 +10,9 @@ a native Rust client, and a quiet bridge that does the work.
   (`grammers`, reads full history bots can't), a SQLite brain, a `Harness`
   seam for agent providers, and the quiet-bot bridge loop.
 - **`verity`** (CLI) — config, login, bot management, `serve`, and
-  Telegram reads (`topics`, `history`) for humans.
-- **`verity-gui`** — GPUI client that reads the supergroup straight from
-  Telegram as *you*. Chat history needs no daemon.
+  Telegram as *you* (`topics`, `history`, `say`).
+- **`verity-gui`** — GPUI client that reads *and writes* the supergroup
+  as *you*. Chat history needs no daemon.
 
 ## Design
 
@@ -26,8 +26,19 @@ You ──► verity-gui / verity (grammers, logged in as YOU)
           SQLite holds brains (memory, config) — chats live in Telegram
 ```
 
-Quiet bots by design: a turn is 👀 reaction → typing → work → a single
-rich message (32k chars, GFM markdown, LaTeX, collapsible thinking blocks).
+Quiet bots by design: a turn is 👀 reaction → typing (one ⏳ progress
+message on slow turns, deleted after) → ✅ → rich replies (32k chars,
+GFM markdown, LaTeX, collapsible thinking blocks, auto-split at the
+cap). Each turn sees the recent topic transcript — bots can't read
+history, so `serve` lends them your MTProto session.
+
+Replies can carry `:::` markers, stripped before send:
+
+- `:::remember k = v:::` — persist a fact across turns
+- `:::tell name: task:::` — hand work to a teammate; it replies in
+  the topic as itself (bots can't see each other, so verity routes)
+- `:::spawn label: task:::` — fan out up to 3 helpers; results fold
+  back into the reply as collapsible blocks
 
 ## Setup
 
@@ -40,7 +51,18 @@ verity serve            # bots create their topics on first run
 ```
 
 `--echo` on `serve` runs the echo harness — full plumbing, no provider.
-Default harness drives `pi`/`pirs` (`--pi-bin` to point at the binary).
+`--no-context` skips attaching your session (turns get no transcript).
+
+Each bot picks its provider at registration (`bot new --provider`):
+`pi` (default; `--pi-bin` points at the binary), `echo`, or
+`acp:<cmd> [args]` for any ACP-speaking agent — `acp:claude-code-acp`,
+`acp:codex acp`, `acp:pi --acp`.
+
+Talk to a bot from the terminal without opening a client:
+
+```bash
+verity say scout "find me a cheap flight to Lisbon next month"
+```
 
 ## License
 

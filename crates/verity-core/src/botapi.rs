@@ -44,6 +44,8 @@ pub struct Message {
     pub chat: Chat,
     pub date: i64,
     pub text: Option<String>,
+    /// Media caption — photos/docs/etc. carry their text here.
+    pub caption: Option<String>,
     pub reply_to_message: Option<Box<Message>>,
 }
 
@@ -93,11 +95,13 @@ impl InputRichMessage {
 }
 
 impl BotApi {
+    /// `VERITY_BOT_API_BASE` overrides the api.telegram.org base —
+    /// for a local Bot API server (or a test mock).
     pub fn new(token: impl Into<String>) -> Self {
         Self {
             token: token.into(),
             http: reqwest::Client::new(),
-            base: API_BASE.into(),
+            base: std::env::var("VERITY_BOT_API_BASE").unwrap_or_else(|_| API_BASE.into()),
         }
     }
 
@@ -107,16 +111,14 @@ impl BotApi {
         self
     }
 
-    async fn call<T: for<'de> Deserialize<'de>>(
-        &self,
-        method: &str,
-        body: &Value,
-    ) -> Result<T> {
+    async fn call<T: for<'de> Deserialize<'de>>(&self, method: &str, body: &Value) -> Result<T> {
         let url = format!("{}/bot{}/{}", self.base, self.token, method);
         let resp: ApiResponse<T> = self.http.post(&url).json(body).send().await?.json().await?;
         if resp.ok {
-            resp.result
-                .ok_or_else(|| Error::BotApi { code: -1, description: "empty result".into() })
+            resp.result.ok_or_else(|| Error::BotApi {
+                code: -1,
+                description: "empty result".into(),
+            })
         } else {
             Err(Error::BotApi {
                 code: resp.error_code.unwrap_or(-1),
@@ -215,6 +217,27 @@ impl BotApi {
         Ok(())
     }
 
+    /// Edit a previously sent message's text. Used for the single
+    /// progress message a long turn keeps updated before deleting it.
+    pub async fn edit_message(&self, chat_id: i64, message_id: i64, text: &str) -> Result<()> {
+        self.call::<bool>(
+            "editMessageText",
+            &json!({ "chat_id": chat_id, "message_id": message_id, "text": text }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Delete a message (e.g. the progress message once the real reply lands).
+    pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<()> {
+        self.call::<bool>(
+            "deleteMessage",
+            &json!({ "chat_id": chat_id, "message_id": message_id }),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// "typing" / "upload_document" / etc. Cheap presence, no message.
     pub async fn send_chat_action(
         &self,
@@ -245,16 +268,14 @@ impl BotApi {
     }
 
     pub async fn create_forum_topic(&self, chat_id: i64, name: &str) -> Result<ForumTopic> {
-        self.call("createForumTopic", &json!({ "chat_id": chat_id, "name": name }))
-            .await
+        self.call(
+            "createForumTopic",
+            &json!({ "chat_id": chat_id, "name": name }),
+        )
+        .await
     }
 
-    pub async fn edit_forum_topic(
-        &self,
-        chat_id: i64,
-        thread_id: i64,
-        name: &str,
-    ) -> Result<()> {
+    pub async fn edit_forum_topic(&self, chat_id: i64, thread_id: i64, name: &str) -> Result<()> {
         self.call::<bool>(
             "editForumTopic",
             &json!({ "chat_id": chat_id, "message_thread_id": thread_id, "name": name }),

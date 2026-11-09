@@ -1,9 +1,21 @@
 //! `~/.verity` layout: `config.toml`, `state.sqlite`, `tg.session`.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{Error, Result};
+
+/// Best-effort 0600 on a file holding credentials (config, sqlite with
+/// bot tokens, MTProto session). No-op off unix.
+pub(crate) fn chmod_private(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -54,11 +66,7 @@ impl Config {
         // credentials-adjacent: keep config owner-readable only
         let path = Self::path()?;
         std::fs::write(&path, s)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        chmod_private(&path);
         Ok(())
     }
 

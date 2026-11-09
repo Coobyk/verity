@@ -29,6 +29,7 @@ impl Store {
             std::fs::create_dir_all(dir)?;
         }
         let conn = Connection::open(path)?;
+        crate::config::chmod_private(path); // bot tokens live here
         conn.execute(
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS bots (
@@ -73,9 +74,7 @@ impl Store {
     }
 
     pub fn remove_bot(&self, name: &str) -> Result<bool> {
-        let mut stmt = self
-            .conn
-            .prepare("DELETE FROM bots WHERE name = ?")?;
+        let mut stmt = self.conn.prepare("DELETE FROM bots WHERE name = ?")?;
         stmt.bind((1, name))?;
         stmt.next()?;
         Ok(self.conn.change_count() > 0)

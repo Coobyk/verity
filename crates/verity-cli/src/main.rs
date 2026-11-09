@@ -4,13 +4,13 @@ use std::io::{BufRead, Write};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use std::sync::Arc;
 use verity_core::botapi::{BotApi, InputRichMessage};
 use verity_core::bridge::Bridge;
 use verity_core::config::Config;
-use verity_core::harness::{EchoHarness, PiHarness};
+use verity_core::harness::{AcpHarness, EchoHarness, PiHarness};
 use verity_core::mtproto::Tg;
 use verity_core::store::{Bot, Store};
-use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "verity", about = "Named teammate bots in a Telegram group")]
@@ -55,17 +55,25 @@ enum Cmd {
         limit: i32,
         group: Option<String>,
     },
+    /// Post a message into a topic as yourself
+    Say {
+        /// Topic id or title substring
+        topic: String,
+        /// Message text
+        text: String,
+        group: Option<String>,
+    },
     /// Run the bridge: bots listen, work quietly, reply when done
     Serve {
         /// Use the echo harness (no agent provider needed)
         #[arg(long)]
         echo: bool,
+        /// Don't attach the user session — turns get no topic transcript
+        #[arg(long)]
+        no_context: bool,
     },
     /// Post into a topic as a bot
-    Send {
-        bot: String,
-        text: String,
-    },
+    Send { bot: String, text: String },
 }
 
 #[derive(Subcommand)]
@@ -77,6 +85,7 @@ enum BotCmd {
         token: String,
         #[arg(long, default_value = "")]
         instructions: String,
+        /// Agent provider: `pi`, `echo`, or `acp:<cmd> [args]` (e.g. `acp:claude-code-acp`)
         #[arg(long, default_value = "pi")]
         provider: String,
         #[arg(long)]
@@ -126,22 +135,52 @@ fn group_of(cfg: &Config, arg: Option<String>) -> Result<String> {
         .context("no group configured — `verity config --group-id <id>` or pass one")
 }
 
+/// Numeric topic ids pass through; anything else is matched against
+/// topic titles (case-insensitive substring).
+async fn resolve_topic(
+    tg: &Tg,
+    peer: &grammers_session::defs::PeerRef,
+    topic: &str,
+) -> Result<i64> {
+    if let Ok(id) = topic.parse::<i64>() {
+        return Ok(id);
+    }
+    tg.list_topics(*peer)
+        .await?
+        .into_iter()
+        .find(|t| t.title.to_lowercase().contains(&topic.to_lowercase()))
+        .map(|t| t.id)
+        .context("no such topic")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
     match Cli::parse().cmd {
-        Cmd::Config { api_id, api_hash, group_id, pi_bin } => {
+        Cmd::Config {
+            api_id,
+            api_hash,
+            group_id,
+            pi_bin,
+        } => {
             let mut cfg = Config::load()?;
-            if let Some(v) = api_id { cfg.api_id = Some(v); }
-            if let Some(v) = api_hash { cfg.api_hash = Some(v); }
-            if let Some(v) = group_id { cfg.group_id = Some(v); }
-            if let Some(v) = pi_bin { cfg.pi_bin = Some(v); }
+            if let Some(v) = api_id {
+                cfg.api_id = Some(v);
+            }
+            if let Some(v) = api_hash {
+                cfg.api_hash = Some(v);
+            }
+            if let Some(v) = group_id {
+                cfg.group_id = Some(v);
+            }
+            if let Some(v) = pi_bin {
+                cfg.pi_bin = Some(v);
+            }
             cfg.save()?;
             println!("saved {}", Config::home()?.join("config.toml").display());
         }
@@ -152,43 +191,56 @@ async fn main() -> Result<()> {
                 println!("already logged in");
                 return Ok(());
             }
-            let phone = phone.map(Ok).unwrap_or_else(|| prompt("Phone (+country code)"))?;
-            tg.sign_in(&phone, |what| prompt(what).map_err(|e| verity_core::Error::Other(e.to_string()))).await?;
+            let phone = phone
+                .map(Ok)
+                .unwrap_or_else(|| prompt("Phone (+country code)"))?;
+            tg.sign_in(&phone, |what| {
+                prompt(what).map_err(|e| verity_core::Error::Other(e.to_string()))
+            })
+            .await?;
             tg.save_session(&Config::session_path()?)?;
             println!("logged in; session saved");
         }
 
         Cmd::Topics { group } => {
             let (tg, cfg) = authorized_tg().await?;
-            let g = group_of(&cfg, group)?;
-            for t in tg.list_topics(&g).await? {
+            let peer = tg.peer(&group_of(&cfg, group)?).await?;
+            for t in tg.list_topics(peer).await? {
                 println!("{:>8}  {}", t.id, t.title);
             }
         }
 
-        Cmd::History { topic, limit, group } => {
+        Cmd::History {
+            topic,
+            limit,
+            group,
+        } => {
             let (tg, cfg) = authorized_tg().await?;
-            let g = group_of(&cfg, group)?;
-            // accept a topic title too: resolve to id when not numeric
-            let topic_id: i64 = match topic.parse() {
-                Ok(id) => id,
-                Err(_) => tg
-                    .list_topics(&g)
-                    .await?
-                    .into_iter()
-                    .find(|t| t.title.to_lowercase().contains(&topic.to_lowercase()))
-                    .context("no such topic")?
-                    .id,
-            };
-            for m in tg.topic_history(&g, topic_id, limit).await? {
+            let peer = tg.peer(&group_of(&cfg, group)?).await?;
+            let topic_id = resolve_topic(&tg, &peer, &topic).await?;
+            for m in tg.topic_history(peer, topic_id, limit).await? {
                 println!("[{}] {}: {}", m.id, m.sender, m.text);
             }
+        }
+
+        Cmd::Say { topic, text, group } => {
+            let (tg, cfg) = authorized_tg().await?;
+            let peer = tg.peer(&group_of(&cfg, group)?).await?;
+            let topic_id = resolve_topic(&tg, &peer, &topic).await?;
+            tg.send_message(peer, Some(topic_id), &text).await?;
+            println!("sent");
         }
 
         Cmd::Bot { cmd } => {
             let store = Store::open(&Config::db_path()?)?;
             match cmd {
-                BotCmd::New { name, token, instructions, provider, model } => {
+                BotCmd::New {
+                    name,
+                    token,
+                    instructions,
+                    provider,
+                    model,
+                } => {
                     let api = BotApi::new(&token);
                     let me = api.get_me().await.context("invalid bot token?")?;
                     store.add_bot(&Bot {
@@ -204,14 +256,30 @@ async fn main() -> Result<()> {
                 }
                 BotCmd::List => {
                     for b in store.list_bots()? {
+                        let user = b
+                            .username
+                            .map(|u| format!("@{u}"))
+                            .unwrap_or_else(|| "-".into());
+                        let topic = b
+                            .topic_id
+                            .map(|t| t.to_string())
+                            .unwrap_or_else(|| "-".into());
+                        let model = b.model.unwrap_or_else(|| "-".into());
                         println!(
-                            "{:<16} @{:?} topic={:?} provider={} model={:?}",
-                            b.name, b.username, b.topic_id, b.provider, b.model
+                            "{:<16} {:<24} topic={:<6} provider={} model={}",
+                            b.name, user, topic, b.provider, model
                         );
                     }
                 }
                 BotCmd::Rm { name } => {
-                    println!("{}", if store.remove_bot(&name)? { "removed" } else { "not found" });
+                    println!(
+                        "{}",
+                        if store.remove_bot(&name)? {
+                            "removed"
+                        } else {
+                            "not found"
+                        }
+                    );
                 }
                 BotCmd::Memory { name, set } => {
                     if let Some(pairs) = set {
@@ -228,21 +296,55 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Serve { echo } => {
+        Cmd::Serve { echo, no_context } => {
             let cfg = Config::load()?;
-            let group_id = cfg.group_id.context("no group_id — `verity config --group-id`")?;
-            let harness: Arc<dyn verity_core::harness::Harness> = if echo {
-                Arc::new(EchoHarness)
+            let group_id = cfg
+                .group_id
+                .context("no group_id — `verity config --group-id`")?;
+            // Per-bot provider string → harness. `--echo` overrides all.
+            let pi_bin = cfg.pi_bin.clone();
+            let make_harness: Arc<verity_core::bridge::MakeHarness> =
+                Arc::new(move |provider: &str| {
+                    if echo || provider == "echo" {
+                        Arc::new(EchoHarness)
+                    } else if let Some(spec) = provider.strip_prefix("acp:") {
+                        Arc::new(AcpHarness::new(spec))
+                    } else {
+                        Arc::new(PiHarness::new(pi_bin.clone()))
+                    }
+                });
+            // Attach the user session so turns can read the topic transcript.
+            // Degrades gracefully to context-free turns when unavailable.
+            let (tg, tg_peer) = if no_context {
+                (None, None)
             } else {
-                Arc::new(PiHarness::new(cfg.pi_bin))
+                match authorized_tg().await {
+                    Ok((tg, _)) => match tg.peer(&group_id.to_string()).await {
+                        Ok(peer) => (Some(Arc::new(tg)), Some(peer)),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "can't resolve group peer — no transcripts");
+                            (Some(Arc::new(tg)), None)
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, "no user session — turns run without transcript");
+                        (None, None)
+                    }
+                }
             };
-            Bridge {
+            let bridge = Bridge {
                 group_id,
                 db_path: Config::db_path()?,
-                harness,
+                make_harness,
+                tg,
+                tg_peer,
+            };
+            tokio::select! {
+                r = bridge.run() => { r?; }
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("shutting down");
+                }
             }
-            .run()
-            .await?;
         }
 
         Cmd::Send { bot, text } => {
@@ -250,10 +352,14 @@ async fn main() -> Result<()> {
             let b = store.get_bot(&bot)?.context("no such bot")?;
             let cfg = Config::load()?;
             let group_id = cfg.group_id.context("no group_id")?;
-            let topic = b.topic_id.context("bot has no topic yet — run `verity serve` once")?;
-            BotApi::new(&b.token)
-                .send_rich_message(group_id, InputRichMessage::markdown(&text), Some(topic))
-                .await?;
+            let topic = b
+                .topic_id
+                .context("bot has no topic yet — run `verity serve` once")?;
+            let api = BotApi::new(&b.token);
+            for part in verity_core::rich::split_markdown(&text, verity_core::rich::RICH_LIMIT) {
+                api.send_rich_message(group_id, InputRichMessage::markdown(&part), Some(topic))
+                    .await?;
+            }
             println!("sent");
         }
     }
