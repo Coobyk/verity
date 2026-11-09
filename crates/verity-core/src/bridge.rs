@@ -275,14 +275,19 @@ async fn run_command(api: &BotApi, bot: &Bot, env: &Env, topic_id: i64, cmd: &st
             }
         }
         "reset" => {
-            // Delete every topic except General (id 1) and ours; other
-            // bots recreate theirs lazily on next message.
+            // Delete every other topic except General (id 1), then clear
+            // our own topic's messages too — whole chat wiped clean.
             if let (Some(tg), Some(peer)) = (&env.tg, &env.peer) {
                 if let Ok(topics) = tg.list_topics(*peer).await {
                     for t in topics {
                         if t.id != 1 && t.id != topic_id {
                             let _ = api.delete_forum_topic(env.group_id, t.id).await;
                         }
+                    }
+                }
+                if let Ok(msgs) = tg.topic_history(*peer, topic_id, 200).await {
+                    for m in msgs {
+                        let _ = api.delete_message(env.group_id, m.id as i64).await;
                     }
                 }
             }
