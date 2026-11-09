@@ -262,9 +262,11 @@ impl Tg {
                 .iter()
                 .find_map(|u| match u {
                     tl::enums::User::User(u) if u.id == id => Some(
-                        u.username
+                        u.first_name
                             .clone()
-                            .unwrap_or_else(|| u.first_name.clone().unwrap_or_default()),
+                            .filter(|n| !n.is_empty())
+                            .or_else(|| u.username.clone())
+                            .unwrap_or_default(),
                     ),
                     _ => None,
                 })

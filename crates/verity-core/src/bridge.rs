@@ -498,21 +498,50 @@ async fn do_turn(env: &Env, bot: &Bot, topic_id: i64, text: &str, depth: u8) -> 
     };
     send_reply(&api, env.group_id, topic_id, &reply).await?;
 
-    // 6. Tells: route work to teammates. Detached so this turn's reply
-    //    isn't gated on another bot's runtime; depth-capped to keep
-    //    bot-to-bot loops finite.
+    // 6. Tells: route work to teammates. The teammate answers in ITS OWN
+    //    topic — bots never post outside their own thread. Detached so
+    //    this turn's reply isn't gated on another bot's runtime;
+    //    depth-capped to keep bot-to-bot loops finite.
     if depth < MAX_TELL_DEPTH && !markers.tell.is_empty() {
         for (name, msg) in markers.tell.into_iter().take(MAX_TELLS) {
             let (target, env2) = (find_bot(&env.db, &name).await, env.clone());
             match target {
                 Some(target) if target.name != bot.name => {
                     let origin = bot.name.clone();
+                    let tname = target.name.clone();
                     tokio::spawn(async move {
+                        // Ensure the teammate has its own topic to answer in.
+                        let tapi = BotApi::new(&target.token);
+                        let ttopic = match target.topic_id {
+                            Some(t) => t,
+                            None => match tapi.create_forum_topic(env2.group_id, &target.name).await {
+                                Ok(t) => {
+                                    let (db, n, tid) =
+                                        (env2.db.clone(), target.name.clone(), t.message_thread_id);
+                                    let _ = db_call(&db, move |s| s.set_bot_topic(&n, tid)).await;
+                                    if let Some(g) = &target.greeting {
+                                        let _ = send_reply(&tapi, env2.group_id, tid, g).await;
+                                    }
+                                    tid
+                                }
+                                Err(e) => {
+                                    warn!(bot = %target.name, error = %e, "tell: topic create failed");
+                                    return;
+                                }
+                            },
+                        };
                         let prompt = format!("Message from teammate {origin}: {msg}");
-                        if let Err(e) = turn(&env2, &target, topic_id, &prompt, depth + 1).await {
+                        if let Err(e) = turn(&env2, &target, ttopic, &prompt, depth + 1).await {
                             warn!(bot = %target.name, error = %e, "tell turn failed");
                         }
                     });
+                    let _ = api
+                        .send_message(
+                            env.group_id,
+                            &format!("📨 handed off to *{tname}* — they'll answer in their own topic"),
+                            Some(topic_id),
+                        )
+                        .await;
                 }
                 _ => warn!(bot = %bot.name, teammate = %name, "tell: unknown teammate"),
             }

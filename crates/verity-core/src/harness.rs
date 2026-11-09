@@ -13,6 +13,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tracing::info;
 use tokio::process::Command;
 
 use crate::{Error, Result};
@@ -239,6 +240,7 @@ impl AcpHarness {
                     .write_all(line.as_bytes())
                     .await
                     .map_err(|e| Error::Harness(format!("acp write: {e}")))?;
+                info!("acp -> {}", &line.trim_end()[..line.trim_end().len().min(300)]);
                 sent += 1;
             }
 
@@ -247,6 +249,7 @@ impl AcpHarness {
                 Ok(None) => break, // agent exited
                 Err(e) => return Err(Error::Harness(format!("acp read: {e}"))),
             };
+            info!("acp <- {}", &line[..line.len().min(300)]);
             let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue; // not JSON-RPC — ignore stray output
             };
@@ -303,7 +306,10 @@ impl AcpHarness {
             }
         }
 
-        let _ = child.wait().await;
+        drop(stdin); // close the pipe so the server can exit
+        // Per-turn agent: don't wait indefinitely — kill if it lingers.
+        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+        let _ = child.kill().await;
         let stderr = stderr_buf.await.unwrap_or_default();
         if reply.is_empty() && !stderr.is_empty() {
             tracing::debug!(stderr = %stderr.chars().take(500).collect::<String>(), "acp: empty reply");
