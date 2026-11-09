@@ -79,6 +79,22 @@ impl Store {
         Ok(())
     }
 
+    /// Rename a bot record and move its memory rows along.
+    pub fn rename_bot(&self, name: &str, new_name: &str) -> Result<bool> {
+        let mut s = self.conn.prepare("UPDATE bots SET name = ? WHERE name = ?")?;
+        s.bind((1, new_name))?;
+        s.bind((2, name))?;
+        s.next()?;
+        let changed = self.conn.change_count() > 0;
+        if changed {
+            let mut s = self.conn.prepare("UPDATE memory SET bot = ? WHERE bot = ?")?;
+            s.bind((1, new_name))?;
+            s.bind((2, name))?;
+            s.next()?;
+        }
+        Ok(changed)
+    }
+
     pub fn remove_bot(&self, name: &str) -> Result<bool> {
         let mut stmt = self.conn.prepare("DELETE FROM bots WHERE name = ?")?;
         stmt.bind((1, name))?;

@@ -127,6 +127,11 @@ enum BotCmd {
         #[arg(long)]
         title: String,
     },
+    /// Rename a bot (store name, memory keys, and its topic title if set)
+    Rename {
+        name: String,
+        new_name: String,
+    },
     /// List registered bots
     List,
     /// Remove a bot (does not delete its topic)
@@ -351,6 +356,20 @@ async fn main() -> Result<()> {
                         .edit_forum_topic(group_id, topic, &title)
                         .await?;
                     println!("topic renamed to {title}");
+                }
+                BotCmd::Rename { name, new_name } => {
+                    if !store.rename_bot(&name, &new_name)? {
+                        bail!("no such bot");
+                    }
+                    if let Some(b) = store.get_bot(&new_name)? {
+                        if let Some(t) = b.topic_id {
+                            let gid = Config::load()?.group_id.context("no group_id")?;
+                            let _ = BotApi::new(&b.token)
+                                .edit_forum_topic(gid, t, &new_name)
+                                .await;
+                        }
+                    }
+                    println!("renamed {name} → {new_name} (restart serve to apply)");
                 }
                 BotCmd::List => {
                     for b in store.list_bots()? {
