@@ -128,7 +128,7 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
     info!(bot = %bot.name, username = ?me.username, "polling");
 
     // Ensure the bot owns a forum topic named after it.
-    let mut topic_id = match bot.topic_id {
+    let topic_id = match bot.topic_id {
         Some(t) => t,
         None => {
             let t = api.create_forum_topic(env.group_id, &bot.name).await?;
@@ -179,6 +179,16 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
         };
         for update in updates {
             offset = update.update_id + 1;
+            // Confirm-button clicks for the destructive commands.
+            if let Some(cb) = update.callback_query {
+                let _ = api.answer_callback_query(&cb.id).await;
+                if let (Some(data), Some(m)) = (cb.data, cb.message) {
+                    if m.message_thread_id == Some(topic_id) {
+                        run_command(&api, bot, env, topic_id, &data, m.message_id).await;
+                    }
+                }
+                continue;
+            }
             let Some(msg) = update.message else { continue };
             if msg.chat.id != env.group_id || msg.message_thread_id != Some(topic_id) {
                 continue;
@@ -189,47 +199,29 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
             let Some(text) = msg.text.clone().or_else(|| msg.caption.clone()) else {
                 continue;
             };
-            // In-chat commands, scoped to this bot — handled without a turn.
-            if let Some(cmd) = text.strip_prefix('/').map(|c| c.split_whitespace().next().unwrap_or("")) {
-                match cmd {
-                    "clear" => {
-                        let (db, n) = (env.db.clone(), bot.name.clone());
-                        let _ = db_call(&db, move |s| {
-                            s.clear_memory(&n)?;
-                            s.kv_del(&format!("greeted:{n}"))?;
-                            s.kv_del(&format!("pending:{n}"))
-                        })
+            // In-chat commands — destructive, so they confirm via an
+            // inline button before anything runs.
+            if let Some(cmd) = text
+                .strip_prefix('/')
+                .map(|c| c.split_whitespace().next().unwrap_or(""))
+            {
+                let (ask, label) = match cmd {
+                    "clear" => ("Wipe my memory? Can't undo this.", "Yes, wipe it"),
+                    "clearchat" => (
+                        "Delete every message in this topic AND wipe my memory? Can't undo.",
+                        "Yes, clear it all",
+                    ),
+                    "reset" => (
+                        "Delete every other topic and wipe ALL my memory? Can't undo.",
+                        "Yes, reset everything",
+                    ),
+                    _ => ("", ""),
+                };
+                if !ask.is_empty() {
+                    let _ = api
+                        .send_confirm(env.group_id, ask, Some(topic_id), label, cmd)
                         .await;
-                        let _ = api
-                            .send_message(env.group_id, "memory wiped", Some(topic_id))
-                            .await;
-                        continue;
-                    }
-                    "reset" | "clearchat" => {
-                        let (db, n) = (env.db.clone(), bot.name.clone());
-                        let _ = api.delete_forum_topic(env.group_id, topic_id).await;
-                        let _ = db_call(&db, move |s| {
-                            s.clear_bot_topic(&n)?;
-                            s.clear_memory(&n)?;
-                            s.kv_del(&format!("greeted:{n}"))?;
-                            s.kv_del(&format!("pending:{n}"))
-                        })
-                        .await;
-                        if cmd == "reset" {
-                            // Fresh topic right away — same as first run.
-                            if let Ok(t) = api.create_forum_topic(env.group_id, &bot.name).await {
-                                let tid = t.message_thread_id;
-                                let (db, n) = (env.db.clone(), bot.name.clone());
-                                let _ = db_call(&db, move |s| s.set_bot_topic(&n, tid)).await;
-                                topic_id = tid;
-                                if let Some(g) = &bot.greeting {
-                                    let _ = send_reply(&api, env.group_id, tid, g).await;
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    _ => {}
+                    continue;
                 }
             }
             debug!(bot = %bot.name, %text, "turn request");
@@ -245,6 +237,64 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
                     .await;
             }
         }
+    }
+}
+
+/// Execute a confirmed destructive command (button click landed in our
+/// topic). `confirm_mid` is the prompt message to clean up after.
+async fn run_command(api: &BotApi, bot: &Bot, env: &Env, topic_id: i64, cmd: &str, confirm_mid: i64) {
+    let n = bot.name.clone();
+    let wipe = move |s: &Store| -> Result<()> {
+        s.clear_memory(&n)?;
+        s.kv_del(&format!("greeted:{n}"))?;
+        s.kv_del(&format!("pending:{n}"))
+    };
+    match cmd {
+        "clear" => {
+            let _ = db_call(&env.db, wipe).await;
+            let _ = api.delete_message(env.group_id, confirm_mid).await;
+            let _ = api
+                .send_message(env.group_id, "memory wiped", Some(topic_id))
+                .await;
+        }
+        "clearchat" => {
+            // Delete every message in the topic (ids via the user session
+            // — bots can't list history), wipe memory, re-greet.
+            if let (Some(tg), Some(peer)) = (&env.tg, &env.peer) {
+                if let Ok(msgs) = tg.topic_history(*peer, topic_id, 200).await {
+                    for m in msgs {
+                        let _ = api.delete_message(env.group_id, m.id as i64).await;
+                    }
+                }
+            }
+            let _ = api.delete_message(env.group_id, confirm_mid).await;
+            let _ = db_call(&env.db, wipe).await;
+            if let Some(g) = &bot.greeting {
+                let _ = send_reply(api, env.group_id, topic_id, g).await;
+            }
+        }
+        "reset" => {
+            // Delete every topic except General (id 1) and ours; other
+            // bots recreate theirs lazily on next message.
+            if let (Some(tg), Some(peer)) = (&env.tg, &env.peer) {
+                if let Ok(topics) = tg.list_topics(*peer).await {
+                    for t in topics {
+                        if t.id != 1 && t.id != topic_id {
+                            let _ = api.delete_forum_topic(env.group_id, t.id).await;
+                        }
+                    }
+                }
+            }
+            let _ = api.delete_message(env.group_id, confirm_mid).await;
+            let n = bot.name.clone();
+            let _ = db_call(&env.db, move |s| s.clear_other_topics(&n))
+                .await;
+            let _ = db_call(&env.db, wipe).await;
+            if let Some(g) = &bot.greeting {
+                let _ = send_reply(api, env.group_id, topic_id, g).await;
+            }
+        }
+        _ => {}
     }
 }
 

@@ -156,6 +156,16 @@ impl Store {
         Ok(())
     }
 
+    /// Forget every bot's topic except `keep` (theirs were deleted).
+    pub fn clear_other_topics(&self, keep: &str) -> Result<()> {
+        let mut s = self
+            .conn
+            .prepare("UPDATE bots SET topic_id = NULL WHERE name != ?")?;
+        s.bind((1, keep))?;
+        s.next()?;
+        Ok(())
+    }
+
     /// Forget a bot's forum topic (next turn recreates it).
     pub fn clear_bot_topic(&self, name: &str) -> Result<()> {
         let mut s = self

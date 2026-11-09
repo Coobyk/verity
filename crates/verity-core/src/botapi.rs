@@ -50,10 +50,18 @@ pub struct Message {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct CallbackQuery {
+    pub id: String,
+    pub data: Option<String>,
+    pub message: Option<Message>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Update {
     pub update_id: i64,
     pub message: Option<Message>,
     pub edited_message: Option<Message>,
+    pub callback_query: Option<CallbackQuery>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -295,6 +303,37 @@ impl BotApi {
             &json!({ "chat_id": chat_id, "message_thread_id": thread_id, "name": name }),
         )
         .await?;
+        Ok(())
+    }
+
+    /// Send a confirmation prompt with a single inline button.
+    /// Returns the sent message's id.
+    pub async fn send_confirm(
+        &self,
+        chat_id: i64,
+        text: &str,
+        topic_id: Option<i64>,
+        button: &str,
+        data: &str,
+    ) -> Result<i64> {
+        let m: Message = self
+            .call(
+                "sendMessage",
+                &json!({
+                    "chat_id": chat_id,
+                    "text": text,
+                    "message_thread_id": topic_id,
+                    "reply_markup": {"inline_keyboard": [[{"text": button, "callback_data": data}]]},
+                }),
+            )
+            .await?;
+        Ok(m.message_id)
+    }
+
+    /// Dismiss the spinner on a clicked inline button.
+    pub async fn answer_callback_query(&self, id: &str) -> Result<()> {
+        self.call::<bool>("answerCallbackQuery", &json!({"callback_query_id": id}))
+            .await?;
         Ok(())
     }
 
