@@ -293,6 +293,141 @@ impl Tg {
         Ok(out)
     }
 
+    /// Wait for the next message from `peer` with id > `after_id`.
+    /// Polls `iter_messages` (newest-first) up to ~30s.
+    async fn wait_reply(&self, peer: PeerRef, after_id: i32) -> Result<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let mut it = self.client.iter_messages(peer);
+            while let Some(m) = it
+                .next()
+                .await
+                .map_err(|e| Error::Mtproto(format!("messages: {e}")))?
+            {
+                if m.id() <= after_id {
+                    break;
+                }
+                let t = m.text().to_string();
+                if !t.is_empty() {
+                    return Ok(t);
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(Error::Mtproto("timed out waiting for reply".into()));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        }
+    }
+
+    async fn last_msg_id(&self, peer: PeerRef) -> i32 {
+        self.client
+            .iter_messages(peer)
+            .next()
+            .await
+            .ok()
+            .flatten()
+            .map(|m| m.id())
+            .unwrap_or(0)
+    }
+
+    /// Automate @BotFather: `/newbot` → name → username → token.
+    /// Returns the issued HTTP API token.
+    pub async fn create_bot(&self, name: &str, username: &str) -> Result<String> {
+        let bf = self
+            .client
+            .resolve_username("botfather")
+            .await
+            .map_err(|e| Error::Mtproto(format!("resolve: {e}")))?
+            .ok_or_else(|| Error::Mtproto("can't resolve @BotFather".into()))?;
+        let bf_ref = PeerRef::from(&bf);
+
+        let mut last = self.last_msg_id(bf_ref).await;
+        self.client
+            .send_message(&bf, InputMessage::new().text("/newbot"))
+            .await
+            .map_err(|e| Error::Mtproto(format!("send: {e}")))?;
+        self.wait_reply(bf_ref, last).await?; // "choose a name"
+
+        last = self.last_msg_id(bf_ref).await;
+        self.client
+            .send_message(&bf, InputMessage::new().text(name))
+            .await
+            .map_err(|e| Error::Mtproto(format!("send: {e}")))?;
+        let ask = self.wait_reply(bf_ref, last).await?; // "choose a username" or error
+
+        last = self.last_msg_id(bf_ref).await;
+        self.client
+            .send_message(&bf, InputMessage::new().text(username))
+            .await
+            .map_err(|e| Error::Mtproto(format!("send: {e}")))?;
+        let done = self.wait_reply(bf_ref, last).await?;
+
+        // Token looks like `123456789:AAA…` (~35 url-safe chars after ':').
+        let token = done
+            .split_whitespace()
+            .find(|w| {
+                w.split_once(':')
+                    .map(|(a, b)| {
+                        a.chars().all(|c| c.is_ascii_digit())
+                            && b.len() >= 30
+                            && b.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    })
+                    .unwrap_or(false)
+            })
+            .map(|w| w.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-'));
+        match token {
+            Some(t) => Ok(t.to_string()),
+            // Username taken etc. — surface BotFather's own words.
+            None => Err(Error::Mtproto(format!("botfather: {ask} / {done}"))),
+        }
+    }
+
+    /// Invite a bot into the group and grant it admin rights
+    /// (manage topics etc. — needed to own a forum topic).
+    pub async fn invite_bot_admin(&self, group: PeerRef, bot_username: &str) -> Result<()> {
+        let bot = self
+            .client
+            .resolve_username(bot_username.trim_start_matches('@'))
+            .await
+            .map_err(|e| Error::Mtproto(format!("resolve: {e}")))?
+            .ok_or_else(|| Error::Mtproto(format!("can't resolve @{bot_username}")))?;
+        let bot_ref = PeerRef::from(&bot);
+        self.client
+            .invoke(&tl::functions::channels::InviteToChannel {
+                channel: group.into(),
+                users: vec![bot_ref.into()],
+            })
+            .await
+            .map_err(|e| Error::Mtproto(format!("invite: {e}")))?;
+        self.client
+            .invoke(&tl::functions::channels::EditAdmin {
+                channel: group.into(),
+                user_id: bot_ref.into(),
+                admin_rights: tl::enums::ChatAdminRights::Rights(tl::types::ChatAdminRights {
+                    change_info: false,
+                    post_messages: true,
+                    edit_messages: true,
+                    delete_messages: true,
+                    ban_users: false,
+                    invite_users: false,
+                    pin_messages: true,
+                    add_admins: false,
+                    anonymous: false,
+                    manage_call: false,
+                    other: true,
+                    manage_topics: true,
+                    post_stories: false,
+                    edit_stories: false,
+                    delete_stories: false,
+                    manage_direct_messages: false,
+                }),
+                rank: String::new(),
+            })
+            .await
+            .map_err(|e| Error::Mtproto(format!("editAdmin: {e}")))?;
+        Ok(())
+    }
+
     /// Post a text message into a forum topic *as the logged-in user*.
     /// The topic id doubles as the thread's root `reply_to` message id.
     /// Pass `None` to post to the group's general stream.

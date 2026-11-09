@@ -101,6 +101,26 @@ enum BotCmd {
         #[arg(long)]
         greeting: Option<String>,
     },
+    /// Create a bot via @BotFather (as your user) and register it
+    Create {
+        name: String,
+        /// Bot username; must end in "bot"
+        #[arg(long)]
+        username: String,
+        #[arg(long, default_value = "")]
+        instructions: String,
+        /// Agent provider: `pi`, `echo`, or `acp:<cmd> [args]`
+        #[arg(long, default_value = "pi")]
+        provider: String,
+        #[arg(long)]
+        greeting: Option<String>,
+    },
+    /// Invite a bot into the group + grant admin (manage topics)
+    Invite {
+        /// Bot username (with or without @)
+        username: String,
+        group: Option<String>,
+    },
     /// List registered bots
     List,
     /// Remove a bot (does not delete its topic)
@@ -279,6 +299,39 @@ async fn main() -> Result<()> {
                         greeting,
                     })?;
                     println!("registered {name} (@{})", me.username.unwrap_or_default());
+                }
+                BotCmd::Create {
+                    name,
+                    username,
+                    instructions,
+                    provider,
+                    greeting,
+                } => {
+                    if !username.ends_with("bot") {
+                        bail!("bot usernames must end in \"bot\"");
+                    }
+                    let (tg, _) = authorized_tg().await?;
+                    println!("asking @BotFather…");
+                    let token = tg.create_bot(&name, &username).await?;
+                    let api = BotApi::new(&token);
+                    let me = api.get_me().await?;
+                    store.add_bot(&Bot {
+                        name: name.clone(),
+                        token,
+                        username: me.username.clone(),
+                        topic_id: None,
+                        instructions,
+                        provider,
+                        model: None,
+                        greeting,
+                    })?;
+                    println!("created + registered {name} (@{})", me.username.unwrap_or_default());
+                }
+                BotCmd::Invite { username, group } => {
+                    let (tg, cfg) = authorized_tg().await?;
+                    let peer = tg.peer(&group_of(&cfg, group)?).await?;
+                    tg.invite_bot_admin(peer, &username).await?;
+                    println!("invited @{username} + granted admin");
                 }
                 BotCmd::List => {
                     for b in store.list_bots()? {
