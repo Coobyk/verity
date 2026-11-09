@@ -254,6 +254,20 @@ impl BotApi {
     }
 
     /// React to a message — the "acknowledged, working" signal with no noise.
+    /// Remove all our reactions from a message.
+    pub async fn clear_reaction(&self, chat_id: i64, message_id: i64) -> Result<()> {
+        self.call::<bool>(
+            "setMessageReaction",
+            &json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reaction": [],
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn set_reaction(&self, chat_id: i64, message_id: i64, emoji: &str) -> Result<()> {
         self.call::<bool>(
             "setMessageReaction",

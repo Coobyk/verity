@@ -415,14 +415,20 @@ async fn handle_turn(
     if let Some(id) = progress_id {
         let _ = api.delete_message(env.group_id, id).await;
     }
-    // Turn over (success or failure — failure already got ⚠️ upstream):
-    // clear pending + swap 👀 for ✅ so nothing lingers.
+    // Turn over — clear the pending record, then resolve the 👀:
+    // ✅ only when the turn spawned helpers; a plain reply leaves no mark.
     let pkey = pending_key(&bot.name);
     let _ = db_call(&env.db, move |s| s.kv_del(&pkey)).await;
-    if result.is_ok() {
-        let _ = api.set_reaction(env.group_id, message_id, "✅").await;
+    match result {
+        Ok(true) => {
+            let _ = api.set_reaction(env.group_id, message_id, "✅").await;
+        }
+        Ok(false) => {
+            let _ = api.clear_reaction(env.group_id, message_id).await;
+        }
+        Err(_) => {} // upstream marks ⚠️, which also replaces the 👀
     }
-    result
+    result.map(|_| ())
 }
 
 fn pending_key(bot_name: &str) -> String {
@@ -432,7 +438,9 @@ fn pending_key(bot_name: &str) -> String {
 /// One turn of agent work for `bot` in `topic_id`: context → harness →
 /// markers → memory, helpers, tells → rich reply. Shared by human turns
 /// (depth 0, via `handle_turn`) and `tell`-routed teammate turns.
-async fn do_turn(env: &Env, bot: &Bot, topic_id: i64, text: &str, depth: u8) -> Result<()> {
+/// Returns `true` when the turn fanned out spawn helpers — real work
+/// worth a ✅; plain chats get no final reaction.
+async fn do_turn(env: &Env, bot: &Bot, topic_id: i64, text: &str, depth: u8) -> Result<bool> {
     let api = BotApi::new(&bot.token);
     let harness = (env.make)(&bot.provider);
 
@@ -599,7 +607,7 @@ async fn do_turn(env: &Env, bot: &Bot, topic_id: i64, text: &str, depth: u8) -> 
         };
         let _ = api.send_message(env.group_id, &note, Some(topic_id)).await;
     }
-    Ok(())
+    Ok(!markers.spawn.is_empty())
 }
 
 /// `do_turn` recurses through `tell` → `tokio::spawn` → `do_turn`, and
@@ -611,7 +619,7 @@ fn turn<'a>(
     topic_id: i64,
     text: &'a str,
     depth: u8,
-) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
     Box::pin(do_turn(env, bot, topic_id, text, depth))
 }
 
@@ -807,7 +815,7 @@ mod tests {
             .filter(|(m, _)| m == "setMessageReaction")
             .filter_map(|(_, b)| b["reaction"][0]["emoji"].as_str())
             .collect();
-        assert_eq!(reactions, ["👀", "✅"], "reaction sequence");
+        assert_eq!(reactions, ["👀"], "👀 set, then cleared on plain reply");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
