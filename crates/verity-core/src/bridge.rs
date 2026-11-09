@@ -169,6 +169,13 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
     }
 
     loop {
+        // Self-terminate if this bot was removed from the store (e.g.
+        // by a /reset) — otherwise the supervisor keeps us alive.
+        let n = bot.name.clone();
+        if !matches!(db_call(&env.db, move |s| s.get_bot(&n)).await, Ok(Some(_))) {
+            info!(bot = %bot.name, "unregistered — stopping loop");
+            return Ok(());
+        }
         let updates = match api.get_updates(offset, 30).await {
             Ok(u) => u,
             Err(e) => {
@@ -328,8 +335,40 @@ async fn run_command(api: &BotApi, bot: &Bot, env: &Env, topic_id: i64, cmd: &st
             }
         }
         "reset" => {
-            // Delete every other topic except General (id 1), then clear
-            // our own topic's messages too — whole chat wiped clean.
+            // 1. Archive every other bot's transcript into General, kick
+            //    it from the group, and delete its registration — reset
+            //    means the whole team, not just topics.
+            let others = db_call(&env.db, |s| s.list_bots())
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|b| b.name != bot.name)
+                .collect::<Vec<_>>();
+            for b in others {
+                if let (Some(tg), Some(peer), Some(t)) = (&env.tg, &env.peer, b.topic_id) {
+                    if let Ok(msgs) = tg.topic_history(*peer, t, 200).await {
+                        let mut buf = format!("📁 {} archive:\n", b.name);
+                        for m in msgs {
+                            let line = format!("{}: {}\n", m.sender, m.text);
+                            if buf.len() + line.len() > 3_900 {
+                                let _ = api.send_message(env.group_id, &buf, None).await;
+                                buf = String::new();
+                            }
+                            buf.push_str(&line);
+                        }
+                        if !buf.trim().is_empty() {
+                            let _ = api.send_message(env.group_id, &buf, None).await;
+                        }
+                    }
+                }
+                if let Ok(me) = BotApi::new(&b.token).get_me().await {
+                    let _ = api.kick_member(env.group_id, me.id).await;
+                }
+                let n = b.name.clone();
+                let _ = db_call(&env.db, move |s| s.remove_bot(&n)).await;
+            }
+            // 2. Delete every other topic except General (id 1), then
+            //    clear our own topic's messages too.
             if let (Some(tg), Some(peer)) = (&env.tg, &env.peer) {
                 if let Ok(topics) = tg.list_topics(*peer).await {
                     for t in topics {

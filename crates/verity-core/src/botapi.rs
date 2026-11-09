@@ -349,6 +349,16 @@ impl BotApi {
         Ok(())
     }
 
+    /// Kick a member from the group (unbanChatMember with only_if_banned=false).
+    pub async fn kick_member(&self, chat_id: i64, user_id: i64) -> Result<()> {
+        self.call::<bool>(
+            "unbanChatMember",
+            &json!({ "chat_id": chat_id, "user_id": user_id, "only_if_banned": false }),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn delete_forum_topic(&self, chat_id: i64, thread_id: i64) -> Result<()> {
         self.call::<bool>(
             "deleteForumTopic",
