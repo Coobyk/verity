@@ -17,6 +17,8 @@ pub struct Bot {
     /// Harness spec, e.g. "pi" or "acp:claude".
     pub provider: String,
     pub model: Option<String>,
+    /// Posted into the bot's topic right after it's created.
+    pub greeting: Option<String>,
 }
 
 pub struct Store {
@@ -40,6 +42,7 @@ impl Store {
                  instructions TEXT NOT NULL DEFAULT '',
                  provider     TEXT NOT NULL DEFAULT 'pi',
                  model        TEXT,
+                 greeting     TEXT,
                  created_at   INTEGER NOT NULL DEFAULT (unixepoch())
              );
              CREATE TABLE IF NOT EXISTS memory (
@@ -54,13 +57,15 @@ impl Store {
                  value TEXT NOT NULL
              );",
         )?;
+        // migration for pre-greeting databases
+        let _ = conn.execute("ALTER TABLE bots ADD COLUMN greeting TEXT");
         Ok(Self { conn })
     }
 
     pub fn add_bot(&self, bot: &Bot) -> Result<()> {
         let mut stmt = self.conn.prepare(
-            "INSERT INTO bots (name, token, username, topic_id, instructions, provider, model)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO bots (name, token, username, topic_id, instructions, provider, model, greeting)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )?;
         stmt.bind((1, bot.name.as_str()))?;
         stmt.bind((2, bot.token.as_str()))?;
@@ -69,6 +74,7 @@ impl Store {
         stmt.bind((5, bot.instructions.as_str()))?;
         stmt.bind((6, bot.provider.as_str()))?;
         stmt.bind((7, bot.model.as_deref()))?;
+        stmt.bind((8, bot.greeting.as_deref()))?;
         stmt.next()?;
         Ok(())
     }
@@ -82,7 +88,7 @@ impl Store {
 
     pub fn list_bots(&self) -> Result<Vec<Bot>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, token, username, topic_id, instructions, provider, model
+            "SELECT name, token, username, topic_id, instructions, provider, model, greeting
              FROM bots ORDER BY name",
         )?;
         let mut out = Vec::new();
@@ -95,6 +101,7 @@ impl Store {
                 instructions: stmt.read(4)?,
                 provider: stmt.read(5)?,
                 model: stmt.read::<Option<String>, _>(6)?,
+                greeting: stmt.read::<Option<String>, _>(7)?,
             });
         }
         Ok(out)

@@ -72,6 +72,10 @@ struct Env {
     peer: Option<PeerRef>,
 }
 
+/// Supervisor sweep interval: how often the bridge looks for newly
+/// registered bots and starts their loops.
+const BOT_SWEEP: Duration = Duration::from_secs(10);
+
 impl Bridge {
     /// Run every bot in the store forever. Individual bot loops log and
     /// keep polling on transient failures.
@@ -83,36 +87,38 @@ impl Bridge {
             tg: self.tg.clone(),
             peer: self.tg_peer,
         };
-        let db = self.db_path.clone();
-        let bots = tokio::task::spawn_blocking(move || -> Result<Vec<Bot>> {
-            Store::open(&db)?.list_bots()
-        })
-        .await
-        .map_err(|e| Error::Other(e.to_string()))??;
-        if bots.is_empty() {
-            return Err(Error::Config(
-                "no bots registered — `verity bot new`".into(),
-            ));
-        }
-        let mut handles = Vec::new();
-        for bot in bots {
-            let env = env.clone();
-            handles.push(tokio::spawn(async move {
-                loop {
-                    match run_bot(&bot, &env).await {
-                        Ok(()) => return, // clean exit (only if polling ends gracefully)
-                        Err(e) => {
-                            warn!(bot = %bot.name, error = %e, "bot loop failed, restarting in 10s");
-                            tokio::time::sleep(Duration::from_secs(10)).await;
+        // Supervisor: run a loop per bot in the store, and pick up bots
+        // registered later (`bot new` or a `:::bot_new:::` marker) without
+        // a restart.
+        let mut running: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            let bots = db_call(&env.db, |s| s.list_bots())
+                .await
+                .unwrap_or_default();
+            if bots.is_empty() && running.is_empty() {
+                warn!("no bots registered — `verity bot new`");
+            }
+            for bot in bots {
+                if !running.insert(bot.name.clone()) {
+                    continue;
+                }
+                let env = env.clone();
+                let bot_name = bot.name.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match run_bot(&bot, &env).await {
+                            Ok(()) => return, // clean exit (only if polling ends gracefully)
+                            Err(e) => {
+                                warn!(bot = %bot.name, error = %e, "bot loop failed, restarting in 10s");
+                                tokio::time::sleep(Duration::from_secs(10)).await;
+                            }
                         }
                     }
-                }
-            }));
+                });
+                info!(bot = %bot_name, "loop started");
+            }
+            tokio::time::sleep(BOT_SWEEP).await;
         }
-        for h in handles {
-            let _ = h.await;
-        }
-        Ok(())
     }
 }
 
@@ -133,6 +139,9 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
             .await
             .map_err(|e| Error::Other(e.to_string()))??;
             info!(bot = %bot.name, topic = tid, "created topic");
+            if let Some(g) = &bot.greeting {
+                let _ = send_reply(&api, env.group_id, tid, g).await;
+            }
             tid
         }
     };
@@ -268,6 +277,8 @@ struct Markers {
     remember: Vec<(String, String)>,
     tell: Vec<(String, String)>,
     spawn: Vec<(String, String)>,
+    /// (name, token, instructions, optional provider) from `bot_new`.
+    bot_new: Vec<(String, String, String, Option<String>)>,
 }
 
 /// Pull `:::verb …:::` lines out of a reply. Returns the cleaned reply
@@ -288,17 +299,40 @@ fn extract_markers(reply: &str) -> (String, Markers) {
                 "tell" | "spawn" => rest.split_once(':').map(|(k, v)| (k.trim(), v.trim())),
                 _ => None,
             };
-            match (verb, parsed) {
-                ("remember", Some((k, v))) if !k.is_empty() && !v.is_empty() => {
-                    markers.remember.push((k.into(), v.into()));
+            match verb {
+                "remember" => {
+                    if let Some((k, v)) = parsed.filter(|(k, v)| !k.is_empty() && !v.is_empty()) {
+                        markers.remember.push((k.into(), v.into()));
+                    }
                 }
-                ("tell", Some((n, m))) if !n.is_empty() && !m.is_empty() => {
-                    markers.tell.push((n.into(), m.into()));
+                "tell" => {
+                    if let Some((n, m)) = parsed.filter(|(n, m)| !n.is_empty() && !m.is_empty()) {
+                        markers.tell.push((n.into(), m.into()));
+                    }
                 }
-                ("spawn", Some((l, t))) if !l.is_empty() && !t.is_empty() => {
-                    markers.spawn.push((l.into(), t.into()));
+                "spawn" => {
+                    if let Some((l, t)) = parsed.filter(|(l, t)| !l.is_empty() && !t.is_empty()) {
+                        markers.spawn.push((l.into(), t.into()));
+                    }
                 }
-                _ => {} // malformed or unknown marker: strip it anyway
+                // `bot_new name | token | instructions [| provider]`
+                "bot_new" => {
+                    let mut f = rest.split('|').map(str::trim);
+                    match (f.next(), f.next(), f.next(), f.next()) {
+                        (Some(n), Some(t), Some(i), p)
+                            if !n.is_empty() && !t.is_empty() && !i.is_empty() =>
+                        {
+                            markers.bot_new.push((
+                                n.into(),
+                                t.into(),
+                                i.into(),
+                                p.filter(|s| !s.is_empty()).map(String::from),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
             }
             continue;
         }
@@ -484,6 +518,33 @@ async fn do_turn(env: &Env, bot: &Bot, topic_id: i64, text: &str, depth: u8) -> 
             }
         }
     }
+
+    // 7. bot_new: register a new teammate. The supervisor sweep picks it
+    //    up within ~10s — it creates its topic and starts working.
+    for (name, token, instructions, provider) in markers.bot_new {
+        let result = async {
+            let me = BotApi::new(&token).get_me().await?;
+            let username = me.username.unwrap_or_else(|| "?".into());
+            let bot2 = Bot {
+                name: name.clone(),
+                token,
+                username: Some(username.clone()),
+                topic_id: None,
+                instructions,
+                provider: provider.unwrap_or_else(|| bot.provider.clone()),
+                model: None,
+                greeting: None,
+            };
+            db_call(&env.db, move |s| s.add_bot(&bot2)).await?;
+            Ok::<_, Error>(username)
+        }
+        .await;
+        let note = match result {
+            Ok(u) => format!("🤖 *{name}* registered (@{u}) — starting up in its own topic"),
+            Err(e) => format!("⚠️ couldn't register *{name}*: {e}"),
+        };
+        let _ = api.send_message(env.group_id, &note, Some(topic_id)).await;
+    }
     Ok(())
 }
 
@@ -661,6 +722,7 @@ mod tests {
             instructions: String::new(),
             provider: "echo".into(),
             model: None,
+            greeting: None,
         };
         let api = BotApi::new("TESTTOKEN").with_base(&mock.base);
 

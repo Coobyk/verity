@@ -72,7 +72,10 @@ fn system_prompt(ctx: &TurnContext) -> String {
              To hand work to one, emit `:::tell name: what to do:::` on its own line — \
              they run the task and reply in the topic as themselves. \
              To fan out up to three short-lived helpers on part of the task, emit \
-             `:::spawn label: task:::`; their results are folded into your reply.",
+             `:::spawn label: task:::`; their results are folded into your reply. \
+             To register a brand-new teammate bot (when given a BotFather token), emit \
+             `:::bot_new name | token | instructions | provider:::` — provider optional, \
+             it defaults to yours.",
             ctx.peers.join(", ")
         ));
     }

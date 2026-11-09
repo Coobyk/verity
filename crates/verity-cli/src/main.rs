@@ -97,6 +97,9 @@ enum BotCmd {
         provider: String,
         #[arg(long)]
         model: Option<String>,
+        /// Posted into the bot's topic once, when it's created
+        #[arg(long)]
+        greeting: Option<String>,
     },
     /// List registered bots
     List,
@@ -261,6 +264,7 @@ async fn main() -> Result<()> {
                     instructions,
                     provider,
                     model,
+                    greeting,
                 } => {
                     let api = BotApi::new(&token);
                     let me = api.get_me().await.context("invalid bot token?")?;
@@ -272,6 +276,7 @@ async fn main() -> Result<()> {
                         instructions,
                         provider,
                         model,
+                        greeting,
                     })?;
                     println!("registered {name} (@{})", me.username.unwrap_or_default());
                 }

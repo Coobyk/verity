@@ -39,6 +39,12 @@ Replies can carry `:::` markers, stripped before send:
   the topic as itself (bots can't see each other, so verity routes)
 - `:::spawn label: task:::` — fan out up to 3 helpers; results fold
   back into the reply as collapsible blocks
+- `:::bot_new name | token | instructions | provider:::` — register a
+  brand-new teammate mid-run; the bridge validates the token and it
+  creates its own topic seconds later
+
+Bots registered while `serve` runs start automatically — the bridge
+re-scans the roster every 10s.
 
 ## Setup
 
@@ -56,7 +62,11 @@ verity serve            # bots create their topics on first run
 Each bot picks its provider at registration (`bot new --provider`):
 `pi` (default; `--pi-bin` points at the binary), `echo`, or
 `acp:<cmd> [args]` for any ACP-speaking agent — `acp:claude-code-acp`,
-`acp:codex acp`, `acp:pi --acp`.
+`acp:codex acp`, `acp:pi --acp`, `acp:devin acp --model swe-2-high`.
+
+`bot new --greeting "<text>"` posts a greeting into the bot's topic
+the first time it's created — that's how the Personal Helper Friend
+introduces itself.
 
 Talk to a bot from the terminal without opening a client:
 
