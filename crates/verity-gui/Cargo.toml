@@ -1,0 +1,16 @@
+[package]
+name = "verity-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "verity-gui"
+path = "src/main.rs"
+
+[dependencies]
+verity-core = { path = "../verity-core" }
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+gpui = "0.2"
