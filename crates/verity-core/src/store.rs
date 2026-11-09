@@ -123,6 +123,32 @@ impl Store {
         Ok(out)
     }
 
+    pub fn kv_set(&self, key: &str, value: &str) -> Result<()> {
+        let mut s = self
+            .conn
+            .prepare("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)")?;
+        s.bind((1, key))?;
+        s.bind((2, value))?;
+        s.next()?;
+        Ok(())
+    }
+
+    pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
+        let mut s = self.conn.prepare("SELECT value FROM kv WHERE key = ?")?;
+        s.bind((1, key))?;
+        match s.next()? {
+            State::Row => Ok(Some(s.read(0)?)),
+            State::Done => Ok(None),
+        }
+    }
+
+    pub fn kv_del(&self, key: &str) -> Result<()> {
+        let mut s = self.conn.prepare("DELETE FROM kv WHERE key = ?")?;
+        s.bind((1, key))?;
+        s.next()?;
+        Ok(())
+    }
+
     pub fn get_bot(&self, name: &str) -> Result<Option<Bot>> {
         Ok(self.list_bots()?.into_iter().find(|b| b.name == name))
     }

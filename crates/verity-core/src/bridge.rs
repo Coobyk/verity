@@ -156,6 +156,18 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
         .and_then(|u| u.last().map(|u| u.update_id + 1))
         .unwrap_or(0);
 
+    // Crash recovery: a leftover pending record means the last run died
+    // mid-turn — the 👀 is still on the message. Re-run it.
+    let pkey = pending_key(&bot.name);
+    if let Ok(Some(v)) = db_call(&env.db, move |s| s.kv_get(&pkey)).await {
+        if let Some((mid, text)) = v.split_once('\n') {
+            if let Ok(mid) = mid.parse::<i64>() {
+                warn!(bot = %bot.name, msg = mid, "resuming crashed turn");
+                let _ = handle_turn(&api, bot, env, topic_id, mid, text).await;
+            }
+        }
+    }
+
     loop {
         let updates = match api.get_updates(offset, 30).await {
             Ok(u) => u,
@@ -384,6 +396,11 @@ async fn handle_turn(
     text: &str,
 ) -> Result<()> {
     let _ = api.set_reaction(env.group_id, message_id, "👀").await;
+    // Mark the turn pending — if we die mid-turn, the leftover record
+    // (and the lingering 👀) lets a restart re-run it.
+    let pkey = pending_key(&bot.name);
+    let pval = format!("{message_id}\n{text}");
+    let _ = db_call(&env.db, move |s| s.kv_set(&pkey, &pval)).await;
     let _ = api
         .send_chat_action(env.group_id, "typing", Some(topic_id))
         .await;
@@ -398,10 +415,18 @@ async fn handle_turn(
     if let Some(id) = progress_id {
         let _ = api.delete_message(env.group_id, id).await;
     }
+    // Turn over (success or failure — failure already got ⚠️ upstream):
+    // clear pending + swap 👀 for ✅ so nothing lingers.
+    let pkey = pending_key(&bot.name);
+    let _ = db_call(&env.db, move |s| s.kv_del(&pkey)).await;
     if result.is_ok() {
         let _ = api.set_reaction(env.group_id, message_id, "✅").await;
     }
     result
+}
+
+fn pending_key(bot_name: &str) -> String {
+    format!("pending:{bot_name}")
 }
 
 /// One turn of agent work for `bot` in `topic_id`: context → harness →
