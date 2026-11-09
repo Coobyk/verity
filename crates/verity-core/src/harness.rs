@@ -52,7 +52,11 @@ pub trait Harness: Send + Sync {
 /// strips and acts on.
 fn system_prompt(ctx: &TurnContext) -> String {
     let mut s = format!(
-        "You are {}, a teammate bot in a Telegram group. Follow these standing instructions:\n{}\n",
+        "You are {}, a teammate bot in a Telegram group. \
+         This is chat, not email: reply casually and directly. \
+         No salutations or greeting prefixes — don't open by \
+         addressing the sender by name. Get straight to it.\n\
+         Follow these standing instructions:\n{}\n",
         ctx.bot_name, ctx.instructions
     );
     if !ctx.memory.is_empty() {
