@@ -288,10 +288,11 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
             if let Err(e) = handle_turn(&api, bot, env, topic_id, msg.message_id, &text).await {
                 warn!(bot = %bot.name, error = %e, "turn failed");
                 let _ = api.set_reaction(env.group_id, msg.message_id, "⚠️").await;
+                let detail: String = e.to_string().chars().take(300).collect();
                 let _ = api
                     .send_message(
                         env.group_id,
-                        "Something went wrong on my side.",
+                        &format!("uh — broke on my side: {detail}"),
                         Some(topic_id),
                     )
                     .await;
@@ -556,7 +557,14 @@ async fn send_reply(api: &BotApi, group_id: i64, topic_id: i64, reply: &str) -> 
             Err(e) => {
                 debug!(error = %e, "rich send failed, falling back to text");
                 for chunk in split_markdown(&part, TEXT_LIMIT) {
-                    api.send_message(group_id, &chunk, Some(topic_id)).await?;
+                    // Legacy markdown render first; raw text last resort.
+                    if api
+                        .send_markdown_message(group_id, &chunk, Some(topic_id))
+                        .await
+                        .is_err()
+                    {
+                        api.send_message(group_id, &chunk, Some(topic_id)).await?;
+                    }
                 }
             }
         }
@@ -769,7 +777,7 @@ async fn do_turn(env: &Env, bot: &Bot, topic_id: i64, text: &str, depth: u8) -> 
                         }
                     });
                     let _ = api
-                        .send_message(
+                        .send_markdown_message(
                             env.group_id,
                             &format!("📨 handed off to *{tname}* — they'll answer in their own topic"),
                             Some(topic_id),
@@ -805,7 +813,9 @@ async fn do_turn(env: &Env, bot: &Bot, topic_id: i64, text: &str, depth: u8) -> 
             Ok(u) => format!("🤖 *{name}* registered (@{u}) — starting up in its own topic"),
             Err(e) => format!("⚠️ couldn't register *{name}*: {e}"),
         };
-        let _ = api.send_message(env.group_id, &note, Some(topic_id)).await;
+        let _ = api
+            .send_markdown_message(env.group_id, &note, Some(topic_id))
+            .await;
     }
     Ok(!markers.spawn.is_empty())
 }

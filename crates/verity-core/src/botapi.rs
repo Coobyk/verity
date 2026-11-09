@@ -165,6 +165,22 @@ impl BotApi {
         self.call("sendMessage", &body).await
     }
 
+    /// Plain sendMessage with legacy `parse_mode: Markdown` — good
+    /// fallback render for GFM-ish text when sendRichMessage fails.
+    pub async fn send_markdown_message(
+        &self,
+        chat_id: i64,
+        text: &str,
+        thread_id: Option<i64>,
+    ) -> Result<Message> {
+        let mut body =
+            json!({ "chat_id": chat_id, "text": text, "parse_mode": "Markdown" });
+        if let Some(t) = thread_id {
+            body["message_thread_id"] = t.into();
+        }
+        self.call("sendMessage", &body).await
+    }
+
     /// Send a rich (block-structured, up to 32k chars, LaTeX/tables) message.
     pub async fn send_rich_message(
         &self,
