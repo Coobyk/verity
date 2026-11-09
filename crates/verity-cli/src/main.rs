@@ -121,6 +121,12 @@ enum BotCmd {
         username: String,
         group: Option<String>,
     },
+    /// Rename a bot's forum topic
+    Topic {
+        name: String,
+        #[arg(long)]
+        title: String,
+    },
     /// List registered bots
     List,
     /// Remove a bot (does not delete its topic)
@@ -332,6 +338,19 @@ async fn main() -> Result<()> {
                     let peer = tg.peer(&group_of(&cfg, group)?).await?;
                     tg.invite_bot_admin(peer, &username).await?;
                     println!("invited @{username} + granted admin");
+                }
+                BotCmd::Topic { name, title } => {
+                    let b = store
+                        .get_bot(&name)?
+                        .context("no such bot")?;
+                    let topic = b
+                        .topic_id
+                        .context("bot has no topic yet — run `verity serve` once")?;
+                    let group_id = Config::load()?.group_id.context("no group_id")?;
+                    BotApi::new(&b.token)
+                        .edit_forum_topic(group_id, topic, &title)
+                        .await?;
+                    println!("topic renamed to {title}");
                 }
                 BotCmd::List => {
                     for b in store.list_bots()? {
