@@ -181,10 +181,31 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
             offset = update.update_id + 1;
             // Confirm-button clicks for the destructive commands.
             if let Some(cb) = update.callback_query {
-                let _ = api.answer_callback_query(&cb.id).await;
                 if let (Some(data), Some(m)) = (cb.data, cb.message) {
                     if m.message_thread_id == Some(topic_id) {
-                        run_command(&api, bot, env, topic_id, &data, m.message_id).await;
+                        match data.as_str() {
+                            "v:cancel" => {
+                                let _ = api.answer_callback_query(&cb.id, Some("cancelled")).await;
+                                let _ = api.delete_message(env.group_id, m.message_id).await;
+                            }
+                            d if d.starts_with("v:") => {
+                                let mut f = d[2..].rsplitn(2, ':');
+                                match (f.next(), f.next()) {
+                                    (Some("ok"), Some(cmd)) => {
+                                        let _ = api.answer_callback_query(&cb.id, None).await;
+                                        run_command(&api, bot, env, topic_id, cmd, m.message_id)
+                                            .await;
+                                    }
+                                    (Some("no"), Some(_)) => {
+                                        let _ = api
+                                            .answer_callback_query(&cb.id, Some("nope — try again"))
+                                            .await;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 continue;
@@ -205,21 +226,53 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
                 .strip_prefix('/')
                 .map(|c| c.split_whitespace().next().unwrap_or(""))
             {
-                let (ask, label) = match cmd {
-                    "clear" => ("Wipe my memory? Can't undo this.", "Yes, wipe it"),
-                    "clearchat" => (
-                        "Delete every message in this topic AND wipe my memory? Can't undo.",
-                        "Yes, clear it all",
-                    ),
-                    "reset" => (
-                        "Delete every other topic and wipe ALL my memory? Can't undo.",
-                        "Yes, reset everything",
-                    ),
-                    _ => ("", ""),
+                let ask = match cmd {
+                    "clear" => "Wipe my memory? Can't undo this.",
+                    "clearchat" => {
+                        "Delete every message in this topic AND wipe my memory? Can't undo."
+                    }
+                    "reset" => "Delete every other topic and wipe ALL my memory? Can't undo.",
+                    _ => "",
                 };
                 if !ask.is_empty() {
+                    // Quiz-confirm: pick the right answer among decoys.
+                    let mut rng = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.subsec_nanos() as u64)
+                        .unwrap_or(1);
+                    let mut next = || {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 7;
+                        rng ^= rng << 17;
+                        rng
+                    };
+                    let (a, b) = (2 + next() % 8, 2 + next() % 8);
+                    let ans = a + b;
+                    let mut opts: Vec<u64> = vec![ans];
+                    while opts.len() < 4 {
+                        let d = (ans as i64 + (next() % 7) as i64 - 3).max(0) as u64;
+                        if !opts.contains(&d) {
+                            opts.push(d);
+                        }
+                    }
+                    for i in (1..opts.len()).rev() {
+                        opts.swap(i, (next() as usize) % (i + 1));
+                    }
+                    let row: Vec<(String, String)> = opts
+                        .iter()
+                        .map(|o| {
+                            let verdict = if *o == ans { "ok" } else { "no" };
+                            (o.to_string(), format!("v:{cmd}:{verdict}"))
+                        })
+                        .collect();
+                    let prompt = format!("{ask}\n\nTo confirm, tap the answer to {a} + {b}:");
                     let _ = api
-                        .send_confirm(env.group_id, ask, Some(topic_id), label, cmd)
+                        .send_buttons(
+                            env.group_id,
+                            &prompt,
+                            Some(topic_id),
+                            &[row, vec![("Cancel".into(), "v:cancel".into())]],
+                        )
                         .await;
                     continue;
                 }

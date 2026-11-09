@@ -306,16 +306,25 @@ impl BotApi {
         Ok(())
     }
 
-    /// Send a confirmation prompt with a single inline button.
-    /// Returns the sent message's id.
-    pub async fn send_confirm(
+    /// Send a prompt with rows of inline buttons — `(label, callback_data)`
+    /// per button, one Vec per row. Returns the sent message's id.
+    pub async fn send_buttons(
         &self,
         chat_id: i64,
         text: &str,
         topic_id: Option<i64>,
-        button: &str,
-        data: &str,
+        rows: &[Vec<(String, String)>],
     ) -> Result<i64> {
+        let keyboard: Vec<Vec<serde_json::Value>> = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|(label, data)| {
+                        json!({"text": label, "callback_data": data})
+                    })
+                    .collect()
+            })
+            .collect();
         let m: Message = self
             .call(
                 "sendMessage",
@@ -323,17 +332,20 @@ impl BotApi {
                     "chat_id": chat_id,
                     "text": text,
                     "message_thread_id": topic_id,
-                    "reply_markup": {"inline_keyboard": [[{"text": button, "callback_data": data}]]},
+                    "reply_markup": {"inline_keyboard": keyboard},
                 }),
             )
             .await?;
         Ok(m.message_id)
     }
 
-    /// Dismiss the spinner on a clicked inline button.
-    pub async fn answer_callback_query(&self, id: &str) -> Result<()> {
-        self.call::<bool>("answerCallbackQuery", &json!({"callback_query_id": id}))
-            .await?;
+    /// Dismiss the spinner on a clicked inline button; `text` shows a toast.
+    pub async fn answer_callback_query(&self, id: &str, text: Option<&str>) -> Result<()> {
+        self.call::<bool>(
+            "answerCallbackQuery",
+            &json!({"callback_query_id": id, "text": text, "show_alert": text.is_some()}),
+        )
+        .await?;
         Ok(())
     }
 
