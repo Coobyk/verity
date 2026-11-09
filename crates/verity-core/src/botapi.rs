@@ -108,7 +108,12 @@ impl BotApi {
     pub fn new(token: impl Into<String>) -> Self {
         Self {
             token: token.into(),
-            http: reqwest::Client::new(),
+            // 75s > the 30s getUpdates long-poll; a stalled connection
+            // must error out instead of hanging the bot loop forever.
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(75))
+                .build()
+                .expect("reqwest client"),
             base: std::env::var("VERITY_BOT_API_BASE").unwrap_or_else(|_| API_BASE.into()),
         }
     }
@@ -243,8 +248,9 @@ impl BotApi {
 
     /// Edit a previously sent message's text. Used for the single
     /// progress message a long turn keeps updated before deleting it.
+    /// Returns `Message`, not `true` (that's only for inline edits).
     pub async fn edit_message(&self, chat_id: i64, message_id: i64, text: &str) -> Result<()> {
-        self.call::<bool>(
+        self.call::<Message>(
             "editMessageText",
             &json!({ "chat_id": chat_id, "message_id": message_id, "text": text }),
         )
