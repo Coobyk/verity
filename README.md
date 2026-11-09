@@ -10,19 +10,19 @@ a native Rust client, and a quiet bridge that does the work.
   (`grammers`, reads full history bots can't), a SQLite brain, a `Harness`
   seam for agent providers, and the quiet-bot bridge loop.
 - **`verity`** (CLI) — config, login, bot management, `serve`, and
-  Telegram as *you* (`topics`, `history`, `say`).
-- **`verity-gui`** — GPUI client that reads *and writes* the supergroup
-  as *you*. Chat history needs no daemon.
+  Telegram as *you* (`groups`, `rename`, `topics`, `history`, `say`).
+- **`verity-gui`** — GPUI client, shelved for now (chat history needs
+  no daemon; the CLI covers the read/write path meanwhile).
 
 ## Design
 
 ```
-You ──► verity-gui / verity (grammers, logged in as YOU)
+You ──► verity (grammers, logged in as YOU)
           reads "Verity HQ" supergroup straight from Telegram cloud
           topics = per-bot threads · you type as yourself
                     ▲
         verity serve (Bot API, one bot token per teammate)
-          bots watch their topic, work quietly, post one rich reply
+          bots watch their topic, work quietly, post rich replies
           SQLite holds brains (memory, config) — chats live in Telegram
 ```
 
