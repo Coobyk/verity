@@ -243,13 +243,14 @@ impl Tg {
             is_self: Some(true),
         });
         if let Some(tl::enums::updates::State::State(s)) = update_state {
-            self.session.set_update_state(UpdateState::All(UpdatesState {
-                pts: s.pts,
-                qts: s.qts,
-                date: s.date,
-                seq: s.seq,
-                channels: Vec::new(),
-            }));
+            self.session
+                .set_update_state(UpdateState::All(UpdatesState {
+                    pts: s.pts,
+                    qts: s.qts,
+                    date: s.date,
+                    seq: s.seq,
+                    channels: Vec::new(),
+                }));
         }
         Ok(())
     }
@@ -299,9 +300,7 @@ impl Tg {
             })
             .await
         {
-            Ok(tl::enums::auth::Authorization::Authorization(a)) => {
-                self.complete_login(a).await
-            }
+            Ok(tl::enums::auth::Authorization::Authorization(a)) => self.complete_login(a).await,
             Ok(tl::enums::auth::Authorization::SignUpRequired(_)) => Err(Error::Mtproto(
                 "this number isn't registered on Telegram".into(),
             )),
@@ -367,8 +366,7 @@ impl Tg {
             let bare = peer.id().bare_id();
             let info = match peer {
                 Peer::Group(g) if g.is_megagroup() => {
-                    let is_forum =
-                        matches!(&g.raw, tl::enums::Chat::Channel(c) if c.forum);
+                    let is_forum = matches!(&g.raw, tl::enums::Chat::Channel(c) if c.forum);
                     GroupInfo {
                         // supergroup chat_id = -100 concat bare channel id
                         chat_id: -(1_000_000_000_000 + bare),
@@ -426,6 +424,19 @@ impl Tg {
             .ok_or_else(|| Error::Mtproto("createChannel: no channel in updates".into()))?;
         // supergroup chat_id = -100 concat bare channel id
         Ok(-(1_000_000_000_000 + channel_id))
+    }
+
+    /// Our own user id — used to gate bot DMs to the owner.
+    pub async fn self_id(&self) -> Result<i64> {
+        let me = self
+            .client
+            .get_me()
+            .await
+            .map_err(|e| Error::Mtproto(format!("get_me: {e}")))?;
+        match me.raw {
+            tl::enums::User::User(u) => Ok(u.id),
+            _ => Err(Error::Mtproto("get_me: not a user".into())),
+        }
     }
 
     /// Rename a supergroup/channel via `channels.editTitle`.
@@ -753,11 +764,14 @@ impl Tg {
                     .map(|(a, b)| {
                         a.chars().all(|c| c.is_ascii_digit())
                             && b.len() >= 30
-                            && b.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                            && b.chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
                     })
                     .unwrap_or(false)
             })
-            .map(|w| w.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-'));
+            .map(|w| {
+                w.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+            });
         match token {
             Some(t) => Ok(t.to_string()),
             // Username taken etc. — surface BotFather's own words.
@@ -830,9 +844,7 @@ impl Tg {
         // "OK, you selected @x_bot. Are you sure? Send 'Yes, I am
         // totally sure.' to confirm…" — echo the quoted phrase back.
         // BotFather may send it fresh *or* edit the picker in place.
-        let ask = self
-            .wait_confirm(bf_ref, picker_id)
-            .await?;
+        let ask = self.wait_confirm(bf_ref, picker_id).await?;
         let phrase = ask
             .split('\'')
             .nth(1)
@@ -916,7 +928,9 @@ impl Tg {
                 || l.contains("occupied")
                 || l.contains("invalid")
             {
-                return Err(Error::Mtproto(format!("botfather rejected a step: {prompt}")));
+                return Err(Error::Mtproto(format!(
+                    "botfather rejected a step: {prompt}"
+                )));
             }
             last = self.last_msg_id(bf_ref).await;
             if l.contains("gif") || l.contains("skip") {
@@ -1190,11 +1204,15 @@ impl Tg {
         };
         let mut out = Vec::new();
         for u in p.users {
-            let tl::enums::User::User(u) = u else { continue };
+            let tl::enums::User::User(u) = u else {
+                continue;
+            };
             if !u.bot {
                 continue;
             }
-            let Some(access_hash) = u.access_hash else { continue };
+            let Some(access_hash) = u.access_hash else {
+                continue;
+            };
             out.push(BotMember {
                 user_id: u.id,
                 username: u.username.clone(),
@@ -1210,7 +1228,11 @@ impl Tg {
     /// Kick a member via `channels.editBanned` — works on admins too
     /// (the Bot API's unban can't touch them). The ban carries a 60s
     /// expiry: kicked now, but re-invitable later.
-    pub async fn kick_member(&self, peer: PeerRef, participant: tl::enums::InputPeer) -> Result<()> {
+    pub async fn kick_member(
+        &self,
+        peer: PeerRef,
+        participant: tl::enums::InputPeer,
+    ) -> Result<()> {
         let until_date = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i32 + 60)
@@ -1219,31 +1241,29 @@ impl Tg {
             .invoke(&tl::functions::channels::EditBanned {
                 channel: peer.into(),
                 participant,
-                banned_rights: tl::enums::ChatBannedRights::Rights(
-                    tl::types::ChatBannedRights {
-                        view_messages: true,
-                        send_messages: false,
-                        send_media: false,
-                        send_stickers: false,
-                        send_gifs: false,
-                        send_games: false,
-                        send_inline: false,
-                        embed_links: false,
-                        send_polls: false,
-                        change_info: false,
-                        invite_users: false,
-                        pin_messages: false,
-                        manage_topics: false,
-                        send_photos: false,
-                        send_videos: false,
-                        send_roundvideos: false,
-                        send_audios: false,
-                        send_voices: false,
-                        send_docs: false,
-                        send_plain: false,
-                        until_date,
-                    },
-                ),
+                banned_rights: tl::enums::ChatBannedRights::Rights(tl::types::ChatBannedRights {
+                    view_messages: true,
+                    send_messages: false,
+                    send_media: false,
+                    send_stickers: false,
+                    send_gifs: false,
+                    send_games: false,
+                    send_inline: false,
+                    embed_links: false,
+                    send_polls: false,
+                    change_info: false,
+                    invite_users: false,
+                    pin_messages: false,
+                    manage_topics: false,
+                    send_photos: false,
+                    send_videos: false,
+                    send_roundvideos: false,
+                    send_audios: false,
+                    send_voices: false,
+                    send_docs: false,
+                    send_plain: false,
+                    until_date,
+                }),
             })
             .await
             .map_err(|e| Error::Mtproto(format!("editBanned: {e}")))?;

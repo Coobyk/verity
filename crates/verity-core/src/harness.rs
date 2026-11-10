@@ -14,8 +14,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tracing::info;
 use tokio::process::Command;
+use tracing::info;
 
 use crate::{Error, Result};
 
@@ -334,7 +334,10 @@ impl AcpHarness {
                 Ok(None) => break, // agent exited
                 Err(e) => return Err(Error::Harness(format!("acp read: {e}"))),
             };
-            info!("acp <- {}", &line[..line.floor_char_boundary(line.len().min(300))]);
+            info!(
+                "acp <- {}",
+                &line[..line.floor_char_boundary(line.len().min(300))]
+            );
             let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue; // not JSON-RPC — ignore stray output
             };
@@ -402,7 +405,7 @@ impl AcpHarness {
         }
 
         drop(stdin); // close the pipe so the server can exit
-        // Per-turn agent: don't wait indefinitely — kill if it lingers.
+                     // Per-turn agent: don't wait indefinitely — kill if it lingers.
         let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
         let _ = child.kill().await;
         let stderr = stderr_buf.await.unwrap_or_default();

@@ -93,9 +93,7 @@ pub async fn upload(api: &BotApi, group_id: i64) -> Result<Vec<String>> {
         let archive = stage.join(&name);
         let (home2, archive2) = (home.clone(), archive.clone());
         let user_home = dirs::home_dir();
-        tokio::task::spawn_blocking(move || {
-            pack(&home2, user_home.as_deref(), &snaps, &archive2)
-        })
+        tokio::task::spawn_blocking(move || pack(&home2, user_home.as_deref(), &snaps, &archive2))
             .await
             .map_err(|e| Error::Other(e.to_string()))??;
         api.send_document(group_id, &archive, Some(CAPTION), None)
@@ -312,11 +310,9 @@ pub async fn restore_arg(arg: &str) -> Result<Vec<String>> {
             let home = Config::home()?;
             std::fs::create_dir_all(&home)?;
             let user_home = dirs::home_dir();
-            tokio::task::spawn_blocking(move || {
-                extract(&archive, &home, user_home.as_deref())
-            })
-            .await
-            .map_err(|e| Error::Other(e.to_string()))?
+            tokio::task::spawn_blocking(move || extract(&archive, &home, user_home.as_deref()))
+                .await
+                .map_err(|e| Error::Other(e.to_string()))?
         }
         .await;
         let _ = std::fs::remove_dir_all(&stage);
@@ -452,10 +448,12 @@ fn extract(archive: &Path, home: &Path, user_home: Option<&Path>) -> Result<Vec<
             }
             // Reject `..`/absolute paths outright — never write outside.
             let rel = Path::new(&name);
-            if rel
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir))
-            {
+            if rel.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir | std::path::Component::RootDir
+                )
+            }) {
                 return Ok(true);
             }
             let mut data = Vec::new();
@@ -505,11 +503,9 @@ fn extract(archive: &Path, home: &Path, user_home: Option<&Path>) -> Result<Vec<
             let data = match &src_home {
                 // Swap the backup machine's $HOME for this one so
                 // absolute paths in units point at real files again.
-                Some(old) if !old.is_empty() && *old != new_home => {
-                    String::from_utf8_lossy(&data)
-                        .replace(old.as_str(), &new_home)
-                        .into_bytes()
-                }
+                Some(old) if !old.is_empty() && *old != new_home => String::from_utf8_lossy(&data)
+                    .replace(old.as_str(), &new_home)
+                    .into_bytes(),
                 _ => data,
             };
             let dest = uhome.join(&rest);
@@ -596,11 +592,10 @@ mod tests {
         assert!(got.contains(&"sub/x.txt".to_string()));
         assert!(got.contains(&"state.sqlite".to_string()));
         assert!(!got.iter().any(|n| n.contains("big.bin")));
-        assert!(!got.iter().any(|n| n.ends_with("-wal") || n.ends_with(".part")));
-        assert_eq!(
-            std::fs::read_to_string(out.join("sub/x.txt")).unwrap(),
-            "x"
-        );
+        assert!(!got
+            .iter()
+            .any(|n| n.ends_with("-wal") || n.ends_with(".part")));
+        assert_eq!(std::fs::read_to_string(out.join("sub/x.txt")).unwrap(), "x");
         assert!(!out.join("target/big.bin").exists());
         assert!(!out.join("state.sqlite-wal").exists());
         // The marker is consumed for the rewrite, never written out.
@@ -616,10 +611,7 @@ mod tests {
         // _home overlay lands under the restore machine's $HOME, with
         // the backup machine's home path rewritten to the local one.
         assert_eq!(
-            std::fs::read_to_string(
-                out_home.join(".config/systemd/user/verity.service")
-            )
-            .unwrap(),
+            std::fs::read_to_string(out_home.join(".config/systemd/user/verity.service")).unwrap(),
             format!(
                 "[Service]\nExecStart={}/verity/target/release/verity serve",
                 out_home.display()

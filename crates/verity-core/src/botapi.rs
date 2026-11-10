@@ -210,8 +210,7 @@ impl BotApi {
         thread_id: Option<i64>,
         reply_to: Option<i64>,
     ) -> Result<Message> {
-        let mut body =
-            json!({ "chat_id": chat_id, "text": text, "parse_mode": "Markdown" });
+        let mut body = json!({ "chat_id": chat_id, "text": text, "parse_mode": "Markdown" });
         if let Some(t) = thread_id {
             body["message_thread_id"] = t.into();
         }
@@ -258,7 +257,10 @@ impl BotApi {
             .to_string();
         let mut form = reqwest::multipart::Form::new()
             .text("chat_id", chat_id.to_string())
-            .part("document", reqwest::multipart::Part::bytes(bytes).file_name(name));
+            .part(
+                "document",
+                reqwest::multipart::Part::bytes(bytes).file_name(name),
+            );
         if let Some(c) = caption {
             form = form.text("caption", c.to_string());
         }
@@ -444,9 +446,7 @@ impl BotApi {
             .iter()
             .map(|row| {
                 row.iter()
-                    .map(|(label, data)| {
-                        json!({"text": label, "callback_data": data})
-                    })
+                    .map(|(label, data)| json!({"text": label, "callback_data": data}))
                     .collect()
             })
             .collect();

@@ -80,6 +80,8 @@ pub struct Bridge {
     /// Absent in `--echo` or when the user isn't logged in.
     pub tg: Option<Arc<Tg>>,
     pub tg_peer: Option<PeerRef>,
+    /// The logged-in user's id — bots answer their DMs only for them.
+    pub owner_id: Option<i64>,
 }
 
 /// Everything a turn needs besides the triggering message — cloneable so
@@ -91,6 +93,8 @@ struct Env {
     make: Arc<MakeHarness>,
     tg: Option<Arc<Tg>>,
     peer: Option<PeerRef>,
+    /// The logged-in user's id — only they may DM the bots.
+    owner_id: Option<i64>,
 }
 
 /// Supervisor sweep interval: how often the bridge looks for newly
@@ -110,6 +114,7 @@ impl Bridge {
             make: self.make_harness.clone(),
             tg: self.tg.clone(),
             peer: self.tg_peer,
+            owner_id: self.owner_id,
         };
         // Periodic backup of ~/verity into General — the off-machine
         // copy that survives a dead laptop or a move to a VM. First one
@@ -124,10 +129,7 @@ impl Bridge {
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(every).await;
-                    let bot = db_call(&env.db, |s| s.primary_bot())
-                        .await
-                        .ok()
-                        .flatten();
+                    let bot = db_call(&env.db, |s| s.primary_bot()).await.ok().flatten();
                     match bot {
                         Some(b) => {
                             let api = BotApi::new(&b.token);
@@ -196,7 +198,7 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
             .map_err(|e| Error::Other(e.to_string()))??;
             info!(bot = %bot.name, topic = tid, "created topic");
             if let Some(g) = &bot.greeting {
-                let _ = send_reply(&api, env.group_id, tid, g, None).await;
+                let _ = send_reply(&api, env.group_id, Some(tid), g, None).await;
             }
             tid
         }
@@ -225,7 +227,9 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
         let (api, bot, env, sem) = (api.clone(), bot.clone(), env.clone(), sem.clone());
         inflight.spawn(async move {
             let _permit = sem.acquire().await.ok();
-            if let Err(e) = handle_turn(&api, &bot, &env, topic_id, mid, &text).await {
+            if let Err(e) =
+                handle_turn(&api, &bot, &env, env.group_id, Some(topic_id), mid, &text).await
+            {
                 warn!(bot = %bot.name, error = %e, "resumed turn failed");
             }
         });
@@ -294,17 +298,31 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
                 continue;
             }
             let Some(msg) = update.message else { continue };
-            if msg.chat.id != env.group_id || msg.message_thread_id != Some(topic_id) {
+            // Two homes: our forum topic, or a DM with the owner
+            // (private chats have positive ids). Strangers get silence.
+            let dm = msg.chat.id > 0;
+            if dm {
+                let mine =
+                    env.owner_id.is_some() && msg.from.as_ref().map(|u| u.id) == env.owner_id;
+                if !mine {
+                    continue;
+                }
+            } else if msg.chat.id != env.group_id || msg.message_thread_id != Some(topic_id) {
                 continue;
             }
             if msg.from.as_ref().map(|u| u.is_bot).unwrap_or(true) {
                 continue; // never react to bots (incl. ourselves)
             }
+            let (chat_id, thread) = if dm {
+                (msg.chat.id, None)
+            } else {
+                (env.group_id, Some(topic_id))
+            };
             // Spawn and keep polling: each message gets its own task so a
             // long turn doesn't block the next one.
             let (api, bot, env, sem) = (api.clone(), bot.clone(), env.clone(), sem.clone());
             inflight.spawn(async move {
-                handle_message(&api, &bot, &env, topic_id, sem, msg).await;
+                handle_message(&api, &bot, &env, chat_id, thread, sem, msg).await;
             });
         }
         // Reap finished tasks; log the ones that went down hard.
@@ -323,7 +341,8 @@ async fn handle_message(
     api: &BotApi,
     bot: &Bot,
     env: &Env,
-    topic_id: i64,
+    chat_id: i64,
+    thread: Option<i64>,
     sem: Arc<Semaphore>,
     msg: crate::botapi::Message,
 ) {
@@ -356,12 +375,25 @@ async fn handle_message(
     if text.trim().is_empty() {
         return;
     }
+    // DM /start → the greeting, same first-contact ritual the topic has.
+    if thread.is_none() && text.trim() == "/start" {
+        let gkey = format!("greeted:{}", bot.name);
+        if let Some(g) = &bot.greeting {
+            let _ = send_reply(api, chat_id, None, g, Some(msg.message_id)).await;
+            let gkey2 = gkey.clone();
+            let _ = db_call(&env.db, move |s| s.kv_set(&gkey2, "1")).await;
+            return;
+        }
+    }
     // In-chat commands — destructive, so they confirm via an
-    // inline button before anything runs.
-    if let Some(cmd) = text
-        .strip_prefix('/')
-        .map(|c| c.split_whitespace().next().unwrap_or(""))
-    {
+    // inline button before anything runs. Group topics only —
+    // a DM skips this and falls through to the turn below.
+    let cmd = thread.and_then(|_| {
+        text.strip_prefix('/')
+            .map(|c| c.split_whitespace().next().unwrap_or(""))
+    });
+    if let Some(cmd) = cmd {
+        let topic_id = thread.unwrap_or(0);
         let ask = match cmd {
             "backup" => {
                 // Not destructive — no quiz-confirm needed.
@@ -429,17 +461,17 @@ async fn handle_message(
     debug!(bot = %bot.name, %text, "turn request");
     // Acknowledge immediately — queued behind other turns, the 🕒 says
     // "seen, will get to it". `handle_turn` swaps it to 👀 on start.
-    let _ = api.set_reaction(env.group_id, msg.message_id, "🕒").await;
+    let _ = api.set_reaction(chat_id, msg.message_id, "🕒").await;
     let _permit = sem.acquire().await.ok();
-    if let Err(e) = handle_turn(api, bot, env, topic_id, msg.message_id, &text).await {
+    if let Err(e) = handle_turn(api, bot, env, chat_id, thread, msg.message_id, &text).await {
         warn!(bot = %bot.name, error = %e, "turn failed");
-        let _ = api.set_reaction(env.group_id, msg.message_id, "⚠️").await;
+        let _ = api.set_reaction(chat_id, msg.message_id, "⚠️").await;
         let detail: String = e.to_string().chars().take(300).collect();
         let _ = api
             .send_message(
-                env.group_id,
+                chat_id,
                 &format!("uh — broke on my side: {detail}"),
-                Some(topic_id),
+                thread,
                 Some(msg.message_id),
             )
             .await;
@@ -476,7 +508,14 @@ async fn recover_pending(db: &Path, bot_name: &str) -> Vec<(i64, String)> {
 
 /// Execute a confirmed destructive command (button click landed in our
 /// topic). `confirm_mid` is the prompt message to clean up after.
-async fn run_command(api: &BotApi, bot: &Bot, env: &Env, topic_id: i64, cmd: &str, confirm_mid: i64) {
+async fn run_command(
+    api: &BotApi,
+    bot: &Bot,
+    env: &Env,
+    topic_id: i64,
+    cmd: &str,
+    confirm_mid: i64,
+) {
     info!(bot = %bot.name, %cmd, "confirmed command executing");
     let n = bot.name.clone();
     let wipe = move |s: &Store| -> Result<()> {
@@ -506,7 +545,7 @@ async fn run_command(api: &BotApi, bot: &Bot, env: &Env, topic_id: i64, cmd: &st
             let _ = api.delete_message(env.group_id, confirm_mid).await;
             let _ = db_call(&env.db, wipe).await;
             if let Some(g) = &bot.greeting {
-                let _ = send_reply(api, env.group_id, topic_id, g, None).await;
+                let _ = send_reply(api, env.group_id, Some(topic_id), g, None).await;
             }
         }
         "reset" => {
@@ -573,10 +612,15 @@ async fn run_command(api: &BotApi, bot: &Bot, env: &Env, topic_id: i64, cmd: &st
             };
             if let Some(t) = new_tid {
                 let _ = api
-                    .send_message(env.group_id, &format!("🧹 clean slate — {note}"), Some(t), None)
+                    .send_message(
+                        env.group_id,
+                        &format!("🧹 clean slate — {note}"),
+                        Some(t),
+                        None,
+                    )
                     .await;
                 if let Some(g) = &bot.greeting {
-                    let _ = send_reply(api, env.group_id, t, g, None).await;
+                    let _ = send_reply(api, env.group_id, Some(t), g, None).await;
                 }
             }
         }
@@ -715,12 +759,12 @@ async fn fetch_history(tg: &Tg, peer: &PeerRef, topic_id: i64) -> Vec<(String, S
 
 /// Keep the "typing" indicator alive for the duration of a turn —
 /// Telegram clears it after ~5s, so re-send every 4.
-fn typing_keepalive(api: BotApi, group_id: i64, topic_id: i64) -> tokio::task::JoinHandle<()> {
+fn typing_keepalive(api: BotApi, chat_id: i64, thread: Option<i64>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(4)).await;
             if api
-                .send_chat_action(group_id, "typing", Some(topic_id))
+                .send_chat_action(chat_id, "typing", thread)
                 .await
                 .is_err()
             {
@@ -737,8 +781,8 @@ fn typing_keepalive(api: BotApi, group_id: i64, topic_id: i64) -> tokio::task::J
 /// shared slot holding the message id (for later deletion).
 fn progress_task(
     api: BotApi,
-    group_id: i64,
-    topic_id: i64,
+    chat_id: i64,
+    thread: Option<i64>,
     reply_to: Option<i64>,
     activity: Activity,
 ) -> (tokio::task::JoinHandle<()>, Arc<Mutex<Option<i64>>>) {
@@ -748,10 +792,14 @@ fn progress_task(
         tokio::time::sleep(PROGRESS_AFTER).await;
         let what = || {
             let a = activity.get();
-            if a.is_empty() { "working".to_string() } else { a }
+            if a.is_empty() {
+                "working".to_string()
+            } else {
+                a
+            }
         };
         let Ok(m) = api
-            .send_message(group_id, &format!("⏳ {}…", what()), Some(topic_id), reply_to)
+            .send_message(chat_id, &format!("⏳ {}…", what()), thread, reply_to)
             .await
         else {
             return;
@@ -762,7 +810,7 @@ fn progress_task(
             tokio::time::sleep(PROGRESS_TICK).await;
             let text = format!("⏳ {}… {}s elapsed", what(), start.elapsed().as_secs());
             if api
-                .edit_message(group_id, m.message_id, &text)
+                .edit_message(chat_id, m.message_id, &text)
                 .await
                 .is_err()
             {
@@ -873,14 +921,14 @@ fn extract_markers(reply: &str) -> (String, Markers) {
 /// `reply_to` threads every part back to the triggering message.
 async fn send_reply(
     api: &BotApi,
-    group_id: i64,
-    topic_id: i64,
+    chat_id: i64,
+    thread: Option<i64>,
     reply: &str,
     reply_to: Option<i64>,
 ) -> Result<()> {
     for part in split_markdown(reply, RICH_LIMIT) {
         match api
-            .send_rich_message(group_id, InputRichMessage::markdown(&part), Some(topic_id), reply_to)
+            .send_rich_message(chat_id, InputRichMessage::markdown(&part), thread, reply_to)
             .await
         {
             Ok(_) => continue,
@@ -889,12 +937,11 @@ async fn send_reply(
                 for chunk in split_markdown(&part, TEXT_LIMIT) {
                     // Legacy markdown render first; raw text last resort.
                     if let Err(e) = api
-                        .send_markdown_message(group_id, &chunk, Some(topic_id), reply_to)
+                        .send_markdown_message(chat_id, &chunk, thread, reply_to)
                         .await
                     {
                         warn!(error = %e, "legacy markdown send failed, sending raw");
-                        api.send_message(group_id, &chunk, Some(topic_id), reply_to)
-                            .await?;
+                        api.send_message(chat_id, &chunk, thread, reply_to).await?;
                     }
                 }
             }
@@ -921,37 +968,49 @@ async fn handle_turn(
     api: &BotApi,
     bot: &Bot,
     env: &Env,
-    topic_id: i64,
+    chat_id: i64,
+    thread: Option<i64>,
     message_id: i64,
     text: &str,
 ) -> Result<()> {
-    let _ = api.set_reaction(env.group_id, message_id, "👀").await;
+    let _ = api.set_reaction(chat_id, message_id, "👀").await;
     // Mark the turn pending — if we die mid-turn, the leftover record
     // (and the lingering 👀) lets a restart re-run it. One key per
-    // message so concurrent turns don't clobber each other.
-    let pkey = pending_key(&bot.name, message_id);
-    let pval = text.to_string();
-    let _ = db_call(&env.db, move |s| s.kv_set(&pkey, &pval)).await;
-    let _ = api
-        .send_chat_action(env.group_id, "typing", Some(topic_id))
-        .await;
-    let keepalive = typing_keepalive(api.clone(), env.group_id, topic_id);
+    // message so concurrent turns don't clobber each other. Topic
+    // turns only — crash recovery replays into the topic.
+    if thread.is_some() {
+        let pkey = pending_key(&bot.name, message_id);
+        let pval = text.to_string();
+        let _ = db_call(&env.db, move |s| s.kv_set(&pkey, &pval)).await;
+    }
+    let _ = api.send_chat_action(chat_id, "typing", thread).await;
+    let keepalive = typing_keepalive(api.clone(), chat_id, thread);
     let activity = Activity::default();
     let (progress, progress_msg) = progress_task(
         api.clone(),
-        env.group_id,
-        topic_id,
+        chat_id,
+        thread,
         Some(message_id),
         activity.clone(),
     );
 
-    let result = do_turn(env, bot, topic_id, text, 0, Some(message_id), activity).await;
+    let result = do_turn(
+        env,
+        bot,
+        chat_id,
+        thread,
+        text,
+        0,
+        Some(message_id),
+        activity,
+    )
+    .await;
 
     keepalive.abort();
     progress.abort();
     let progress_id = *progress_msg.lock().unwrap();
     if let Some(id) = progress_id {
-        let _ = api.delete_message(env.group_id, id).await;
+        let _ = api.delete_message(chat_id, id).await;
     }
     // Turn over — clear the pending record, then resolve the 👀:
     // ✅ only when the turn spawned helpers; a plain reply leaves no mark.
@@ -959,10 +1018,10 @@ async fn handle_turn(
     let _ = db_call(&env.db, move |s| s.kv_del(&pkey)).await;
     match &result {
         Ok(o) if o.helpers => {
-            let _ = api.set_reaction(env.group_id, message_id, "✅").await;
+            let _ = api.set_reaction(chat_id, message_id, "✅").await;
         }
         Ok(_) => {
-            let _ = api.clear_reaction(env.group_id, message_id).await;
+            let _ = api.clear_reaction(chat_id, message_id).await;
         }
         Err(_) => {} // upstream marks ⚠️, which also replaces the 👀
     }
@@ -1004,7 +1063,8 @@ fn pending_prefix(bot_name: &str) -> String {
 async fn do_turn(
     env: &Env,
     bot: &Bot,
-    topic_id: i64,
+    chat_id: i64,
+    thread: Option<i64>,
     text: &str,
     depth: u8,
     reply_to: Option<i64>,
@@ -1030,13 +1090,13 @@ async fn do_turn(
     })
     .await
     .unwrap_or_default();
-    let history = match (&env.tg, &env.peer) {
-        (Some(tg), Some(peer)) => fetch_history(tg, peer, topic_id).await,
+    let history = match (thread, &env.tg, &env.peer) {
+        (Some(t), Some(tg), Some(peer)) => fetch_history(tg, peer, t).await,
         _ => Vec::new(),
     };
     let gkey = format!("greeted:{}", bot.name);
-    let first_contact = depth == 0
-        && matches!(db_call(&env.db, move |s| s.kv_get(&gkey)).await, Ok(None));
+    let first_contact =
+        depth == 0 && matches!(db_call(&env.db, move |s| s.kv_get(&gkey)).await, Ok(None));
     let ctx = TurnContext {
         bot_name: bot.name.clone(),
         instructions: bot.instructions.clone(),
@@ -1109,7 +1169,7 @@ async fn do_turn(
     } else {
         reply
     };
-    send_reply(&api, env.group_id, topic_id, &reply, reply_to).await?;
+    send_reply(&api, chat_id, thread, &reply, reply_to).await?;
 
     // `:::backup:::` — the reply asked for a config snapshot; upload
     // ~/verity to General and note it in the topic.
@@ -1118,9 +1178,7 @@ async fn do_turn(
             Ok(files) => format!("🗄 backed up {} to General", files.join(", ")),
             Err(e) => format!("⚠️ backup failed: {e}"),
         };
-        let _ = api
-            .send_message(env.group_id, &note, Some(topic_id), reply_to)
-            .await;
+        let _ = api.send_message(chat_id, &note, thread, reply_to).await;
     }
 
     // 6. Tells: route work to teammates. The teammate answers in ITS OWN
@@ -1139,32 +1197,57 @@ async fn do_turn(
                         let tapi = BotApi::new(&target.token);
                         let ttopic = match target.topic_id {
                             Some(t) => t,
-                            None => match tapi.create_forum_topic(env2.group_id, &target.name).await {
-                                Ok(t) => {
-                                    let (db, n, tid) =
-                                        (env2.db.clone(), target.name.clone(), t.message_thread_id);
-                                    let _ = db_call(&db, move |s| s.set_bot_topic(&n, tid)).await;
-                                    if let Some(g) = &target.greeting {
-                                        let _ = send_reply(&tapi, env2.group_id, tid, g, None).await;
+                            None => {
+                                match tapi.create_forum_topic(env2.group_id, &target.name).await {
+                                    Ok(t) => {
+                                        let (db, n, tid) = (
+                                            env2.db.clone(),
+                                            target.name.clone(),
+                                            t.message_thread_id,
+                                        );
+                                        let _ =
+                                            db_call(&db, move |s| s.set_bot_topic(&n, tid)).await;
+                                        if let Some(g) = &target.greeting {
+                                            let _ = send_reply(
+                                                &tapi,
+                                                env2.group_id,
+                                                Some(tid),
+                                                g,
+                                                None,
+                                            )
+                                            .await;
+                                        }
+                                        tid
                                     }
-                                    tid
+                                    Err(e) => {
+                                        warn!(bot = %target.name, error = %e, "tell: topic create failed");
+                                        return;
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!(bot = %target.name, error = %e, "tell: topic create failed");
-                                    return;
-                                }
-                            },
+                            }
                         };
                         let prompt = format!("Message from teammate {origin}: {msg}");
-                        if let Err(e) = turn(&env2, &target, ttopic, &prompt, depth + 1, None).await {
+                        if let Err(e) = turn(
+                            &env2,
+                            &target,
+                            env2.group_id,
+                            Some(ttopic),
+                            &prompt,
+                            depth + 1,
+                            None,
+                        )
+                        .await
+                        {
                             warn!(bot = %target.name, error = %e, "tell turn failed");
                         }
                     });
                     let _ = api
                         .send_markdown_message(
-                            env.group_id,
-                            &format!("📨 handed off to *{tname}* — they'll answer in their own topic"),
-                            Some(topic_id),
+                            chat_id,
+                            &format!(
+                                "📨 handed off to *{tname}* — they'll answer in their own topic"
+                            ),
+                            thread,
                             reply_to,
                         )
                         .await;
@@ -1199,7 +1282,7 @@ async fn do_turn(
             Err(e) => format!("⚠️ couldn't register *{name}*: {e}"),
         };
         let _ = api
-            .send_markdown_message(env.group_id, &note, Some(topic_id), reply_to)
+            .send_markdown_message(chat_id, &note, thread, reply_to)
             .await;
     }
     Ok(TurnOutcome {
@@ -1243,14 +1326,24 @@ async fn stop_self() {
 fn turn<'a>(
     env: &'a Env,
     bot: &'a Bot,
-    topic_id: i64,
+    chat_id: i64,
+    thread: Option<i64>,
     text: &'a str,
     depth: u8,
     reply_to: Option<i64>,
 ) -> Pin<Box<dyn Future<Output = Result<TurnOutcome>> + Send + 'a>> {
     // Tell-routed turns have no progress message watching them — a
     // throwaway slot keeps the signature uniform.
-    Box::pin(do_turn(env, bot, topic_id, text, depth, reply_to, Activity::default()))
+    Box::pin(do_turn(
+        env,
+        bot,
+        chat_id,
+        thread,
+        text,
+        depth,
+        reply_to,
+        Activity::default(),
+    ))
 }
 
 async fn find_bot(db: &Path, name: &str) -> Option<Bot> {
@@ -1415,6 +1508,7 @@ mod tests {
             make: Arc::new(|_: &str| -> Arc<dyn Harness> { Arc::new(crate::harness::EchoHarness) }),
             tg: None,
             peer: None,
+            owner_id: None,
         };
         let bot = Bot {
             name: "scout".into(),
@@ -1428,7 +1522,7 @@ mod tests {
         };
         let api = BotApi::new("TESTTOKEN").with_base(&mock.base);
 
-        handle_turn(&api, &bot, &env, 7, 42, "hello verity")
+        handle_turn(&api, &bot, &env, -100123, Some(7), 42, "hello verity")
             .await
             .unwrap();
 

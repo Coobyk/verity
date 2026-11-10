@@ -160,10 +160,7 @@ enum BotCmd {
         title: String,
     },
     /// Rename a bot (store name, memory keys, and its topic title if set)
-    Rename {
-        name: String,
-        new_name: String,
-    },
+    Rename { name: String, new_name: String },
     /// List registered bots
     List,
     /// Remove a bot (does not delete its topic)
@@ -335,7 +332,11 @@ async fn run() -> Result<()> {
                 && pi_bin.is_none();
             if interactive {
                 println!("leave blank to keep the current value");
-                if let Some(v) = prompt_keep("api_id (my.telegram.org)", cfg.api_id.map(|v| v.to_string()), false)? {
+                if let Some(v) = prompt_keep(
+                    "api_id (my.telegram.org)",
+                    cfg.api_id.map(|v| v.to_string()),
+                    false,
+                )? {
                     cfg.api_id = Some(v.parse().context("api_id must be a number")?);
                 }
                 if let Some(v) = prompt_keep("api_hash", cfg.api_hash.clone(), true)? {
@@ -416,11 +417,9 @@ async fn run() -> Result<()> {
                         Some(group_id) => match tg.peer(&group_id.to_string()).await {
                             Ok(peer) => {
                                 let keep_id = match &keep {
-                                    Some(k) => BotApi::new(&k.token)
-                                        .get_me()
-                                        .await
-                                        .ok()
-                                        .map(|u| u.id),
+                                    Some(k) => {
+                                        BotApi::new(&k.token).get_me().await.ok().map(|u| u.id)
+                                    }
                                     None => None,
                                 };
                                 let rep = tg.wipe_group(peer, keep_id).await;
@@ -563,7 +562,10 @@ async fn run() -> Result<()> {
                         model: None,
                         greeting,
                     })?;
-                    println!("created + registered {name} (@{})", me.username.unwrap_or_default());
+                    println!(
+                        "created + registered {name} (@{})",
+                        me.username.unwrap_or_default()
+                    );
                 }
                 BotCmd::Invite { username, group } => {
                     let (tg, cfg) = authorized_tg().await?;
@@ -572,9 +574,7 @@ async fn run() -> Result<()> {
                     println!("invited @{username} + granted admin");
                 }
                 BotCmd::Topic { name, title } => {
-                    let b = store
-                        .get_bot(&name)?
-                        .context("no such bot")?;
+                    let b = store.get_bot(&name)?.context("no such bot")?;
                     let topic = b
                         .topic_id
                         .context("bot has no topic yet — run `verity serve` once")?;
@@ -778,12 +778,25 @@ async fn run() -> Result<()> {
                     }
                 }
             };
+            // Our user id gates bot DMs — without a session there is
+            // no trusted identity, so DMs stay ignored.
+            let owner_id = match &tg {
+                Some(tg) => match tg.self_id().await {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "get_me failed — bot DMs disabled");
+                        None
+                    }
+                },
+                None => None,
+            };
             let bridge = Bridge {
                 group_id,
                 db_path: Config::db_path()?,
                 make_harness,
                 tg,
                 tg_peer,
+                owner_id,
             };
             tokio::select! {
                 r = bridge.run() => { r?; }
@@ -806,7 +819,8 @@ async fn run() -> Result<()> {
                 api.send_document(group_id, std::path::Path::new(&text), None, Some(topic))
                     .await?;
             } else {
-                for part in verity_core::rich::split_markdown(&text, verity_core::rich::RICH_LIMIT) {
+                for part in verity_core::rich::split_markdown(&text, verity_core::rich::RICH_LIMIT)
+                {
                     api.send_rich_message(
                         group_id,
                         InputRichMessage::markdown(&part),
