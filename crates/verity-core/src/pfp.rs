@@ -1,7 +1,8 @@
-//! BallsMaker — seeded generative avatars: a scatter of lit spheres
-//! ("balls") over a deep radial backdrop. Ported from the original
-//! JS generator as a pure-Rust tiny-skia renderer — deterministic per
-//! seed, so `:::pfp:::` and `verity bot pfp --seed` reproduce exactly.
+//! BallsMaker — seeded metaball-blob avatars. Rust port of
+//! ballsmaker.pages.dev: scatter 4–7 balls, blur, hard alpha-threshold
+//! (the "goo" filter) so they fuse into one blob, then drop auto-placed
+//! capsule eyes on it. Deterministic per seed, so `:::pfp:::` and
+//! `verity bot pfp --seed` reproduce exactly.
 
 use crate::{Error, Result};
 use tiny_skia::*;
@@ -52,148 +53,164 @@ fn hsl(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
     )
 }
 
-fn circle(cx: f32, cy: f32, r: f32) -> Path {
-    let mut pb = PathBuilder::new();
-    pb.push_circle(cx, cy, r);
-    pb.finish().expect("circle path")
+/// One horizontal + vertical box-blur pass on an alpha buffer.
+fn box_blur(a: &mut [u8], w: usize, h: usize, r: usize, tmp: &mut [u8]) {
+    let n = 2 * r + 1;
+    for y in 0..h {
+        let row = y * w;
+        let mut acc: u32 = 0;
+        for x in 0..w {
+            let add = a[row + (x + r).min(w - 1)] as u32;
+            let sub = if x > r { a[row + x - r - 1] as u32 } else { 0 };
+            acc += add;
+            acc = acc.saturating_sub(sub);
+            tmp[row + x] = (acc / n as u32) as u8;
+        }
+    }
+    for x in 0..w {
+        let mut acc: u32 = 0;
+        for y in 0..h {
+            let add = tmp[(y + r).min(h - 1) * w + x] as u32;
+            let sub = if y > r {
+                tmp[(y - r - 1) * w + x] as u32
+            } else {
+                0
+            };
+            acc += add;
+            acc = acc.saturating_sub(sub);
+            a[y * w + x] = (acc / n as u32) as u8;
+        }
+    }
 }
 
-/// Render a BallsMaker avatar at `size`×`size`, return PNG bytes.
-/// Layout: deep radial backdrop, then ~20 spheres sorted back→front —
-/// each a radial gradient from an off-center highlight to a dark rim,
-/// plus a crisp specular dot. Two accent hues off the base hue keep
-/// the palette tight but lively.
+/// Render a BallsMaker blob at `size`×`size`, return PNG bytes.
+/// Faithful port: black goo blob + white capsule eyes + pupils on a
+/// seeded vivid background (the site offers white/black/transparent —
+/// a colorful bg reads better as a tiny avatar).
 pub fn render(seed: u64, size: u32) -> Result<Vec<u8>> {
     let mut rng = Rng(seed.max(1));
     let s = size as f32;
+    let k = s / 900.0; // the original canvas is 900×900
+
+    // 1. Ball scatter — port of randomBlob(): center ±120, 4–7 balls
+    //    at random angle/distance (y squashed 0.75), r 50–140.
+    let cx = s * 0.5 + (rng.f() as f32 - 0.5) * 120.0 * k;
+    let cy = s * 0.5 + (rng.f() as f32 - 0.5) * 120.0 * k;
+    let n = 4 + rng.u(4);
+    let mut balls = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let a = rng.range(0.0, std::f64::consts::TAU) as f32;
+        let d = rng.range(0.0, 170.0) as f32 * k;
+        balls.push((
+            cx + a.cos() * d,
+            cy + a.sin() * d * 0.75,
+            rng.range(50.0, 140.0) as f32 * k,
+        ));
+    }
+
+    // 2. Alpha mask: white circles → 3× box blur ≈ the feGaussianBlur
+    //    (blur 28 → σ14 at 900px), then the feColorMatrix hard
+    //    threshold at 0.5 — balls merge into goo.
+    let w = size as usize;
+    let mut alpha = vec![0u8; w * w];
+    {
+        let mut px = Pixmap::new(size, size)
+            .ok_or_else(|| Error::Other("pfp: pixmap alloc failed".into()))?;
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(255, 255, 255, 255);
+        paint.anti_alias = false;
+        for &(x, y, r) in &balls {
+            let mut pb = PathBuilder::new();
+            pb.push_circle(x, y, r);
+            if let Some(p) = pb.finish() {
+                px.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
+            }
+        }
+        for (i, p) in px.pixels().iter().enumerate() {
+            alpha[i] = p.alpha();
+        }
+    }
+    let mut tmp = vec![0u8; w * w];
+    let br = (14.0 * k).max(2.0) as usize;
+    for _ in 0..3 {
+        box_blur(&mut alpha, w, w, br, &mut tmp);
+    }
+
+    // 3. Threshold → goo mask; gather bbox + centroid for the eyes.
+    let mut min_x = w;
+    let mut max_x = 0usize;
+    let mut min_y = w;
+    let mut max_y = 0usize;
+    let (mut sx, mut sy, mut count) = (0u64, 0u64, 0u64);
+    for y in 0..w {
+        for x in 0..w {
+            let i = y * w + x;
+            if alpha[i] >= 128 {
+                alpha[i] = 255;
+                sx += x as u64;
+                sy += y as u64;
+                count += 1;
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            } else {
+                alpha[i] = 0;
+            }
+        }
+    }
+    if count == 0 {
+        return Err(Error::Other("pfp: empty blob".into()));
+    }
+    let (bcx, bcy) = (sx as f32 / count as f32, sy as f32 / count as f32);
+    let (bw, bh) = ((max_x - min_x) as f32, (max_y - min_y) as f32);
+
+    // 4. Composite: seeded bg → near-black blob.
     let mut px =
         Pixmap::new(size, size).ok_or_else(|| Error::Other("pfp: pixmap alloc failed".into()))?;
-
-    // Backdrop: radial glow from upper-left, base hue, dark rim.
-    let base = rng.range(0.0, 360.0);
-    {
-        let (r1, g1, b1) = hsl(base, 0.55, 0.22);
-        let (r2, g2, b2) = hsl(base + 30.0, 0.6, 0.08);
-        let stops = vec![
-            GradientStop::new(0.0, Color::from_rgba8(r1, g1, b1, 255)),
-            GradientStop::new(1.0, Color::from_rgba8(r2, g2, b2, 255)),
-        ];
-        if let Some(sh) = RadialGradient::new(
-            Point::from_xy(s * 0.3, s * 0.25),
-            Point::from_xy(s * 0.5, s * 0.55),
-            s * 0.85,
-            stops,
-            SpreadMode::Pad,
-            Transform::identity(),
-        ) {
-            let mut paint = Paint::default();
-            paint.shader = sh;
-            px.fill_rect(
-                Rect::from_xywh(0.0, 0.0, s, s).unwrap(),
-                &paint,
-                Transform::identity(),
-                None,
-            );
+    let hue = rng.range(0.0, 360.0);
+    let (br_, bg_, bb_) = hsl(hue, 0.62, 0.5);
+    px.fill(Color::from_rgba8(br_, bg_, bb_, 255));
+    let blob_c = PremultipliedColorU8::from_rgba(0x1a, 0x1a, 0x22, 255)
+        .ok_or_else(|| Error::Other("pfp: color".into()))?;
+    for (i, on) in alpha.iter().enumerate() {
+        if *on == 255 {
+            px.pixels_mut()[i] = blob_c;
         }
     }
 
-    // Hue roster: base + two accents, ± jitter per ball.
-    let hues = [
-        base,
-        base + rng.range(100.0, 160.0),
-        base + rng.range(200.0, 260.0),
-        base + 180.0,
-    ];
-
-    // Balls, far→near: distant ones smaller, dimmer, more transparent.
-    let count = 16 + rng.u(8) as usize;
-    let mut balls: Vec<(f32, f32, f32, usize, f64, f64)> = (0..count)
-        .map(|_| {
+    // 5. Auto eyes — port of placeAutoEyes(): gap ≥ blob width*0.3,
+    //    size 0.13×blob height clamped 12–90, capsule w×1.5w, pupils.
+    let gap = (46.0 * k).max(bw * 0.3);
+    let esz = (bh * 0.13).clamp(12.0 * k, 90.0 * k);
+    let (ew, eh) = (esz, esz * 1.5);
+    let ey = bcy - bh * 0.06;
+    let mut eye = Paint::default();
+    eye.set_color_rgba8(255, 255, 255, 255);
+    eye.anti_alias = true;
+    let mut pupil = Paint::default();
+    pupil.set_color_rgba8(0x1a, 0x1a, 0x22, 255);
+    pupil.anti_alias = true;
+    for ex in [bcx - gap / 2.0, bcx + gap / 2.0] {
+        for (dx, dy, dw, dh, paint) in [
+            // Eye capsule — the JS uses roundRect, ellipse fallback reads the same.
+            (-ew / 2.0, -eh / 2.0, ew, eh, &eye),
+            // Pupil: slight downward look, like the site's toggle.
             (
-                rng.range(0.0, 1.0) as f32,
-                rng.range(0.0, 1.0) as f32,
-                rng.range(0.03, 0.30) as f32,
-                rng.u(hues.len() as u64) as usize,
-                rng.range(0.45, 1.0),
-                rng.range(-25.0, 25.0),
-            )
-        })
-        .collect();
-    // Larger on top — sort by radius ascending.
-    balls.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
-
-    for (fx, fy, fr, hi, alpha, hj) in balls {
-        let (cx, cy, r) = (fx * s, fy * s, fr * s);
-        let hue = hues[hi] + hj;
-        // Sphere shading: light source upper-left of the ball.
-        let hx = cx - r * 0.35;
-        let hy = cy - r * 0.35;
-        let (lr, lg, lb) = hsl(hue, 0.75, 0.72);
-        let (mr, mg, mb) = hsl(hue, 0.8, 0.5);
-        let (dr, dg, db) = hsl(hue, 0.85, 0.22);
-        let a = (alpha * 255.0) as u8;
-        let stops = vec![
-            GradientStop::new(0.0, Color::from_rgba8(lr, lg, lb, a)),
-            GradientStop::new(0.45, Color::from_rgba8(mr, mg, mb, a)),
-            GradientStop::new(1.0, Color::from_rgba8(dr, dg, db, a)),
-        ];
-        let Some(sh) = RadialGradient::new(
-            Point::from_xy(hx, hy),
-            Point::from_xy(cx, cy),
-            r,
-            stops,
-            SpreadMode::Pad,
-            Transform::identity(),
-        ) else {
-            continue;
-        };
-        let mut paint = Paint::default();
-        paint.shader = sh;
-        paint.anti_alias = true;
-        px.fill_path(
-            &circle(cx, cy, r),
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
-
-        // Specular dot — the "ball" read comes from this.
-        let dot_r = r * 0.11;
-        let mut dot = Paint::default();
-        dot.set_color_rgba8(255, 255, 255, (alpha * 220.0) as u8);
-        dot.anti_alias = true;
-        px.fill_path(
-            &circle(cx - r * 0.32, cy - r * 0.32, dot_r),
-            &dot,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
-    }
-
-    // Vignette: dark rim keeps it readable as a tiny circle crop.
-    {
-        let stops = vec![
-            GradientStop::new(0.0, Color::from_rgba8(0, 0, 0, 0)),
-            GradientStop::new(1.0, Color::from_rgba8(0, 0, 0, 110)),
-        ];
-        if let Some(sh) = RadialGradient::new(
-            Point::from_xy(s * 0.5, s * 0.5),
-            Point::from_xy(s * 0.5, s * 0.5),
-            s * 0.72,
-            stops,
-            SpreadMode::Pad,
-            Transform::identity(),
-        ) {
-            let mut paint = Paint::default();
-            paint.shader = sh;
-            px.fill_rect(
-                Rect::from_xywh(0.0, 0.0, s, s).unwrap(),
-                &paint,
-                Transform::identity(),
-                None,
-            );
+                -ew * 0.14,
+                eh * 0.12 - eh * 0.11,
+                ew * 0.28,
+                eh * 0.22,
+                &pupil,
+            ),
+        ] {
+            if let Some(rect) = Rect::from_xywh(ex + dx, ey + dy, dw, dh) {
+                let mut pb = PathBuilder::new();
+                pb.push_oval(rect);
+                if let Some(p) = pb.finish() {
+                    px.fill_path(&p, paint, FillRule::Winding, Transform::identity(), None);
+                }
+            }
         }
     }
 
@@ -221,7 +238,7 @@ mod tests {
     fn renders_png() {
         let png = render(42, 256).unwrap();
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
-        assert!(png.len() > 1000);
+        assert!(png.len() > 500);
     }
 
     #[test]
