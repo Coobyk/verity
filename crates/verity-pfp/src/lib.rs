@@ -99,15 +99,13 @@ fn box_blur(a: &mut [u8], w: usize, h: usize, r: usize, tmp: &mut [u8]) {
 
 /// Render a BallsMaker blob at `size`×`size`, return PNG bytes.
 /// Faithful to ballsmaker.pages.dev: black goo blob, white stadium
-/// eyes, white bg, no pupils. `hue` swaps in a vivid bg, `pupils`
-/// draws the site's optional pupils.
+/// eyes, white bg. `hue` swaps in a vivid background.
 pub fn render(seed: u64, size: u32) -> Result<Vec<u8>> {
-    render_opts(seed, size, None, false)
+    render_opts(seed, size, None)
 }
 
-/// [`render`] with knobs: `hue` = bg hue in degrees (None → white),
-/// `pupils` = draw the dark pupil inside each eye.
-pub fn render_opts(seed: u64, size: u32, hue: Option<f64>, pupils: bool) -> Result<Vec<u8>> {
+/// [`render`] with a knob: `hue` = bg hue in degrees (None → white).
+pub fn render_opts(seed: u64, size: u32, hue: Option<f64>) -> Result<Vec<u8>> {
     let mut rng = Rng(seed.max(1));
     let s = size as f32;
     let k = s / 900.0; // the original canvas is 900×900
@@ -236,9 +234,6 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>, pupils: bool) -> Resu
     let mut eye = Paint::default();
     eye.set_color_rgba8(255, 255, 255, 255);
     eye.anti_alias = true;
-    let mut pupil = Paint::default();
-    pupil.set_color_rgba8(0x1a, 0x1a, 0x22, 255);
-    pupil.anti_alias = true;
     for ex in [bcx - gap / 2.0, bcx + gap / 2.0] {
         // Eye capsule — a stadium (rect + two cap discs), matching the
         // site's roundRect. A plain oval reads egg-shaped, not right.
@@ -255,20 +250,6 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>, pupils: bool) -> Resu
             pb.push_circle(ex, cy, ew / 2.0);
             if let Some(p) = pb.finish() {
                 px.fill_path(&p, &eye, FillRule::Winding, Transform::identity(), None);
-            }
-        }
-        if pupils {
-            if let Some(rect) = Rect::from_xywh(
-                ex - ew * 0.14,
-                ey + eh * 0.12 - eh * 0.11,
-                ew * 0.28,
-                eh * 0.22,
-            ) {
-                let mut pb = PathBuilder::new();
-                pb.push_oval(rect);
-                if let Some(p) = pb.finish() {
-                    px.fill_path(&p, &pupil, FillRule::Winding, Transform::identity(), None);
-                }
             }
         }
     }

@@ -8,15 +8,14 @@ thread_local! {
     static OUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Render an avatar. `hue < 0` = the site's white bg; `pupils != 0`
-/// draws pupils + glint. Returns a pointer into wasm memory.
+/// Render an avatar. `hue < 0` = the site's white bg. Returns a
+/// pointer into wasm memory.
 #[no_mangle]
-pub extern "C" fn pfp_render(seed: u64, size: u32, hue: f64, pupils: u32) -> *mut u8 {
+pub extern "C" fn pfp_render(seed: u64, size: u32, hue: f64) -> *mut u8 {
     let png = verity_pfp::render_opts(
         seed,
         size.max(8).min(1024),
         if hue < 0.0 { None } else { Some(hue) },
-        pupils != 0,
     )
     .unwrap_or_default();
     OUT.with(|o| {

@@ -53,7 +53,6 @@
     <button id="byname">seed from name</button>
     <label>seed <input id="seed" type="number" value="42" /></label>
     <label>hue <input id="hue" type="range" min="-1" max="360" value="-1" /> <span id="huev">auto-white</span></label>
-    <label><input id="pupils" type="checkbox" checked /> pupils</label>
     <button id="roll">🎲 reroll</button>
     <button id="add" class="primary">+ add</button>
     <span id="status"></span>
@@ -87,15 +86,9 @@ function nameSeed(name) {
   return h;
 }
 
-function params() {
-  const hue = parseFloat(document.getElementById("hue").value);
-  const pupils = document.getElementById("pupils").checked ? 1 : 0;
-  return { hue, pupils };
-}
-
 function render(seed) {
-  const { hue, pupils } = params();
-  const ptr = wasm.pfp_render(BigInt(seed) & 0xffffffffffffffffn, 512, hue, pupils);
+  const hue = parseFloat(document.getElementById("hue").value);
+  const ptr = wasm.pfp_render(BigInt(seed) & 0xffffffffffffffffn, 512, hue);
   const len = wasm.pfp_len();
   const bytes = new Uint8Array(wasm.memory.buffer, ptr, len).slice();
   const url = URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
