@@ -713,6 +713,146 @@ impl Tg {
         )))
     }
 
+    /// Wait until a BotFather view is replaced: a new incoming message
+    /// after `msg_id`, or `msg_id` itself edited (text or keyboard —
+    /// button clicks usually update the same message). Polls ~30s.
+    async fn wait_change(
+        &self,
+        peer: PeerRef,
+        msg_id: i32,
+        old_text: &str,
+        old_labels: &[String],
+    ) -> Result<Message> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let mut it = self.client.iter_messages(peer);
+            while let Some(m) = it
+                .next()
+                .await
+                .map_err(|e| Error::Mtproto(format!("messages: {e}")))?
+            {
+                if m.id() > msg_id && !m.outgoing() && !m.text().is_empty() {
+                    return Ok(m);
+                }
+                if m.id() == msg_id {
+                    let labels: Vec<String> = Self::button_labels(&m)
+                        .into_iter()
+                        .map(|(l, _)| l)
+                        .collect();
+                    if m.text() != old_text || labels != old_labels {
+                        return Ok(m);
+                    }
+                }
+                if m.id() < msg_id {
+                    break;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(Error::Mtproto("timed out waiting for view change".into()));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        }
+    }
+
+    /// Click the first inline-callback button on `msg` whose label
+    /// contains `needle` (case-insensitive) and wait for the view it
+    /// opens. Errs listing the available labels when nothing matches.
+    async fn click_and_wait(&self, peer: PeerRef, msg: &Message, needle: &str) -> Result<Message> {
+        let want = needle.to_lowercase();
+        let labels = Self::button_labels(msg);
+        let hit = labels
+            .iter()
+            .find(|(label, data)| !data.is_empty() && label.to_lowercase().contains(&want));
+        let Some((_, data)) = hit else {
+            let all: Vec<String> = labels.into_iter().map(|(l, _)| l).collect();
+            return Err(Error::Mtproto(format!(
+                "no '{needle}' button (have: {})\nview: {}",
+                all.join(", "),
+                msg.text()
+            )));
+        };
+        let mid = msg.id();
+        let old_text = msg.text().to_string();
+        let old_labels: Vec<String> = labels.iter().map(|(l, _)| l.clone()).collect();
+        self.client
+            .invoke(&tl::functions::messages::GetBotCallbackAnswer {
+                game: false,
+                peer: peer.into(),
+                msg_id: mid,
+                data: Some(data.clone()),
+                password: None,
+            })
+            .await
+            .map_err(|e| Error::Mtproto(format!("callback: {e}")))?;
+        self.wait_change(peer, mid, &old_text, &old_labels).await
+    }
+
+    /// Navigate @BotFather's `/myapps` to one app's card: pick the bot
+    /// (skipped when the first view is already the app list), then the
+    /// app. Both match picker buttons by substring, case-insensitive.
+    async fn mini_app_card_msg(&self, bot: &str, app: &str) -> Result<Message> {
+        let bf = self.botfather().await?;
+        let bf_ref = PeerRef::from(&bf);
+        let last = self.last_msg_id(bf_ref).await;
+        self.client
+            .send_message(&bf, InputMessage::new().text("/myapps"))
+            .await
+            .map_err(|e| Error::Mtproto(format!("send: {e}")))?;
+        let picker = self.wait_reply_msg(bf_ref, last).await?;
+        let want_bot = bot.trim_start_matches('@').to_lowercase();
+        let first = Self::button_labels(&picker);
+        let mut view = if first
+            .iter()
+            .any(|(l, _)| l.to_lowercase().contains(&want_bot))
+        {
+            self.click_and_wait(bf_ref, &picker, bot).await?
+        } else {
+            picker
+        };
+        // Picking the bot may land straight on an app card — step back
+        // to the app list before choosing when `app` isn't here.
+        let has = |m: &Message, n: &str| {
+            Self::button_labels(m)
+                .iter()
+                .any(|(l, _)| l.to_lowercase().contains(&n.to_lowercase()))
+        };
+        if !has(&view, app) && has(&view, "back") {
+            view = self.click_and_wait(bf_ref, &view, "back").await?;
+        }
+        self.click_and_wait(bf_ref, &view, app).await
+    }
+
+    /// The `/myapps` card for one mini app — text plus button labels,
+    /// so the registered URL is visible without changing anything.
+    pub async fn mini_app_card(&self, bot: &str, app: &str) -> Result<String> {
+        let card = self.mini_app_card_msg(bot, app).await?;
+        let labels: Vec<String> = Self::button_labels(&card)
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect();
+        Ok(format!("{}\n[buttons: {}]", card.text(), labels.join(", ")))
+    }
+
+    /// `/myapps` → bot → app → Edit → URL: repoint where the mini app
+    /// is served from. Returns BotFather's confirmation.
+    pub async fn mini_app_set_url(&self, bot: &str, app: &str, url: &str) -> Result<String> {
+        let bf = self.botfather().await?;
+        let bf_ref = PeerRef::from(&bf);
+        let mut view = self.mini_app_card_msg(bot, app).await?;
+        // The URL control sits either on the card itself or one level
+        // into an "Edit" menu.
+        if !Self::button_labels(&view)
+            .iter()
+            .any(|(l, _)| l.to_lowercase().contains("url"))
+        {
+            view = self.click_and_wait(bf_ref, &view, "edit").await?;
+        }
+        self.click_and_wait(bf_ref, &view, "url").await?;
+        let last = self.last_msg_id(bf_ref).await;
+        self.send_line(&bf, url).await?;
+        self.wait_reply(bf_ref, last).await
+    }
+
     /// Send a raw text line to @BotFather (mid-flow repairs);
     /// returns his reply.
     pub async fn bf_send(&self, text: &str) -> Result<String> {

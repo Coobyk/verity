@@ -174,6 +174,16 @@ enum BotCmd {
         #[arg(long)]
         short: String,
     },
+    /// Show a Mini App's @BotFather card (/myapps), or repoint the
+    /// URL it's served from when one is given
+    Appurl {
+        /// Roster name or @username of the bot that owns the app
+        bot: String,
+        /// App title or short name — matched against button labels
+        app: String,
+        /// New https URL; omit to just print the current card
+        url: Option<String>,
+    },
     /// Send a raw line to @BotFather (repair a stuck flow)
     Bf { text: String },
     /// List every bot you own at @BotFather (not just registered ones)
@@ -572,6 +582,20 @@ async fn run() -> Result<()> {
                         )
                         .await?;
                     println!("{done}");
+                }
+                BotCmd::Appurl { bot, app, url } => {
+                    let want = store
+                        .get_bot(&bot)
+                        .ok()
+                        .flatten()
+                        .and_then(|b| b.username)
+                        .unwrap_or_else(|| bot.clone());
+                    let (tg, _) = authorized_tg().await?;
+                    println!("asking @BotFather…");
+                    match &url {
+                        Some(u) => println!("{}", tg.mini_app_set_url(&want, &app, u).await?),
+                        None => println!("{}", tg.mini_app_card(&want, &app).await?),
+                    }
                 }
                 BotCmd::Bf { text } => {
                     let (tg, _) = authorized_tg().await?;
