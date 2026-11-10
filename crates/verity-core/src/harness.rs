@@ -168,7 +168,54 @@ impl Harness for EchoHarness {
 }
 
 /// How long a single ACP turn may run before the child is killed.
-const ACP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// `VERITY_TURN_TIMEOUT` (seconds) overrides; default 15m.
+fn acp_timeout() -> Duration {
+    std::env::var("VERITY_TURN_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(15 * 60))
+}
+
+/// Owns the turn's agent child so dropping it — on timeout, error, or
+/// early return — kills the whole process group, not just the direct
+/// child. `kill_on_drop` alone leaves grandchildren (shells, browsers,
+/// dev servers the agent spawned) running as orphans.
+struct ChildGroup {
+    child: tokio::process::Child,
+}
+
+impl ChildGroup {
+    fn spawn(cmd: &mut Command) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        cmd.process_group(0); // group leader: pgid == child pid
+        cmd.spawn().map(|child| Self { child })
+    }
+}
+
+impl std::ops::Deref for ChildGroup {
+    type Target = tokio::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for ChildGroup {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+impl Drop for ChildGroup {
+    fn drop(&mut self) {
+        let Some(pid) = self.child.id() else { return };
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &format!("-{pid}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
 
 /// Drives any agent CLI speaking the Agent Client Protocol: newline-
 /// delimited JSON-RPC over stdio (`initialize` → `session/new` →
@@ -196,12 +243,13 @@ impl AcpHarness {
 impl Harness for AcpHarness {
     async fn run_turn(&self, ctx: &TurnContext, prompt: &str) -> Result<TurnOutput> {
         let run = self.run_turn_inner(ctx, prompt);
-        match tokio::time::timeout(ACP_TIMEOUT, run).await {
+        let limit = acp_timeout();
+        match tokio::time::timeout(limit, run).await {
             Ok(r) => r,
             Err(_) => Err(Error::Harness(format!(
                 "{}: turn exceeded {}s",
                 self.argv.first().map(String::as_str).unwrap_or("acp"),
-                ACP_TIMEOUT.as_secs()
+                limit.as_secs()
             ))),
         }
     }
@@ -213,14 +261,14 @@ impl AcpHarness {
             .argv
             .split_first()
             .ok_or_else(|| Error::Harness("empty acp: provider spec".into()))?;
-        let mut child = Command::new(bin)
-            .args(args)
+        let mut cmd = Command::new(bin);
+        cmd.args(args)
             .current_dir(&ctx.cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
+            .kill_on_drop(true);
+        let mut child = ChildGroup::spawn(&mut cmd)
             .map_err(|e| Error::Harness(format!("failed to spawn {bin}: {e}")))?;
 
         let mut stdin = child.stdin.take().expect("piped stdin");
