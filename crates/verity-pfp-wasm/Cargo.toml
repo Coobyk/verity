@@ -1,0 +1,11 @@
+[package]
+name = "verity-pfp-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+verity-pfp = { path = "../verity-pfp" }

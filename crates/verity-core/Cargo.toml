@@ -22,6 +22,7 @@ grammers-tl-types.workspace = true
 async-trait.workspace = true
 sevenz-rust2 = "0.24"
 tiny-skia.workspace = true
+verity-pfp = { path = "../verity-pfp" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

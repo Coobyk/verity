@@ -4,7 +4,21 @@
 //! capsule eyes on it. Deterministic per seed, so `:::pfp:::` and
 //! `verity bot pfp --seed` reproduce exactly.
 
-use crate::{Error, Result};
+use thiserror::Error;
+
+type Result<T> = std::result::Result<T, PfpError>;
+
+#[derive(Debug, Error)]
+pub enum PfpError {
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<PfpError> for std::io::Error {
+    fn from(e: PfpError) -> Self {
+        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+    }
+}
 use tiny_skia::*;
 
 /// xorshift64* — small, fast, plenty for art.
@@ -124,7 +138,7 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>, pupils: bool) -> Resu
     let mut alpha = vec![0u8; mw * mw];
     {
         let mut px = Pixmap::new((size * 2).max(1), (size * 2).max(1))
-            .ok_or_else(|| Error::Other("pfp: pixmap alloc failed".into()))?;
+            .ok_or_else(|| PfpError::Other("pfp: pixmap alloc failed".into()))?;
         let mut paint = Paint::default();
         paint.set_color_rgba8(255, 255, 255, 255);
         paint.anti_alias = false;
@@ -168,7 +182,7 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>, pupils: bool) -> Resu
         }
     }
     if count == 0 {
-        return Err(Error::Other("pfp: empty blob".into()));
+        return Err(PfpError::Other("pfp: empty blob".into()));
     }
     let mut cover = vec![0u8; w * w];
     for y in 0..w {
@@ -190,8 +204,8 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>, pupils: bool) -> Resu
 
     // 4. Composite: white bg (the site's default) or a vivid hue →
     //    pure-black blob, matching the export's fillStyle "#000".
-    let mut px =
-        Pixmap::new(size, size).ok_or_else(|| Error::Other("pfp: pixmap alloc failed".into()))?;
+    let mut px = Pixmap::new(size, size)
+        .ok_or_else(|| PfpError::Other("pfp: pixmap alloc failed".into()))?;
     let (br_, bg_, bb_) = match hue {
         Some(h) => hsl(h, 0.62, 0.5),
         None => (255, 255, 255),
@@ -297,7 +311,7 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>, pupils: bool) -> Resu
     }
 
     px.encode_png()
-        .map_err(|e| Error::Other(format!("pfp: png encode: {e}")))
+        .map_err(|e| PfpError::Other(format!("pfp: png encode: {e}")))
 }
 
 /// Stable seed for a bot name — same name, same face, unless an

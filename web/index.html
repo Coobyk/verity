@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BallsMaker WASM — pfp preview</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: #0c0c0e; color: #e8e8ea;
+  }
+  main { max-width: 960px; margin: 0 auto; padding: 28px 20px 60px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: #8b8b93; font-size: 13px; margin-bottom: 22px; }
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    background: #141416; border: 1px solid #232327; border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 24px;
+  }
+  label { font-size: 12px; color: #9a9aa2; display: flex; align-items: center; gap: 6px; }
+  input[type=text], input[type=number] {
+    background: #0c0c0e; border: 1px solid #2c2c31; color: #e8e8ea;
+    border-radius: 6px; padding: 6px 10px; font: inherit; width: 130px;
+  }
+  input[type=range] { width: 110px; accent-color: #8ab4f8; }
+  button {
+    background: #2a2a30; color: #e8e8ea; border: 1px solid #3a3a41;
+    border-radius: 6px; padding: 6px 14px; font: inherit; cursor: pointer;
+  }
+  button:hover { background: #35353c; }
+  button.primary { background: #2563eb; border-color: #2563eb; }
+  button.primary:hover { background: #1d4fd7; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; }
+  .cell {
+    background: #141416; border: 1px solid #232327; border-radius: 10px;
+    padding: 10px; text-align: center;
+  }
+  .cell img { width: 100%; border-radius: 8px; display: block; }
+  .cell .seed { font-size: 11px; color: #8b8b93; margin: 6px 0; word-break: break-all; }
+  .cell button { font-size: 11px; padding: 4px 10px; }
+  #status { color: #8b8b93; font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>BallsMaker <span style="color:#8ab4f8">wasm</span></h1>
+  <div class="sub">verity-pfp running in your browser — same renderer the bots use</div>
+
+  <div class="controls">
+    <label>name <input id="name" type="text" placeholder="Verity" /></label>
+    <button id="byname">seed from name</button>
+    <label>seed <input id="seed" type="number" value="42" /></label>
+    <label>hue <input id="hue" type="range" min="-1" max="360" value="-1" /> <span id="huev">auto-white</span></label>
+    <label><input id="pupils" type="checkbox" checked /> pupils</label>
+    <button id="roll">🎲 reroll</button>
+    <button id="add" class="primary">+ add</button>
+    <span id="status"></span>
+  </div>
+
+  <div class="grid" id="grid"></div>
+</main>
+
+<script>
+let wasm = null;
+const grid = document.getElementById("grid");
+const status = document.getElementById("status");
+
+async function init() {
+  const resp = await fetch("pfp.wasm");
+  const { instance } = await WebAssembly.instantiateStreaming(resp, {});
+  wasm = instance.exports;
+  status.textContent = "wasm ready — " + resp.headers.get("content-length") + " bytes";
+  render(42); render(7); render(1337);
+}
+init().catch(e => status.textContent = "wasm failed: " + e);
+
+function nameSeed(name) {
+  const enc = new TextEncoder().encode(name);
+  const ptr = wasm.pfp_render ? null : null;
+  // pfp_name_seed(ptr, len) — need scratch memory; write into wasm mem
+  // via a temp render first so OUT buffer exists? Simpler: compute
+  // FNV-1a in JS — same hash.
+  let h = 0xcbf29ce484222325n;
+  for (const b of enc) { h ^= BigInt(b); h = (h * 0x100000001b3n) & 0xffffffffffffffffn; }
+  return h;
+}
+
+function params() {
+  const hue = parseFloat(document.getElementById("hue").value);
+  const pupils = document.getElementById("pupils").checked ? 1 : 0;
+  return { hue, pupils };
+}
+
+function render(seed) {
+  const { hue, pupils } = params();
+  const ptr = wasm.pfp_render(BigInt(seed) & 0xffffffffffffffffn, 512, hue, pupils);
+  const len = wasm.pfp_len();
+  const bytes = new Uint8Array(wasm.memory.buffer, ptr, len).slice();
+  const url = URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
+  const cell = document.createElement("div");
+  cell.className = "cell";
+  cell.innerHTML = `<img src="${url}" alt="seed ${seed}" />
+    <div class="seed">seed ${seed}</div>
+    <button>download</button>`;
+  cell.querySelector("button").onclick = () => {
+    const a = document.createElement("a");
+    a.href = url; a.download = `ballsmaker-${seed}.png`; a.click();
+  };
+  grid.prepend(cell);
+}
+
+document.getElementById("roll").onclick = () => {
+  const s = BigInt(Math.floor(Math.random() * 2 ** 53));
+  document.getElementById("seed").value = s;
+  render(s);
+};
+document.getElementById("add").onclick = () => {
+  render(BigInt(document.getElementById("seed").value || "42"));
+};
+document.getElementById("byname").onclick = () => {
+  const n = document.getElementById("name").value || "Verity";
+  const s = nameSeed(n);
+  document.getElementById("seed").value = s;
+  render(s);
+};
+document.getElementById("hue").oninput = e => {
+  document.getElementById("huev").textContent =
+    e.target.value < 0 ? "auto-white" : e.target.value;
+};
+</script>
+</body>
+</html>

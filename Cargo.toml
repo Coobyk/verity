@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/verity-core", "crates/verity-cli"]
+members = ["crates/verity-core", "crates/verity-cli", "crates/verity-pfp", "crates/verity-pfp-wasm"]
 
 [workspace.package]
 version = "0.1.0"

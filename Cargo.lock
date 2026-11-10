@@ -2416,6 +2416,22 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "verity-pfp",
+]
+
+[[package]]
+name = "verity-pfp"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tiny-skia",
+]
+
+[[package]]
+name = "verity-pfp-wasm"
+version = "0.1.0"
+dependencies = [
+ "verity-pfp",
 ]
 
 [[package]]
