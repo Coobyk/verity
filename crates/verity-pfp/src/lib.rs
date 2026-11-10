@@ -98,11 +98,11 @@ fn box_blur(a: &mut [u8], w: usize, h: usize, r: usize, tmp: &mut [u8]) {
 }
 
 /// Render a BallsMaker blob at `size`×`size`, return PNG bytes.
-/// Default: black goo blob + glinted white capsule eyes on white with
-/// a soft drop shadow. `hue` swaps in a vivid bg, `no_pupils` strips
-/// the pupils for the site's plain stare.
+/// Faithful to ballsmaker.pages.dev: black goo blob, white stadium
+/// eyes, white bg, no pupils. `hue` swaps in a vivid bg, `pupils`
+/// draws the site's optional pupils.
 pub fn render(seed: u64, size: u32) -> Result<Vec<u8>> {
-    render_opts(seed, size, None, true)
+    render_opts(seed, size, None, false)
 }
 
 /// [`render`] with knobs: `hue` = bg hue in degrees (None → white),
@@ -112,21 +112,20 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>, pupils: bool) -> Resu
     let s = size as f32;
     let k = s / 900.0; // the original canvas is 900×900
 
-    // 1. Ball scatter — a dominant central mass plus a few satellite
-    //    bumps fused on by the goo. Rounder and fuller than the site's
-    //    flat scatter (which leaves dangly offshoots at pfp scale).
-    let cx = s * 0.5 + (rng.f() as f32 - 0.5) * 60.0 * k;
-    let cy = s * 0.5 + (rng.f() as f32 - 0.5) * 60.0 * k;
-    let r0 = s * rng.range(0.28, 0.34) as f32;
-    let mut balls = vec![(cx, cy, r0)];
-    let n = 2 + rng.u(3);
+    // 1. Ball scatter — port of the site's randomBlob(): center ±120,
+    //    4–7 balls at random angle/distance ≤170 (y squashed 0.75),
+    //    radius 50–140.
+    let cx = s * 0.5 + (rng.f() as f32 - 0.5) * 120.0 * k;
+    let cy = s * 0.5 + (rng.f() as f32 - 0.5) * 120.0 * k;
+    let n = 4 + rng.u(4);
+    let mut balls = Vec::with_capacity(n as usize);
     for _ in 0..n {
         let a = rng.range(0.0, std::f64::consts::TAU) as f32;
-        let d = r0 * rng.range(0.55, 0.8) as f32;
+        let d = rng.range(0.0, 170.0) as f32 * k;
         balls.push((
             cx + a.cos() * d,
-            cy + a.sin() * d * 0.85,
-            r0 * rng.range(0.35, 0.6) as f32,
+            cy + a.sin() * d * 0.75,
+            rng.range(50.0, 140.0) as f32 * k,
         ));
     }
 
@@ -211,37 +210,6 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>, pupils: bool) -> Resu
         None => (255, 255, 255),
     };
     px.fill(Color::from_rgba8(br_, bg_, bb_, 255));
-
-    // Soft drop shadow: the mask shifted down ~3.5%, re-blurred, ~24%
-    // black — gives the blob a floor so it doesn't float on the bg.
-    {
-        let dy = (s * 0.035) as usize;
-        let mut shadow = vec![0u8; w * w];
-        for y in dy..w {
-            for x in 0..w {
-                shadow[y * w + x] = cover[(y - dy) * w + x];
-            }
-        }
-        let sr = (s * 0.025).max(1.0) as usize;
-        for _ in 0..3 {
-            box_blur(&mut shadow, w, w, sr, &mut tmp);
-        }
-        for (i, a) in shadow.iter().enumerate() {
-            let sa = *a as u16 * 60 / 255;
-            if sa == 0 {
-                continue;
-            }
-            let dst = px.pixels()[i];
-            px.pixels_mut()[i] = PremultipliedColorU8::from_rgba(
-                (dst.red() as u16 * (255 - sa) / 255) as u8,
-                (dst.green() as u16 * (255 - sa) / 255) as u8,
-                (dst.blue() as u16 * (255 - sa) / 255) as u8,
-                dst.alpha(),
-            )
-            .unwrap_or(dst);
-        }
-    }
-
     for (i, cov) in cover.iter().enumerate() {
         let c = *cov as u16;
         if c == 0 {
@@ -258,12 +226,13 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>, pupils: bool) -> Resu
         .unwrap_or(dst);
     }
 
-    // 5. Auto eyes — bigger and a touch lower than the site defaults;
-    //    reads friendlier at avatar scale. Stadium capsules w×1.5w.
-    let gap = (52.0 * k).max(bw * 0.34);
-    let esz = (bh * 0.16).clamp(14.0 * k, 96.0 * k);
+    // 5. Auto eyes — port of placeAutoEyes(): gap ≥ 46 or 30% of blob
+    //    width, size 13% of blob height clamped 12–90, capsule w×1.5w
+    //    centered slightly above the centroid.
+    let gap = (46.0 * k).max(bw * 0.3);
+    let esz = (bh * 0.13).clamp(12.0 * k, 90.0 * k);
     let (ew, eh) = (esz, esz * 1.5);
-    let ey = bcy - bh * 0.02;
+    let ey = bcy - bh * 0.06;
     let mut eye = Paint::default();
     eye.set_color_rgba8(255, 255, 255, 255);
     eye.anti_alias = true;
@@ -289,12 +258,6 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>, pupils: bool) -> Resu
             }
         }
         if pupils {
-            // Glint — the tiny white catchlight that sells "alive".
-            let mut pb = PathBuilder::new();
-            pb.push_circle(ex - ew * 0.14 - ew * 0.04, ey - ew * 0.02, ew * 0.07);
-            if let Some(p) = pb.finish() {
-                px.fill_path(&p, &eye, FillRule::Winding, Transform::identity(), None);
-            }
             if let Some(rect) = Rect::from_xywh(
                 ex - ew * 0.14,
                 ey + eh * 0.12 - eh * 0.11,
