@@ -5,7 +5,7 @@ Decisions captured from the design sessions. Update as the code moves.
 ## The idea
 
 Akeru-style named teammate bots, but native (Rust + GPUI, no Electron) and
-Telegram-first: a forum supergroup ("Verity HQ") is the shared surface —
+Telegram-first: a forum supergroup ("Verity") is the shared surface —
 one topic per bot, bots are real bot accounts with their own avatars.
 
 ## Layers

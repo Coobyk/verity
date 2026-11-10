@@ -22,7 +22,7 @@ pub struct Config {
     /// MTProto app credentials from https://my.telegram.org
     pub api_id: Option<i32>,
     pub api_hash: Option<String>,
-    /// The forum supergroup that hosts the bots ("Verity HQ").
+    /// The forum supergroup that hosts the bots ("Verity").
     pub group_id: Option<i64>,
     /// Binary used by the Pi harness (`pi` or `pirs`).
     pub pi_bin: Option<String>,

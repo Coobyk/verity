@@ -18,7 +18,7 @@ a native Rust client, and a quiet bridge that does the work.
 
 ```
 You ──► verity (grammers, logged in as YOU)
-          reads "Verity HQ" supergroup straight from Telegram cloud
+          reads "Verity" supergroup straight from Telegram cloud
           topics = per-bot threads · you type as yourself
                     ▲
         verity serve (Bot API, one bot token per teammate)
