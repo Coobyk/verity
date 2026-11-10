@@ -13,6 +13,7 @@ pub mod config;
 pub mod error;
 pub mod harness;
 pub mod mtproto;
+pub mod pfp;
 pub mod rich;
 pub mod store;
 

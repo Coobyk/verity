@@ -831,6 +831,8 @@ struct Markers {
     bot_new: Vec<(String, String, String, Option<String>)>,
     /// `:::backup:::` — ship ~/verity to General after the reply.
     backup: bool,
+    /// `:::pfp [seed]:::` — regenerate the bot's avatar.
+    pfp: Option<u64>,
     /// `:::shutdown:::` / `:::restart:::` — how the service should die
     /// once this turn's paperwork is done.
     exit: Option<Exit>,
@@ -888,6 +890,16 @@ fn extract_markers(reply: &str) -> (String, Markers) {
                     }
                 }
                 "backup" => markers.backup = true,
+                // `:::pfp:::` or `:::pfp <seed>:::` — new BallsMaker face.
+                "pfp" => {
+                    let seed = rest.parse::<u64>().ok().unwrap_or_else(|| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or(1)
+                    });
+                    markers.pfp = Some(seed);
+                }
                 "shutdown" => markers.exit = Some(Exit::Stop),
                 "restart" => markers.exit = Some(Exit::Restart),
                 // `bot_new name | token | instructions [| provider]`
@@ -1177,6 +1189,18 @@ async fn do_turn(
         let note = match crate::backup::upload(&api, env.group_id).await {
             Ok(files) => format!("🗄 backed up {} to General", files.join(", ")),
             Err(e) => format!("⚠️ backup failed: {e}"),
+        };
+        let _ = api.send_message(chat_id, &note, thread, reply_to).await;
+    }
+
+    // `:::pfp:::` — fresh BallsMaker avatar, uploaded as this bot.
+    if let Some(seed) = markers.pfp {
+        let note = match crate::pfp::render(seed, 512) {
+            Ok(png) => match api.set_profile_photo(png).await {
+                Ok(()) => format!("🎨 new face — seed {seed}"),
+                Err(e) => format!("⚠️ pfp upload failed: {e}"),
+            },
+            Err(e) => format!("⚠️ pfp render failed: {e}"),
         };
         let _ = api.send_message(chat_id, &note, thread, reply_to).await;
     }

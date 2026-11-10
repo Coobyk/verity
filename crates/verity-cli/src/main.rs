@@ -4,6 +4,7 @@ use std::io::{BufRead, Write};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use std::path::Path;
 use std::sync::Arc;
 use verity_core::botapi::{BotApi, InputRichMessage};
 use verity_core::bridge::Bridge;
@@ -161,6 +162,14 @@ enum BotCmd {
     },
     /// Rename a bot (store name, memory keys, and its topic title if set)
     Rename { name: String, new_name: String },
+    /// Regenerate the bot's profile picture (BallsMaker style) and upload it
+    Pfp {
+        name: String,
+        /// Fixed seed — default derives from the bot's name, so the
+        /// same name always gets the same face unless a seed is given
+        #[arg(long)]
+        seed: Option<u64>,
+    },
     /// List registered bots
     List,
     /// Remove a bot (does not delete its topic)
@@ -691,6 +700,18 @@ async fn run() -> Result<()> {
                     for label in tg.my_bots().await? {
                         println!("{label}");
                     }
+                }
+                BotCmd::Pfp { name, seed } => {
+                    let bot = store.get_bot(&name)?.context("no such bot")?;
+                    let seed = seed.unwrap_or_else(|| verity_core::pfp::name_seed(&bot.name));
+                    let png = verity_core::pfp::render(seed, 512)?;
+                    let out = Config::db_path()?
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(format!("pfp-{}.png", bot.name));
+                    std::fs::write(&out, &png)?;
+                    BotApi::new(&bot.token).set_profile_photo(png).await?;
+                    println!("pfp set for {} (seed {seed}) → {}", bot.name, out.display());
                 }
                 BotCmd::Memory { name, set } => {
                     if let Some(pairs) = set {

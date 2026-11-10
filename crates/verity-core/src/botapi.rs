@@ -279,6 +279,28 @@ impl BotApi {
         unwrap(resp)
     }
 
+    /// `setMyProfilePhoto` — swap the bot's avatar. The photo ships as a
+    /// multipart attachment referenced from the InputProfilePhoto JSON.
+    pub async fn set_profile_photo(&self, png: Vec<u8>) -> Result<()> {
+        let form = reqwest::multipart::Form::new()
+            .text("photo", r#"{"type":"static","photo":"attach://p"}"#)
+            .part(
+                "p",
+                reqwest::multipart::Part::bytes(png).file_name("pfp.png"),
+            );
+        let url = format!("{}/bot{}/setMyProfilePhoto", self.base, self.token);
+        let resp: ApiResponse<serde_json::Value> = self
+            .http
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await?
+            .json()
+            .await?;
+        unwrap(resp)?;
+        Ok(())
+    }
+
     /// `getFile` — resolve a `file_id` to the server-side `file_path`
     /// used by [`Self::download_file`].
     pub async fn file_path(&self, file_id: &str) -> Result<String> {
