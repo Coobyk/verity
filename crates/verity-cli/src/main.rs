@@ -21,7 +21,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Set api_id/api_hash (my.telegram.org) and the host group
+    /// Set api_id/api_hash (my.telegram.org) and the host group —
+    /// or pass --create-group <title> to make a new forum supergroup
     Config {
         #[arg(long)]
         api_id: Option<i32>,
@@ -29,6 +30,9 @@ enum Cmd {
         api_hash: Option<String>,
         #[arg(long)]
         group_id: Option<i64>,
+        /// Create a new forum supergroup with this title and use it
+        #[arg(long)]
+        create_group: Option<String>,
         #[arg(long)]
         pi_bin: Option<String>,
     },
@@ -247,6 +251,18 @@ async fn authorized_tg() -> Result<(Tg, Config)> {
     Ok((tg, cfg))
 }
 
+/// Create a forum supergroup using cfg's own credentials — `tg()`
+/// reloads from disk, which would miss values being set in the same
+/// `verity config` run.
+async fn create_group_with(cfg: &Config, title: &str) -> Result<i64> {
+    let (api_id, api_hash) = cfg.api_credentials()?;
+    let tg = Tg::connect(api_id, api_hash, &Config::session_path()?).await?;
+    if !tg.is_authorized().await? {
+        bail!("not logged in — run `verity login --phone <number>`");
+    }
+    tg.create_group(title).await.map_err(Into::into)
+}
+
 fn group_of(cfg: &Config, arg: Option<String>) -> Result<String> {
     if let Some(g) = arg {
         return Ok(g);
@@ -308,11 +324,15 @@ async fn run() -> Result<()> {
             api_id,
             api_hash,
             group_id,
+            create_group,
             pi_bin,
         } => {
             let mut cfg = Config::load()?;
-            let interactive =
-                api_id.is_none() && api_hash.is_none() && group_id.is_none() && pi_bin.is_none();
+            let interactive = api_id.is_none()
+                && api_hash.is_none()
+                && group_id.is_none()
+                && create_group.is_none()
+                && pi_bin.is_none();
             if interactive {
                 println!("leave blank to keep the current value");
                 if let Some(v) = prompt_keep("api_id (my.telegram.org)", cfg.api_id.map(|v| v.to_string()), false)? {
@@ -322,11 +342,21 @@ async fn run() -> Result<()> {
                     cfg.api_hash = Some(v);
                 }
                 if let Some(v) = prompt_keep(
-                    "group_id (Bot-API id, see `verity groups`)",
+                    "group_id (Bot-API id, see `verity groups`; 'new' to create)",
                     cfg.group_id.map(|v| v.to_string()),
                     false,
                 )? {
-                    cfg.group_id = Some(v.parse().context("group_id must be a number")?);
+                    if v == "new" || v.starts_with("new ") {
+                        let title = match v.strip_prefix("new").unwrap_or("").trim() {
+                            "" => prompt("new group title")?,
+                            t => t.to_string(),
+                        };
+                        let id = create_group_with(&cfg, &title).await?;
+                        println!("created '{title}' ({id})");
+                        cfg.group_id = Some(id);
+                    } else {
+                        cfg.group_id = Some(v.parse().context("group_id must be a number")?);
+                    }
                 }
                 if let Some(v) = prompt_keep("pi_bin", cfg.pi_bin.clone(), false)? {
                     cfg.pi_bin = Some(v);
@@ -340,6 +370,11 @@ async fn run() -> Result<()> {
                 }
                 if let Some(v) = group_id {
                     cfg.group_id = Some(v);
+                }
+                if let Some(title) = create_group {
+                    let id = create_group_with(&cfg, &title).await?;
+                    println!("created '{title}' ({id})");
+                    cfg.group_id = Some(id);
                 }
                 if let Some(v) = pi_bin {
                     cfg.pi_bin = Some(v);

@@ -220,6 +220,41 @@ impl Tg {
         Ok(out)
     }
 
+    /// Create a forum supergroup via `channels.createChannel`
+    /// (megagroup + forum — the only kind verity can host a roster in).
+    /// Returns its Bot-API chat id.
+    pub async fn create_group(&self, title: &str) -> Result<i64> {
+        let res = self
+            .client
+            .invoke(&tl::functions::channels::CreateChannel {
+                broadcast: false,
+                megagroup: true,
+                for_import: false,
+                forum: true,
+                title: title.to_string(),
+                about: String::new(),
+                geo_point: None,
+                address: None,
+                ttl_period: None,
+            })
+            .await
+            .map_err(|e| Error::Mtproto(format!("createChannel: {e}")))?;
+        let chats: &[tl::enums::Chat] = match &res {
+            tl::enums::Updates::Updates(u) => &u.chats,
+            tl::enums::Updates::Combined(u) => &u.chats,
+            _ => &[],
+        };
+        let channel_id = chats
+            .iter()
+            .find_map(|c| match c {
+                tl::enums::Chat::Channel(c) => Some(c.id),
+                _ => None,
+            })
+            .ok_or_else(|| Error::Mtproto("createChannel: no channel in updates".into()))?;
+        // supergroup chat_id = -100 concat bare channel id
+        Ok(-(1_000_000_000_000 + channel_id))
+    }
+
     /// Rename a supergroup/channel via `channels.editTitle`.
     /// (Basic groups would need `messages.editChatTitle` — not needed here.)
     pub async fn rename_chat(&self, peer: PeerRef, title: &str) -> Result<()> {
