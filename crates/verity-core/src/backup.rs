@@ -34,12 +34,22 @@ const SQLITE_FILES: &[&str] = &["state.sqlite", "tg.session"];
 /// restore — settings that live outside `~/verity` travel along.
 const HOME_ROOT: &str = "_home/";
 
+/// Top-level entry carrying the backup machine's `$HOME`; on a
+/// different-home restore, `_home` text files (systemd units with
+/// absolute paths) get that string rewritten to the local one.
+const SRC_HOME_MARK: &str = "_src-home";
+
+/// The one `target/` file that does ship: a same-arch restore machine
+/// then runs `serve` with no toolchain at all.
+const SERVE_BIN: &str = "target/release/verity";
+
 /// `$HOME`-relative dirs whose `verity*`-named files ride into
 /// `HOME_ROOT`: the units that run serve/watch/keepalive and the
 /// sent-file state that shouldn't re-fire after a restore.
 const HOME_PARTS: &[&str] = &[".config/systemd/user", ".local/state"];
 
-const CAPTION: &str = "🗄 verity backup — full 7z archive. `verity restore` to unpack.";
+const CAPTION: &str =
+    "🗄 verity backup — full 7z archive. Save it and `verity restore <path>` on a new machine.";
 /// How far back a restore scans the channel for backup docs.
 const RESTORE_SCAN: usize = 500;
 
@@ -142,7 +152,22 @@ fn pack(
             .map_err(sz_err)?;
         }
     }
+    // `target/` is skipped wholesale, but the release binary itself
+    // rides along — without it a fresh machine couldn't start serve.
+    let bin = home.join(SERVE_BIN);
+    if bin.is_file() {
+        sz.push_archive_entry(
+            ArchiveEntry::new_file(SERVE_BIN),
+            Some(std::fs::File::open(&bin)?),
+        )
+        .map_err(sz_err)?;
+    }
     if let Some(user_home) = user_home {
+        sz.push_archive_entry(
+            ArchiveEntry::new_file(SRC_HOME_MARK),
+            Some(user_home.to_string_lossy().as_bytes()),
+        )
+        .map_err(sz_err)?;
         for part in HOME_PARTS {
             let dir = user_home.join(part);
             if !dir.is_dir() {
@@ -267,16 +292,164 @@ async fn unpack(msg: grammers_client::types::Message) -> Result<Vec<String>> {
     out
 }
 
+/// `verity restore <archive>` — point at a local `verity-backup-*.7z`
+/// or an https URL and it unpacks itself. No Telegram session is
+/// needed: the session rides inside the archive, which is the whole
+/// point on a machine that was never set up. Returns names restored.
+pub async fn restore_arg(arg: &str) -> Result<Vec<String>> {
+    if arg.starts_with("http://") || arg.starts_with("https://") {
+        let stage = std::env::temp_dir().join(format!(
+            "verity-restore-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&stage)?;
+        let archive = stage.join("backup.7z");
+        let out = async {
+            fetch(arg, &archive).await?;
+            let home = Config::home()?;
+            std::fs::create_dir_all(&home)?;
+            let user_home = dirs::home_dir();
+            tokio::task::spawn_blocking(move || {
+                extract(&archive, &home, user_home.as_deref())
+            })
+            .await
+            .map_err(|e| Error::Other(e.to_string()))?
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&stage);
+        return out;
+    }
+    let path = expand_tilde(arg);
+    if !path.is_file() {
+        return Err(Error::Config(format!(
+            "no archive at \"{arg}\" — pass a {ARCHIVE_PREFIX}*{ARCHIVE_EXT} path or https URL \
+             (to scan General instead: `verity restore --group <id>`)"
+        )));
+    }
+    let home = Config::home()?;
+    std::fs::create_dir_all(&home)?;
+    let user_home = dirs::home_dir();
+    tokio::task::spawn_blocking(move || extract(&path, &home, user_home.as_deref()))
+        .await
+        .map_err(|e| Error::Other(e.to_string()))?
+}
+
+/// `~/x` → `$HOME/x`; everything else passes through untouched.
+fn expand_tilde(arg: &str) -> PathBuf {
+    match arg.strip_prefix("~/") {
+        Some(rest) => match dirs::home_dir() {
+            Some(h) => h.join(rest),
+            None => PathBuf::from(arg),
+        },
+        None => PathBuf::from(arg),
+    }
+}
+
+async fn fetch(url: &str, dest: &Path) -> Result<()> {
+    let resp = reqwest::get(url)
+        .await
+        .map_err(|e| Error::Other(format!("fetch {url}: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(Error::Other(format!("fetch {url}: {}", resp.status())));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| Error::Other(format!("fetch {url}: {e}")))?;
+    std::fs::write(dest, &bytes)?;
+    Ok(())
+}
+
+/// Light up what a restore just unpacked: reload systemd --user and
+/// `enable --now` every unit that came back (skipping ones whose
+/// ExecStart binary isn't there), plus linger so serve survives
+/// logout. All best-effort — every step reports into the notes.
+pub fn post_restore(files: &[String]) -> Vec<String> {
+    const UNITS: &str = "_home/.config/systemd/user/";
+    let mut notes = Vec::new();
+    let units: Vec<&str> = files
+        .iter()
+        .filter_map(|n| n.strip_prefix(UNITS))
+        .filter(|n| n.ends_with(".service") || n.ends_with(".timer"))
+        .collect();
+    if units.is_empty() {
+        return notes;
+    }
+    let Some(uhome) = dirs::home_dir() else {
+        return notes;
+    };
+    if run_status("systemctl", &["--user", "daemon-reload"]) {
+        notes.push("systemd --user reloaded".to_string());
+    } else {
+        notes.push("systemctl --user daemon-reload failed — enable units by hand".to_string());
+        return notes;
+    }
+    for u in units {
+        let unit_file = uhome.join(".config/systemd/user").join(u);
+        if let Some(missing) = missing_exec(&unit_file) {
+            notes.push(format!(
+                "{u}: not started — {missing} doesn't exist \
+                 (build/install it, then `systemctl --user enable --now {u}`)"
+            ));
+            continue;
+        }
+        notes.push(format!(
+            "{u}: {}",
+            if run_status("systemctl", &["--user", "enable", "--now", u]) {
+                "enabled + started"
+            } else {
+                "enable failed — try `systemctl --user enable --now` by hand"
+            }
+        ));
+    }
+    if run_status("loginctl", &["enable-linger"]) {
+        notes.push("linger on — serve survives logout".to_string());
+    }
+    notes
+}
+
+fn run_status(cmd: &str, args: &[&str]) -> bool {
+    std::process::Command::new(cmd)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// First token of a unit's ExecStart; `Some(path)` when it's absolute
+/// and doesn't exist — enabling a service like that just restart-loops.
+fn missing_exec(unit: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(unit).ok()?;
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("ExecStart=") {
+            let bin = v.split_whitespace().next()?;
+            if bin.starts_with('/') && !Path::new(bin).exists() {
+                return Some(bin.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn extract(archive: &Path, home: &Path, user_home: Option<&Path>) -> Result<Vec<String>> {
     let mut reader = ArchiveReader::open(archive, Password::empty()).map_err(sz_err)?;
     let mut got = Vec::new();
+    // `_home` entries buffer in memory — they're tiny (units, sent
+    // state) and only land after the stream ends, once SRC_HOME_MARK
+    // has told us the backup machine's $HOME for the path rewrite.
+    let mut home_entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut src_home: Option<String> = None;
     reader
         .for_each_entries(|entry, r| {
             let name = entry.name().replace('\\', "/");
             if entry.is_directory() || name.is_empty() {
                 return Ok(true);
             }
-            // `_home/<rel>` → real $HOME; everything else → ~/verity.
             // Reject `..`/absolute paths outright — never write outside.
             let rel = Path::new(&name);
             if rel
@@ -285,17 +458,19 @@ fn extract(archive: &Path, home: &Path, user_home: Option<&Path>) -> Result<Vec<
             {
                 return Ok(true);
             }
-            let dest = match name.strip_prefix(HOME_ROOT) {
-                Some(rest) => match &user_home {
-                    Some(h) => h.join(rest),
-                    None => return Ok(true),
-                },
-                None => home.join(rel),
-            };
             let mut data = Vec::new();
             if std::io::Read::read_to_end(r, &mut data).is_err() {
                 return Ok(true); // skip undecodable entries, keep going
             }
+            if name == SRC_HOME_MARK {
+                src_home = String::from_utf8(data).ok().map(|s| s.trim().to_string());
+                return Ok(true);
+            }
+            if let Some(rest) = name.strip_prefix(HOME_ROOT) {
+                home_entries.push((rest.to_string(), data));
+                return Ok(true);
+            }
+            let dest = home.join(rel);
             if let Some(p) = dest.parent() {
                 let _ = std::fs::create_dir_all(p);
             }
@@ -315,11 +490,49 @@ fn extract(archive: &Path, home: &Path, user_home: Option<&Path>) -> Result<Vec<
                     chmod_private(&dest);
                 }
             }
+            // The archive keeps no mode bits — re-mark the serve binary
+            // executable or the restored units can't launch it.
+            if name == SERVE_BIN {
+                chmod_exec(&dest);
+            }
             got.push(name);
             Ok(true)
         })
         .map_err(sz_err)?;
+    if let Some(uhome) = user_home {
+        let new_home = uhome.to_string_lossy().into_owned();
+        for (rest, data) in home_entries {
+            let data = match &src_home {
+                // Swap the backup machine's $HOME for this one so
+                // absolute paths in units point at real files again.
+                Some(old) if !old.is_empty() && *old != new_home => {
+                    String::from_utf8_lossy(&data)
+                        .replace(old.as_str(), &new_home)
+                        .into_bytes()
+                }
+                _ => data,
+            };
+            let dest = uhome.join(&rest);
+            if let Some(p) = dest.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            std::fs::write(&dest, &data)?;
+            got.push(format!("{HOME_ROOT}{rest}"));
+        }
+    }
     Ok(got)
+}
+
+/// Best-effort 0755 — for the shipped `target/release/verity`, which
+/// the archive stores modeless. No-op off unix.
+fn chmod_exec(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 #[cfg(test)]
@@ -335,7 +548,7 @@ mod tests {
         let user_home = tmp.join("userhome");
         for d in [
             home.join("sub"),
-            home.join("target"),
+            home.join("target/release"),
             user_home.join(".config/systemd/user"),
         ] {
             std::fs::create_dir_all(&d).unwrap();
@@ -345,10 +558,14 @@ mod tests {
         std::fs::write(home.join("state.sqlite-wal"), "sidecar").unwrap();
         std::fs::write(home.join("sub/x.txt"), "x").unwrap();
         std::fs::write(home.join("target/big.bin"), "build output").unwrap();
+        std::fs::write(home.join("target/release/verity"), "binary").unwrap();
         std::fs::write(home.join("x.part"), "temp").unwrap();
         std::fs::write(
             user_home.join(".config/systemd/user/verity.service"),
-            "[Unit]",
+            format!(
+                "[Service]\nExecStart={}/verity/target/release/verity serve",
+                user_home.display()
+            ),
         )
         .unwrap();
 
@@ -378,7 +595,7 @@ mod tests {
         assert!(got.contains(&"config.toml".to_string()));
         assert!(got.contains(&"sub/x.txt".to_string()));
         assert!(got.contains(&"state.sqlite".to_string()));
-        assert!(!got.iter().any(|n| n.contains("target")));
+        assert!(!got.iter().any(|n| n.contains("big.bin")));
         assert!(!got.iter().any(|n| n.ends_with("-wal") || n.ends_with(".part")));
         assert_eq!(
             std::fs::read_to_string(out.join("sub/x.txt")).unwrap(),
@@ -386,13 +603,27 @@ mod tests {
         );
         assert!(!out.join("target/big.bin").exists());
         assert!(!out.join("state.sqlite-wal").exists());
-        // _home overlay lands under the restore machine's $HOME.
+        // The marker is consumed for the rewrite, never written out.
+        assert!(!out.join(SRC_HOME_MARK).exists());
+        // ...but the serve binary does ship and comes back executable.
+        let bin = out.join(SERVE_BIN);
+        assert_eq!(std::fs::read_to_string(&bin).unwrap(), "binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(bin.metadata().unwrap().permissions().mode() & 0o777, 0o755);
+        }
+        // _home overlay lands under the restore machine's $HOME, with
+        // the backup machine's home path rewritten to the local one.
         assert_eq!(
             std::fs::read_to_string(
                 out_home.join(".config/systemd/user/verity.service")
             )
             .unwrap(),
-            "[Unit]"
+            format!(
+                "[Service]\nExecStart={}/verity/target/release/verity serve",
+                out_home.display()
+            )
         );
 
         // Hostile entries are refused.

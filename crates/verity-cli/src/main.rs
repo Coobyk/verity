@@ -80,9 +80,15 @@ enum Cmd {
     /// 7z ~/verity (minus target/) + $HOME settings into one archive;
     /// send it to the group's General topic
     Backup,
-    /// Pull the newest backup archive from General back into ~/verity
-    /// (and the _home/ overlay back into $HOME)
+    /// Restore from a backup archive — pass its path or https URL and
+    /// it unpacks + re-enables itself (no Telegram login needed; the
+    /// session rides inside the archive). No argument: pull the newest
+    /// archive out of General instead.
     Restore {
+        /// Local path or https URL of a verity-backup-*.7z
+        archive: Option<String>,
+        /// General-scan mode only: group id or title
+        #[arg(long)]
         group: Option<String>,
     },
     /// Run the bridge: bots listen, work quietly, reply when done
@@ -643,18 +649,26 @@ async fn run() -> Result<()> {
             println!("uploaded to General: {}", files.join(", "));
         }
 
-        Cmd::Restore { group } => {
-            let (tg, cfg) = authorized_tg().await?;
-            let peer = tg.peer(&group_of(&cfg, group)?).await?;
-            let files = verity_core::backup::download(&tg, peer).await?;
+        Cmd::Restore { archive, group } => {
+            let files = match &archive {
+                Some(a) => verity_core::backup::restore_arg(a).await?,
+                None => {
+                    let (tg, cfg) = authorized_tg().await?;
+                    let peer = tg.peer(&group_of(&cfg, group)?).await?;
+                    verity_core::backup::download(&tg, peer).await?
+                }
+            };
             if files.is_empty() {
                 println!("no backup documents found in General");
             } else {
                 println!(
-                    "restored into {}: {}",
-                    Config::home()?.display(),
-                    files.join(", ")
+                    "restored {} files into {}",
+                    files.len(),
+                    Config::home()?.display()
                 );
+                for note in verity_core::backup::post_restore(&files) {
+                    println!("{note}");
+                }
             }
         }
 
