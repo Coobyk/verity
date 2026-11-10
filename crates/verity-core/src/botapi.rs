@@ -472,17 +472,15 @@ impl BotApi {
                     .collect()
             })
             .collect();
-        let m: Message = self
-            .call(
-                "sendMessage",
-                &json!({
-                    "chat_id": chat_id,
-                    "text": text,
-                    "message_thread_id": topic_id,
-                    "reply_markup": {"inline_keyboard": keyboard},
-                }),
-            )
-            .await?;
+        let mut body = json!({
+            "chat_id": chat_id,
+            "text": text,
+            "reply_markup": {"inline_keyboard": keyboard},
+        });
+        if let Some(t) = topic_id {
+            body["message_thread_id"] = t.into();
+        }
+        let m: Message = self.call("sendMessage", &body).await?;
         Ok(m.message_id)
     }
 
