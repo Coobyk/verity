@@ -97,36 +97,39 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>, pupils: bool) -> Resu
     let s = size as f32;
     let k = s / 900.0; // the original canvas is 900×900
 
-    // 1. Ball scatter — port of randomBlob(): center ±120, 4–7 balls
-    //    at random angle/distance (y squashed 0.75), r 50–140.
-    let cx = s * 0.5 + (rng.f() as f32 - 0.5) * 120.0 * k;
-    let cy = s * 0.5 + (rng.f() as f32 - 0.5) * 120.0 * k;
-    let n = 4 + rng.u(4);
-    let mut balls = Vec::with_capacity(n as usize);
+    // 1. Ball scatter — a dominant central mass plus a few satellite
+    //    bumps fused on by the goo. Rounder and fuller than the site's
+    //    flat scatter (which leaves dangly offshoots at pfp scale).
+    let cx = s * 0.5 + (rng.f() as f32 - 0.5) * 60.0 * k;
+    let cy = s * 0.5 + (rng.f() as f32 - 0.5) * 60.0 * k;
+    let r0 = s * rng.range(0.26, 0.32) as f32;
+    let mut balls = vec![(cx, cy, r0)];
+    let n = 2 + rng.u(3);
     for _ in 0..n {
         let a = rng.range(0.0, std::f64::consts::TAU) as f32;
-        let d = rng.range(0.0, 170.0) as f32 * k;
+        let d = r0 * rng.range(0.55, 0.8) as f32;
         balls.push((
             cx + a.cos() * d,
-            cy + a.sin() * d * 0.75,
-            rng.range(50.0, 140.0) as f32 * k,
+            cy + a.sin() * d * 0.85,
+            r0 * rng.range(0.3, 0.55) as f32,
         ));
     }
 
-    // 2. Alpha mask: white circles → 3× box blur ≈ the feGaussianBlur
-    //    (blur 28 → σ14 at 900px), then the feColorMatrix hard
-    //    threshold at 0.5 — balls merge into goo.
+    // 2. Alpha mask at 2× — white circles → 3× box blur ≈ the
+    //    feGaussianBlur (blur 28 → σ14 at 900px) → feColorMatrix hard
+    //    threshold at 0.5 → downsample 2× for smooth goo edges.
     let w = size as usize;
-    let mut alpha = vec![0u8; w * w];
+    let mw = w * 2;
+    let mut alpha = vec![0u8; mw * mw];
     {
-        let mut px = Pixmap::new(size, size)
+        let mut px = Pixmap::new((size * 2).max(1), (size * 2).max(1))
             .ok_or_else(|| Error::Other("pfp: pixmap alloc failed".into()))?;
         let mut paint = Paint::default();
         paint.set_color_rgba8(255, 255, 255, 255);
         paint.anti_alias = false;
         for &(x, y, r) in &balls {
             let mut pb = PathBuilder::new();
-            pb.push_circle(x, y, r);
+            pb.push_circle(x * 2.0, y * 2.0, r * 2.0);
             if let Some(p) = pb.finish() {
                 px.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
             }
@@ -135,23 +138,24 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>, pupils: bool) -> Resu
             alpha[i] = p.alpha();
         }
     }
-    let mut tmp = vec![0u8; w * w];
-    let br = (14.0 * k).max(2.0) as usize;
+    let mut tmp = vec![0u8; mw * mw];
+    let br = (28.0 * k).max(4.0) as usize;
     for _ in 0..3 {
-        box_blur(&mut alpha, w, w, br, &mut tmp);
+        box_blur(&mut alpha, mw, mw, br, &mut tmp);
     }
 
-    // 3. Threshold → goo mask; gather bbox + centroid for the eyes.
-    let mut min_x = w;
+    // 3. Threshold in supersampled space → bbox/centroid for eyes;
+    //    2× downsample keeps a soft coverage edge.
+    let mut min_x = mw;
     let mut max_x = 0usize;
-    let mut min_y = w;
+    let mut min_y = mw;
     let mut max_y = 0usize;
     let (mut sx, mut sy, mut count) = (0u64, 0u64, 0u64);
-    for y in 0..w {
-        for x in 0..w {
-            let i = y * w + x;
-            if alpha[i] >= 128 {
-                alpha[i] = 255;
+    for y in 0..mw {
+        for x in 0..mw {
+            let on = alpha[y * mw + x] >= 128;
+            alpha[y * mw + x] = if on { 255 } else { 0 };
+            if on {
                 sx += x as u64;
                 sy += y as u64;
                 count += 1;
@@ -159,16 +163,29 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>, pupils: bool) -> Resu
                 max_x = max_x.max(x);
                 min_y = min_y.min(y);
                 max_y = max_y.max(y);
-            } else {
-                alpha[i] = 0;
             }
         }
     }
     if count == 0 {
         return Err(Error::Other("pfp: empty blob".into()));
     }
-    let (bcx, bcy) = (sx as f32 / count as f32, sy as f32 / count as f32);
-    let (bw, bh) = ((max_x - min_x) as f32, (max_y - min_y) as f32);
+    let mut cover = vec![0u8; w * w];
+    for y in 0..w {
+        for x in 0..w {
+            let i = y * 2 * mw + x * 2;
+            let a = (alpha[i] as u16
+                + alpha[i + 1] as u16
+                + alpha[i + mw] as u16
+                + alpha[i + mw + 1] as u16)
+                / 4;
+            cover[y * w + x] = a as u8;
+        }
+    }
+    let (bcx, bcy) = (
+        sx as f32 / count as f32 / 2.0,
+        sy as f32 / count as f32 / 2.0,
+    );
+    let (bw, bh) = ((max_x - min_x) as f32 / 2.0, (max_y - min_y) as f32 / 2.0);
 
     // 4. Composite: white bg (the site's default) or a vivid hue →
     //    pure-black blob, matching the export's fillStyle "#000".
@@ -179,20 +196,28 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>, pupils: bool) -> Resu
         None => (255, 255, 255),
     };
     px.fill(Color::from_rgba8(br_, bg_, bb_, 255));
-    let blob_c = PremultipliedColorU8::from_rgba(0, 0, 0, 255)
-        .ok_or_else(|| Error::Other("pfp: color".into()))?;
-    for (i, on) in alpha.iter().enumerate() {
-        if *on == 255 {
-            px.pixels_mut()[i] = blob_c;
+    for (i, cov) in cover.iter().enumerate() {
+        let c = *cov as u16;
+        if c == 0 {
+            continue;
         }
+        // black blob over bg at coverage c → bg * (1 - c/255)
+        let dst = px.pixels()[i];
+        px.pixels_mut()[i] = PremultipliedColorU8::from_rgba(
+            (dst.red() as u16 * (255 - c) / 255) as u8,
+            (dst.green() as u16 * (255 - c) / 255) as u8,
+            (dst.blue() as u16 * (255 - c) / 255) as u8,
+            dst.alpha(),
+        )
+        .unwrap_or(dst);
     }
 
-    // 5. Auto eyes — port of placeAutoEyes(): gap ≥ blob width*0.3,
-    //    size 0.13×blob height clamped 12–90, capsule w×1.5w, pupils.
-    let gap = (46.0 * k).max(bw * 0.3);
-    let esz = (bh * 0.13).clamp(12.0 * k, 90.0 * k);
+    // 5. Auto eyes — bigger and a touch lower than the site defaults;
+    //    reads friendlier at avatar scale. Stadium capsules w×1.5w.
+    let gap = (52.0 * k).max(bw * 0.34);
+    let esz = (bh * 0.16).clamp(14.0 * k, 96.0 * k);
     let (ew, eh) = (esz, esz * 1.5);
-    let ey = bcy - bh * 0.06;
+    let ey = bcy - bh * 0.02;
     let mut eye = Paint::default();
     eye.set_color_rgba8(255, 255, 255, 255);
     eye.anti_alias = true;
