@@ -105,6 +105,10 @@ struct Env {
 /// Supervisor sweep interval: how often the bridge looks for newly
 /// registered bots and starts their loops.
 const BOT_SWEEP: Duration = Duration::from_secs(10);
+/// Longest a getUpdates 409-conflict backoff may grow — while a second
+/// instance owns the token we keep one probe per this interval so we
+/// resume on our own if the other poller ever goes away.
+const CONFLICT_BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// Default `~/verity` → General backup cadence while `serve` runs;
 /// `VERITY_BACKUP_EVERY` (seconds) overrides, `0` disables.
 const DEFAULT_BACKUP_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
@@ -225,6 +229,8 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
     // bounded by `sem` — queued messages wait marked 🕒.
     let mut inflight = tokio::task::JoinSet::new();
     let sem = Arc::new(Semaphore::new(max_turns()));
+    // Consecutive getUpdates 409s — reset on the first clean poll.
+    let mut conflicts = 0u32;
 
     // Crash recovery: leftover pending records mean the last run died
     // mid-turn — the reaction is still on those messages. Re-run each.
@@ -267,10 +273,26 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
             }
         }
         let updates = match api.get_updates(offset, 30).await {
-            Ok(u) => u,
+            Ok(u) => {
+                conflicts = 0;
+                u
+            }
             Err(e) => {
-                warn!(bot = %bot.name, error = %e, "getUpdates failed, retrying");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                // 409 = another getUpdates poller owns this token — a
+                // second verity instance somewhere. Every retry can kill
+                // the rightful poller's in-flight long-poll, so back off
+                // instead of fighting at full rate: a duplicate instance
+                // becomes a quiet standby that resumes if the other dies.
+                if matches!(e, Error::BotApi { code: 409, .. }) {
+                    conflicts += 1;
+                    let wait =
+                        Duration::from_secs(30 << conflicts.min(4)).min(CONFLICT_BACKOFF_MAX);
+                    warn!(bot = %bot.name, backoff = ?wait, "getUpdates conflict — another poller owns this token");
+                    tokio::time::sleep(wait).await;
+                } else {
+                    warn!(bot = %bot.name, error = %e, "getUpdates failed, retrying");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
                 continue;
             }
         };
