@@ -158,30 +158,35 @@ impl Bridge {
         // Supervisor: run a loop per bot in the store, and pick up bots
         // registered later (`bot new` or a `:::bot_new:::` marker) without
         // a restart.
-        let mut running: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let running = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::<String>::new(),
+        ));
         loop {
             let bots = db_call(&env.db, |s| s.list_bots())
                 .await
                 .unwrap_or_default();
-            if bots.is_empty() && running.is_empty() {
+            if bots.is_empty() && running.lock().unwrap().is_empty() {
                 warn!("no bots registered — `verity bot new`");
             }
             for bot in bots {
-                if !running.insert(bot.name.clone()) {
+                if !running.lock().unwrap().insert(bot.name.clone()) {
                     continue;
                 }
-                let env = env.clone();
+                let (env, running2) = (env.clone(), running.clone());
                 let bot_name = bot.name.clone();
                 tokio::spawn(async move {
                     loop {
                         match run_bot(&bot, &env).await {
-                            Ok(()) => return, // clean exit (only if polling ends gracefully)
+                            Ok(()) => break, // clean exit (only if polling ends gracefully)
                             Err(e) => {
                                 warn!(bot = %bot.name, error = %e, "bot loop failed, restarting in 10s");
                                 tokio::time::sleep(Duration::from_secs(10)).await;
                             }
                         }
                     }
+                    // Free the slot — if the record still exists the
+                    // sweep respawns us; a /reset'd bot stays gone.
+                    running2.lock().unwrap().remove(&bot.name);
                 });
                 info!(bot = %bot_name, "loop started");
             }
@@ -266,10 +271,15 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
                     }
                 }
             }
-            _ => {
+            Ok(None) => {
                 info!(bot = %bot.name, "unregistered — stopping loop");
                 inflight.abort_all();
                 return Ok(());
+            }
+            Err(e) => {
+                // A transient store error (db lock, I/O) is NOT a
+                // deletion — keep polling rather than dying silently.
+                warn!(bot = %bot.name, error = %e, "store check failed — continuing");
             }
         }
         let updates = match api.get_updates(offset, 30).await {
