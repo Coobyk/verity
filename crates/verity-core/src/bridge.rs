@@ -1,5 +1,5 @@
 //! The quiet-bot loop. Each registered bot long-polls its own Bot API
-//! updates; a message in its topic gets: 👀 reaction → typing → work →
+//! updates; a message in its topic gets: 🕒 while queued → 👀 → typing → work →
 //! ✅ → rich replies (split at the 32k cap). No tool-call spam.
 //!
 //! Turns run concurrently — the poll loop spawns each message's work as
@@ -32,7 +32,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::botapi::{BotApi, InputRichMessage};
-use crate::harness::{Harness, TurnContext};
+use crate::harness::{Activity, Harness, TurnContext};
 use crate::mtproto::Tg;
 use crate::rich::{split_markdown, RICH_LIMIT, TEXT_LIMIT};
 use crate::store::{Bot, Store};
@@ -54,7 +54,7 @@ const MAX_HELPERS: usize = 3;
 const PROGRESS_AFTER: Duration = Duration::from_secs(12);
 const PROGRESS_TICK: Duration = Duration::from_secs(20);
 /// How many agent turns may run at once per bot; extra messages queue on
-/// the semaphore (their 👀 is already on). `VERITY_MAX_TURNS` overrides.
+/// the semaphore (marked 🕒 while they wait). `VERITY_MAX_TURNS` overrides.
 fn max_turns() -> usize {
     std::env::var("VERITY_MAX_TURNS")
         .ok()
@@ -210,12 +210,12 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
 
     // Per-message work runs in tasks so a slow turn never mutes the bot:
     // the poll loop spawns and keeps polling. Turns themselves are
-    // bounded by `sem` — queued messages wait with their 👀 on.
+    // bounded by `sem` — queued messages wait marked 🕒.
     let mut inflight = tokio::task::JoinSet::new();
     let sem = Arc::new(Semaphore::new(max_turns()));
 
     // Crash recovery: leftover pending records mean the last run died
-    // mid-turn — the 👀 is still on those messages. Re-run each.
+    // mid-turn — the reaction is still on those messages. Re-run each.
     for (mid, text) in recover_pending(&env.db, &bot.name).await {
         warn!(bot = %bot.name, msg = mid, "resuming crashed turn");
         let (api, bot, env, sem) = (api.clone(), bot.clone(), env.clone(), sem.clone());
@@ -423,9 +423,9 @@ async fn handle_message(
         }
     }
     debug!(bot = %bot.name, %text, "turn request");
-    // Acknowledge immediately — queued behind other turns, the 👀 says
-    // "seen, will get to it".
-    let _ = api.set_reaction(env.group_id, msg.message_id, "👀").await;
+    // Acknowledge immediately — queued behind other turns, the 🕒 says
+    // "seen, will get to it". `handle_turn` swaps it to 👀 on start.
+    let _ = api.set_reaction(env.group_id, msg.message_id, "🕒").await;
     let _permit = sem.acquire().await.ok();
     if let Err(e) = handle_turn(api, bot, env, topic_id, msg.message_id, &text).await {
         warn!(bot = %bot.name, error = %e, "turn failed");
@@ -710,20 +710,26 @@ fn typing_keepalive(api: BotApi, group_id: i64, topic_id: i64) -> tokio::task::J
 
 /// After [`PROGRESS_AFTER`], post one progress message — a reply to the
 /// triggering message so it's traceable — and edit it every
-/// [`PROGRESS_TICK`] with the elapsed count. Returns the task handle and
-/// the shared slot holding the message id (for later deletion).
+/// [`PROGRESS_TICK`] with the current activity label ("editing
+/// bridge.rs") and the elapsed count. Returns the task handle and the
+/// shared slot holding the message id (for later deletion).
 fn progress_task(
     api: BotApi,
     group_id: i64,
     topic_id: i64,
     reply_to: Option<i64>,
+    activity: Activity,
 ) -> (tokio::task::JoinHandle<()>, Arc<Mutex<Option<i64>>>) {
     let msg_id = Arc::new(Mutex::new(None));
     let slot = msg_id.clone();
     let handle = tokio::spawn(async move {
         tokio::time::sleep(PROGRESS_AFTER).await;
+        let what = || {
+            let a = activity.get();
+            if a.is_empty() { "working".to_string() } else { a }
+        };
         let Ok(m) = api
-            .send_message(group_id, "⏳ working…", Some(topic_id), reply_to)
+            .send_message(group_id, &format!("⏳ {}…", what()), Some(topic_id), reply_to)
             .await
         else {
             return;
@@ -732,7 +738,7 @@ fn progress_task(
         let start = Instant::now();
         loop {
             tokio::time::sleep(PROGRESS_TICK).await;
-            let text = format!("⏳ working… {}s elapsed", start.elapsed().as_secs());
+            let text = format!("⏳ {}… {}s elapsed", what(), start.elapsed().as_secs());
             if api
                 .edit_message(group_id, m.message_id, &text)
                 .await
@@ -886,10 +892,16 @@ async fn handle_turn(
         .send_chat_action(env.group_id, "typing", Some(topic_id))
         .await;
     let keepalive = typing_keepalive(api.clone(), env.group_id, topic_id);
-    let (progress, progress_msg) =
-        progress_task(api.clone(), env.group_id, topic_id, Some(message_id));
+    let activity = Activity::default();
+    let (progress, progress_msg) = progress_task(
+        api.clone(),
+        env.group_id,
+        topic_id,
+        Some(message_id),
+        activity.clone(),
+    );
 
-    let result = do_turn(env, bot, topic_id, text, 0, Some(message_id)).await;
+    let result = do_turn(env, bot, topic_id, text, 0, Some(message_id), activity).await;
 
     keepalive.abort();
     progress.abort();
@@ -936,6 +948,7 @@ async fn do_turn(
     text: &str,
     depth: u8,
     reply_to: Option<i64>,
+    activity: Activity,
 ) -> Result<bool> {
     let api = BotApi::new(&bot.token);
     let harness = (env.make)(&bot.provider);
@@ -973,6 +986,7 @@ async fn do_turn(
         first_contact,
         cwd: std::env::current_dir().unwrap_or_else(|_| "/".into()),
         model: bot.model.clone(),
+        activity,
     };
 
     // 2. Work.
@@ -1011,6 +1025,7 @@ async fn do_turn(
             first_contact: false,
             cwd: ctx.cwd.clone(),
             model: ctx.model.clone(),
+            activity: ctx.activity.clone(),
         };
         let (harness, label, task) = (harness.clone(), label.clone(), task.clone());
         helpers.spawn(async move { (label, harness.run_turn(&hctx, &task).await) });
@@ -1141,7 +1156,9 @@ fn turn<'a>(
     depth: u8,
     reply_to: Option<i64>,
 ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
-    Box::pin(do_turn(env, bot, topic_id, text, depth, reply_to))
+    // Tell-routed turns have no progress message watching them — a
+    // throwaway slot keeps the signature uniform.
+    Box::pin(do_turn(env, bot, topic_id, text, depth, reply_to, Activity::default()))
 }
 
 async fn find_bot(db: &Path, name: &str) -> Option<Bot> {
@@ -1281,7 +1298,8 @@ mod tests {
         }
     }
 
-    /// Full quiet-bot turn against the mock: 👀 → typing → work → rich
+    /// Full quiet-bot turn against the mock: 👀 (🕒 is set earlier, at
+    /// dispatch) → typing → work → rich
     /// reply → ✅. Exercises `handle_turn` end to end, DB included.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_flow_against_mock_api() {

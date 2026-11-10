@@ -8,6 +8,7 @@
 //! - `acp:<cmd> [args]` — any agent CLI speaking the Agent Client
 //!   Protocol over stdio (claude-code-acp, codex acp, `pi --acp`, …)
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -23,6 +24,22 @@ use crate::{Error, Result};
 pub struct TurnOutput {
     /// Final reply, as Telegram Rich Markdown.
     pub reply: String,
+}
+
+/// Shared one-line "what the agent is doing right now". Harnesses that
+/// stream events (ACP) write it on every tool call / text chunk; the
+/// bridge's ⏳ progress message reads it each tick. Providers with no
+/// event stream just leave it empty → "working".
+#[derive(Debug, Clone, Default)]
+pub struct Activity(Arc<Mutex<String>>);
+
+impl Activity {
+    pub fn set(&self, label: impl Into<String>) {
+        *self.0.lock().unwrap() = label.into();
+    }
+    pub fn get(&self) -> String {
+        self.0.lock().unwrap().clone()
+    }
 }
 
 /// Context handed to the harness for one turn.
@@ -43,6 +60,8 @@ pub struct TurnContext {
     /// Working directory for the agent.
     pub cwd: std::path::PathBuf,
     pub model: Option<String>,
+    /// Out-channel for progress labels; see [`Activity`].
+    pub activity: Activity,
 }
 
 #[async_trait]
@@ -335,6 +354,9 @@ impl AcpHarness {
                         .map_err(|e| Error::Harness(format!("acp write: {e}")))?;
                 } else if method == "session/update" {
                     let u = &msg["params"]["update"];
+                    if let Some(label) = activity_label(u) {
+                        ctx.activity.set(label);
+                    }
                     match u["sessionUpdate"].as_str() {
                         Some("agent_message_chunk") => {
                             if let Some(t) = u["content"]["text"].as_str() {
@@ -426,6 +448,96 @@ impl ReplyAccumulator {
             self.last
         }
     }
+}
+
+/// Turn an ACP `session/update` payload into a short ⏳ label —
+/// "editing mtproto.rs", "running cargo test". `None` for updates that
+/// carry no new activity (usage counters, bare status flips), so they
+/// don't overwrite a more specific label with "working".
+fn activity_label(u: &serde_json::Value) -> Option<String> {
+    let label = match u["sessionUpdate"].as_str()? {
+        "tool_call" | "tool_call_update" => {
+            let file = tool_path(u);
+            match u["kind"].as_str() {
+                Some("read") => file.map(|f| format!("reading {f}")),
+                Some("edit") => file.map(|f| format!("editing {f}")),
+                // devin titles execute calls "Ran cmd1, cmd2".
+                Some("execute") => u["title"]
+                    .as_str()
+                    .and_then(|t| t.strip_prefix("Ran "))
+                    .map(|c| format!("running {c}")),
+                _ => None,
+            }
+            .or_else(|| u["title"].as_str().and_then(gerundize))?
+        }
+        "agent_thought_chunk" => "thinking".into(),
+        "agent_message_chunk" => "writing reply".into(),
+        "plan" => "planning".into(),
+        _ => return None,
+    };
+    Some(truncate(&label, 48))
+}
+
+/// File a tool call touches: basename of `locations[].path`, a diff
+/// `content[].path`, or `rawInput.file_path` — whichever shows up first.
+fn tool_path(u: &serde_json::Value) -> Option<String> {
+    let path = u["locations"]
+        .as_array()
+        .and_then(|l| l.iter().find_map(|l| l["path"].as_str()))
+        .or_else(|| {
+            u["content"]
+                .as_array()
+                .and_then(|c| c.iter().find_map(|c| c["path"].as_str()))
+        })
+        .or_else(|| u["rawInput"]["file_path"].as_str())?;
+    std::path::Path::new(path)
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+}
+
+/// Best-effort present participle for the past-tense titles agents
+/// report ("Ran" is handled by the execute branch; the rest lands here).
+/// Unknown titles pass through with the first letter lowered.
+fn gerundize(title: &str) -> Option<String> {
+    if title.is_empty() {
+        return None;
+    }
+    let (verb, rest) = title.split_once(' ').unwrap_or((title, ""));
+    let doing = match verb {
+        "Ran" | "Run" => "running",
+        "Read" => "reading",
+        "Edit" | "Edited" => "editing",
+        "Wrote" | "Write" => "writing",
+        "Listed" => "listing",
+        "Called" | "Calling" => "calling",
+        "Invoked" => "invoking",
+        "Created" => "creating",
+        "Fetched" | "Fetching" => "fetching",
+        "Searched" | "Searching" => "searching",
+        "Deleted" => "deleting",
+        "Moved" => "moving",
+        _ => {
+            let mut t = title.to_string();
+            if let Some(r) = t.get_mut(0..1) {
+                r.make_ascii_lowercase();
+            }
+            return Some(t);
+        }
+    };
+    Some(if rest.is_empty() {
+        doing.into()
+    } else {
+        format!("{doing} {rest}")
+    })
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut t = s[..s.floor_char_boundary(max)].to_string();
+    t.push('…');
+    t
 }
 
 /// Drop `<think>…</think>` / `<thinking>…</thinking>` blocks some models
@@ -526,6 +638,33 @@ mod tests {
         acc.boundary();
         acc.chunk("final");
         assert_eq!(acc.finish(), "final");
+    }
+
+    #[test]
+    fn labels_tool_calls() {
+        let u = json!({"sessionUpdate": "tool_call", "kind": "edit",
+            "content": [{"type": "diff", "path": "/a/b/mtproto.rs"}]});
+        assert_eq!(activity_label(&u).as_deref(), Some("editing mtproto.rs"));
+        let u = json!({"sessionUpdate": "tool_call", "kind": "read",
+            "locations": [{"path": "/a/b/main.rs"}]});
+        assert_eq!(activity_label(&u).as_deref(), Some("reading main.rs"));
+        let u = json!({"sessionUpdate": "tool_call", "kind": "execute",
+            "title": "Ran cargo test"});
+        assert_eq!(activity_label(&u).as_deref(), Some("running cargo test"));
+        let u = json!({"sessionUpdate": "tool_call",
+            "title": "Calling get_me from instabox"});
+        assert_eq!(
+            activity_label(&u).as_deref(),
+            Some("calling get_me from instabox")
+        );
+    }
+
+    #[test]
+    fn bare_status_updates_keep_prior_label() {
+        let u = json!({"sessionUpdate": "tool_call_update", "status": "completed"});
+        assert_eq!(activity_label(&u), None);
+        let u = json!({"sessionUpdate": "usage_update"});
+        assert_eq!(activity_label(&u), None);
     }
 
     #[test]
