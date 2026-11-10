@@ -665,30 +665,48 @@ async fn save_media(
     Ok(dest)
 }
 
+/// A turn may wait this long on the user-session transcript before
+/// running context-free. Requests on a half-dead MTProto connection
+/// stall until the kernel gives up (minutes) — parked turns then all
+/// wake in one burst when the socket finally dies. `VERITY_HISTORY_TIMEOUT`
+/// overrides (seconds).
+fn history_timeout() -> Duration {
+    std::env::var("VERITY_HISTORY_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(60))
+}
+
 /// Pull the recent topic transcript via the user session, as
 /// `(sender, text)` pairs with oversized messages truncated.
 async fn fetch_history(tg: &Tg, peer: &PeerRef, topic_id: i64) -> Vec<(String, String)> {
-    match tg.topic_history(*peer, topic_id, HISTORY_LIMIT).await {
-        Ok(msgs) => msgs
-            .into_iter()
-            .filter(|m| !m.text.is_empty())
-            .map(|m| {
-                let text = if m.text.chars().count() > HISTORY_MSG_CHARS {
-                    format!(
-                        "{}…",
-                        m.text.chars().take(HISTORY_MSG_CHARS).collect::<String>()
-                    )
-                } else {
-                    m.text
-                };
-                (m.sender, text)
-            })
-            .collect(),
-        Err(e) => {
+    let fetch = tg.topic_history(*peer, topic_id, HISTORY_LIMIT);
+    let msgs = match tokio::time::timeout(history_timeout(), fetch).await {
+        Ok(Ok(msgs)) => msgs,
+        Ok(Err(e)) => {
             debug!(error = %e, "topic history fetch failed; turn runs without it");
-            Vec::new()
+            return Vec::new();
         }
-    }
+        Err(_) => {
+            warn!("topic history fetch timed out; turn runs without it");
+            return Vec::new();
+        }
+    };
+    msgs.into_iter()
+        .filter(|m| !m.text.is_empty())
+        .map(|m| {
+            let text = if m.text.chars().count() > HISTORY_MSG_CHARS {
+                format!(
+                    "{}…",
+                    m.text.chars().take(HISTORY_MSG_CHARS).collect::<String>()
+                )
+            } else {
+                m.text
+            };
+            (m.sender, text)
+        })
+        .collect()
 }
 
 /// Keep the "typing" indicator alive for the duration of a turn —

@@ -215,8 +215,29 @@ async fn resolve_topic(
         .context("no such topic")
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Tokio worker threads default to a 2 MiB stack; deep synchronous
+/// chains (dependency parsers, drop glue unwinding a burst of failed
+/// futures) can exhaust it — that aborts the whole process, no unwind.
+/// Give workers the same headroom the main thread gets.
+/// `VERITY_STACK_MIB` overrides.
+fn worker_stack() -> usize {
+    std::env::var("VERITY_STACK_MIB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8)
+        * 1024
+        * 1024
+}
+
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(worker_stack())
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
