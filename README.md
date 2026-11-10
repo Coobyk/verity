@@ -26,7 +26,7 @@ You ──► verity (grammers, logged in as YOU)
           SQLite holds brains (memory, config) — chats live in Telegram
 ```
 
-Quiet bots by design: a turn is 👀 reaction → typing (one ⏳ progress
+Quiet bots by design: a turn is 🕒 while queued → 👀 → typing (one ⏳ progress
 message on slow turns, deleted after) → ✅ → rich replies (32k chars,
 GFM markdown, LaTeX, collapsible thinking blocks, auto-split at the
 cap). Each turn sees the recent topic transcript — bots can't read

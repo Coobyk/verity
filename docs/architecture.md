@@ -28,7 +28,7 @@ one topic per bot, bots are real bot accounts with their own avatars.
   Conversation content lives in Telegram. Memory writes ride along in
   the reply stream: `:::remember k = v:::` lines are persisted to the
   `memory` table and stripped before send.
-- **Quiet bots.** A turn: 👀 reaction → typing (kept alive every 4s) →
+- **Quiet bots.** A turn: 🕒 while queued → 👀 → typing (kept alive every 4s) →
   work → rich replies split at the 32k cap, plain-text fallback split at
   4k. Offline backlog is acked-and-skipped on start; a crashed bot loop
   restarts after 10s.
