@@ -255,7 +255,8 @@ impl AcpHarness {
                     .write_all(line.as_bytes())
                     .await
                     .map_err(|e| Error::Harness(format!("acp write: {e}")))?;
-                info!("acp -> {}", &line.trim_end()[..line.trim_end().len().min(300)]);
+                let t = line.trim_end();
+                info!("acp -> {}", &t[..t.floor_char_boundary(t.len().min(300))]);
                 sent += 1;
             }
 
@@ -264,7 +265,7 @@ impl AcpHarness {
                 Ok(None) => break, // agent exited
                 Err(e) => return Err(Error::Harness(format!("acp read: {e}"))),
             };
-            info!("acp <- {}", &line[..line.len().min(300)]);
+            info!("acp <- {}", &line[..line.floor_char_boundary(line.len().min(300))]);
             let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue; // not JSON-RPC — ignore stray output
             };
