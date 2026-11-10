@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Watch ~/verity/deaths for new *.md reports and post them into Healthity's
-# topic as formatted markdown via `verity send`. Sent filenames are
+# topic as file documents via `verity send --file`. Sent filenames are
 # tracked in $STATE so restarts never repost.
 set -u
 DEATHS=/data/home/verity/deaths
@@ -12,7 +12,7 @@ while true; do
     [ -e "$f" ] || continue
     base=$(basename "$f")
     grep -qxF "$base" "$STATE" && continue
-    if "$VERITY" send Healthity "$(cat "$f")" >/dev/null 2>&1; then
+    if "$VERITY" send Healthity "$f" --file >/dev/null 2>&1; then
       echo "$base" >> "$STATE"
     fi
   done
