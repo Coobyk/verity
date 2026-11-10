@@ -44,6 +44,11 @@ Replies can carry `:::` markers, stripped before send:
   creates its own topic seconds later
 - `:::backup:::` — upload `~/verity` (config, session, sqlite brain)
   as documents in General
+- `:::restart:::` — exit cleanly once the turn's reply and bookkeeping
+  are done; the supervisor (`Restart=always`) comes back on the new
+  binary — the safe way for a turn to reload itself after a rebuild
+- `:::shutdown:::` — ask systemd to stop verity's own unit so it stays
+  down; a bare exit would just be restarted
 
 Bots registered while `serve` runs start automatically — the bridge
 re-scans the roster every 10s.

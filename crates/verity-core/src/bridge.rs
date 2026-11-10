@@ -20,6 +20,10 @@
 //!   the same harness; results fold into the reply as `<details>` blocks
 //! - `:::backup:::` — 7z `~/verity` (minus `target/`) + `$HOME` settings
 //!   into one archive, uploaded to General
+//! - `:::restart:::` — exit(0) once the turn's paperwork is done; the
+//!   supervisor (`Restart=always`) comes back on the new binary
+//! - `:::shutdown:::` — ask systemd to stop our own unit so it stays
+//!   down; a bare exit would just be restarted
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -779,6 +783,26 @@ struct Markers {
     bot_new: Vec<(String, String, String, Option<String>)>,
     /// `:::backup:::` — ship ~/verity to General after the reply.
     backup: bool,
+    /// `:::shutdown:::` / `:::restart:::` — how the service should die
+    /// once this turn's paperwork is done.
+    exit: Option<Exit>,
+}
+
+/// How a turn asked for the service to end.
+#[derive(Clone, Copy)]
+enum Exit {
+    /// `exit(0)` — `Restart=always` (or any supervisor) reloads us.
+    Restart,
+    /// `systemctl stop` our own unit — explicit stops don't restart.
+    Stop,
+}
+
+/// What `do_turn` hands back: whether helpers ran (a ✅ is earned) plus
+/// any request to end the service, enacted by the caller after the
+/// pending record is cleared.
+struct TurnOutcome {
+    helpers: bool,
+    exit: Option<Exit>,
 }
 
 /// Pull `:::verb …:::` lines out of a reply. Returns the cleaned reply
@@ -816,6 +840,8 @@ fn extract_markers(reply: &str) -> (String, Markers) {
                     }
                 }
                 "backup" => markers.backup = true,
+                "shutdown" => markers.exit = Some(Exit::Stop),
+                "restart" => markers.exit = Some(Exit::Restart),
                 // `bot_new name | token | instructions [| provider]`
                 "bot_new" => {
                     let mut f = rest.split('|').map(str::trim);
@@ -931,14 +957,28 @@ async fn handle_turn(
     // ✅ only when the turn spawned helpers; a plain reply leaves no mark.
     let pkey = pending_key(&bot.name, message_id);
     let _ = db_call(&env.db, move |s| s.kv_del(&pkey)).await;
-    match result {
-        Ok(true) => {
+    match &result {
+        Ok(o) if o.helpers => {
             let _ = api.set_reaction(env.group_id, message_id, "✅").await;
         }
-        Ok(false) => {
+        Ok(_) => {
             let _ = api.clear_reaction(env.group_id, message_id).await;
         }
         Err(_) => {} // upstream marks ⚠️, which also replaces the 👀
+    }
+    // `:::shutdown:::` / `:::restart:::` fire only here: the reply is on
+    // the wire and the pending record cleared, so a restart can never
+    // resume into the same order to die. `tell`-routed turns don't reach
+    // this — a handoff can't take the bridge down mid-flight.
+    if let Ok(o) = &result {
+        match o.exit {
+            Some(Exit::Stop) => stop_self().await,
+            Some(Exit::Restart) => {
+                info!(bot = %bot.name, ":::restart::: — exiting for the supervisor");
+                std::process::exit(0);
+            }
+            None => {}
+        }
     }
     result.map(|_| ())
 }
@@ -958,7 +998,9 @@ fn pending_prefix(bot_name: &str) -> String {
 /// `reply_to` threads the reply back to the triggering message (None for
 /// bot-to-bot turns — there's no human message to attach to).
 /// Returns `true` when the turn fanned out spawn helpers — real work
-/// worth a ✅; plain chats get no final reaction.
+/// worth a ✅; plain chats get no final reaction. The [`TurnOutcome`]
+/// also carries any `:::shutdown:::`/`:::restart:::` request — the
+/// depth-0 caller enacts it once the pending record is cleared.
 async fn do_turn(
     env: &Env,
     bot: &Bot,
@@ -967,7 +1009,7 @@ async fn do_turn(
     depth: u8,
     reply_to: Option<i64>,
     activity: Activity,
-) -> Result<bool> {
+) -> Result<TurnOutcome> {
     let api = BotApi::new(&bot.token);
     let harness = (env.make)(&bot.provider);
 
@@ -1160,7 +1202,39 @@ async fn do_turn(
             .send_markdown_message(env.group_id, &note, Some(topic_id), reply_to)
             .await;
     }
-    Ok(!markers.spawn.is_empty())
+    Ok(TurnOutcome {
+        helpers: !markers.spawn.is_empty(),
+        exit: markers.exit,
+    })
+}
+
+/// `:::shutdown:::` — die and stay dead. A bare `exit(0)` won't do:
+/// under `Restart=always` the supervisor resurrects the process seconds
+/// later, so the bridge asks systemd to stop its own unit instead — the
+/// unit name is the last component of our own cgroup, and the stop
+/// request survives the SIGTERM it provokes. Without systemd, exiting
+/// is the stop anyway.
+async fn stop_self() {
+    let unit = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|cg| cg.trim().rsplit('/').next().map(String::from))
+        .filter(|u| u.ends_with(".service"));
+    let stopped = match &unit {
+        Some(u) => {
+            info!(unit = %u, ":::shutdown::: — stopping own unit");
+            tokio::process::Command::new("systemctl")
+                .args(["--user", "stop", u])
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+        None => false,
+    };
+    if !stopped {
+        warn!(":::shutdown::: — no systemd unit to stop; exiting");
+    }
+    std::process::exit(0);
 }
 
 /// `do_turn` recurses through `tell` → `tokio::spawn` → `do_turn`, and
@@ -1173,7 +1247,7 @@ fn turn<'a>(
     text: &'a str,
     depth: u8,
     reply_to: Option<i64>,
-) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<TurnOutcome>> + Send + 'a>> {
     // Tell-routed turns have no progress message watching them — a
     // throwaway slot keeps the signature uniform.
     Box::pin(do_turn(env, bot, topic_id, text, depth, reply_to, Activity::default()))
@@ -1224,6 +1298,15 @@ mod tests {
         let (clean, m) = extract_markers(reply);
         assert_eq!(clean, "ok");
         assert!(m.remember.is_empty() && m.tell.is_empty() && m.spawn.is_empty());
+    }
+
+    #[test]
+    fn parses_exit_markers() {
+        let (clean, m) = extract_markers("bye\n:::shutdown:::");
+        assert_eq!(clean, "bye");
+        assert!(matches!(m.exit, Some(Exit::Stop)));
+        let (_, m) = extract_markers("brb\n:::restart:::");
+        assert!(matches!(m.exit, Some(Exit::Restart)));
     }
 
     /// A bare-bones mock of the Bot API HTTP surface: records each method
