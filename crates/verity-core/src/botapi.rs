@@ -188,10 +188,15 @@ impl BotApi {
         chat_id: i64,
         text: &str,
         thread_id: Option<i64>,
+        reply_to: Option<i64>,
     ) -> Result<Message> {
         let mut body = json!({ "chat_id": chat_id, "text": text });
         if let Some(t) = thread_id {
             body["message_thread_id"] = t.into();
+        }
+        if let Some(m) = reply_to {
+            body["reply_parameters"] =
+                json!({"message_id": m, "allow_sending_without_reply": true});
         }
         self.call("sendMessage", &body).await
     }
@@ -203,11 +208,16 @@ impl BotApi {
         chat_id: i64,
         text: &str,
         thread_id: Option<i64>,
+        reply_to: Option<i64>,
     ) -> Result<Message> {
         let mut body =
             json!({ "chat_id": chat_id, "text": text, "parse_mode": "Markdown" });
         if let Some(t) = thread_id {
             body["message_thread_id"] = t.into();
+        }
+        if let Some(m) = reply_to {
+            body["reply_parameters"] =
+                json!({"message_id": m, "allow_sending_without_reply": true});
         }
         self.call("sendMessage", &body).await
     }
@@ -218,10 +228,15 @@ impl BotApi {
         chat_id: i64,
         rich: InputRichMessage,
         thread_id: Option<i64>,
+        reply_to: Option<i64>,
     ) -> Result<Message> {
         let mut body = json!({ "chat_id": chat_id, "rich_message": rich });
         if let Some(t) = thread_id {
             body["message_thread_id"] = t.into();
+        }
+        if let Some(m) = reply_to {
+            body["reply_parameters"] =
+                json!({"message_id": m, "allow_sending_without_reply": true});
         }
         self.call("sendRichMessage", &body).await
     }

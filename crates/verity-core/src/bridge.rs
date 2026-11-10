@@ -2,6 +2,12 @@
 //! updates; a message in its topic gets: 👀 reaction → typing → work →
 //! ✅ → rich replies (split at the 32k cap). No tool-call spam.
 //!
+//! Turns run concurrently — the poll loop spawns each message's work as
+//! a task (bounded by [`max_turns`]), so a long-running turn doesn't
+//! mute the bot. Every reply (and the ⏳ progress note) is sent as a
+//! Telegram reply to the message that triggered it, so answers trace
+//! back to their question no matter the completion order.
+//!
 //! If a user-side MTProto session is attached, each turn also carries the
 //! recent topic transcript — bots can't read history themselves, so the
 //! user's session reads it for them.
@@ -22,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use grammers_session::defs::PeerRef;
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::botapi::{BotApi, InputRichMessage};
@@ -46,6 +53,14 @@ const MAX_HELPERS: usize = 3;
 /// the real reply lands.
 const PROGRESS_AFTER: Duration = Duration::from_secs(12);
 const PROGRESS_TICK: Duration = Duration::from_secs(20);
+/// How many agent turns may run at once per bot; extra messages queue on
+/// the semaphore (their 👀 is already on). `VERITY_MAX_TURNS` overrides.
+fn max_turns() -> usize {
+    std::env::var("VERITY_MAX_TURNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4)
+}
 
 /// Builds the harness for a bot's `provider` string (`pi`, `echo`,
 /// `acp:<cmd> [args]`).
@@ -177,7 +192,7 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
             .map_err(|e| Error::Other(e.to_string()))??;
             info!(bot = %bot.name, topic = tid, "created topic");
             if let Some(g) = &bot.greeting {
-                let _ = send_reply(&api, env.group_id, tid, g).await;
+                let _ = send_reply(&api, env.group_id, tid, g, None).await;
             }
             tid
         }
@@ -193,16 +208,23 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
         .and_then(|u| u.last().map(|u| u.update_id + 1))
         .unwrap_or(0);
 
-    // Crash recovery: a leftover pending record means the last run died
-    // mid-turn — the 👀 is still on the message. Re-run it.
-    let pkey = pending_key(&bot.name);
-    if let Ok(Some(v)) = db_call(&env.db, move |s| s.kv_get(&pkey)).await {
-        if let Some((mid, text)) = v.split_once('\n') {
-            if let Ok(mid) = mid.parse::<i64>() {
-                warn!(bot = %bot.name, msg = mid, "resuming crashed turn");
-                let _ = handle_turn(&api, bot, env, topic_id, mid, text).await;
+    // Per-message work runs in tasks so a slow turn never mutes the bot:
+    // the poll loop spawns and keeps polling. Turns themselves are
+    // bounded by `sem` — queued messages wait with their 👀 on.
+    let mut inflight = tokio::task::JoinSet::new();
+    let sem = Arc::new(Semaphore::new(max_turns()));
+
+    // Crash recovery: leftover pending records mean the last run died
+    // mid-turn — the 👀 is still on those messages. Re-run each.
+    for (mid, text) in recover_pending(&env.db, &bot.name).await {
+        warn!(bot = %bot.name, msg = mid, "resuming crashed turn");
+        let (api, bot, env, sem) = (api.clone(), bot.clone(), env.clone(), sem.clone());
+        inflight.spawn(async move {
+            let _permit = sem.acquire().await.ok();
+            if let Err(e) = handle_turn(&api, &bot, &env, topic_id, mid, &text).await {
+                warn!(bot = %bot.name, error = %e, "resumed turn failed");
             }
-        }
+        });
     }
 
     loop {
@@ -222,6 +244,7 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
             }
             _ => {
                 info!(bot = %bot.name, "unregistered — stopping loop");
+                inflight.abort_all();
                 return Ok(());
             }
         }
@@ -273,120 +296,178 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
             if msg.from.as_ref().map(|u| u.is_bot).unwrap_or(true) {
                 continue; // never react to bots (incl. ourselves)
             }
-            // Text or caption; media gets downloaded and its local path
-            // appended so the agent can actually look at it.
-            let mut text = msg
-                .text
-                .clone()
-                .or_else(|| msg.caption.clone())
-                .unwrap_or_default();
-            if let Some(att) = attachment(&msg) {
-                match save_media(&api, &env.db, &bot.name, msg.message_id, &att).await {
-                    Ok(path) => {
-                        let note = format!(
-                            "[{} attached: {} — read this file to view it]",
-                            att.desc,
-                            path.display()
-                        );
-                        text = if text.is_empty() {
-                            note
-                        } else {
-                            format!("{text}\n\n{note}")
-                        };
-                    }
-                    Err(e) => {
-                        warn!(bot = %bot.name, error = %e, "attachment download failed")
-                    }
-                }
-            }
-            if text.trim().is_empty() {
-                continue;
-            }
-            // In-chat commands — destructive, so they confirm via an
-            // inline button before anything runs.
-            if let Some(cmd) = text
-                .strip_prefix('/')
-                .map(|c| c.split_whitespace().next().unwrap_or(""))
-            {
-                let ask = match cmd {
-                    "backup" => {
-                        // Not destructive — no quiz-confirm needed.
-                        let note = match crate::backup::upload(&api, env.group_id).await {
-                            Ok(files) => {
-                                format!("🗄 backed up {} to General", files.join(", "))
-                            }
-                            Err(e) => format!("⚠️ backup failed: {e}"),
-                        };
-                        let _ = api
-                            .send_message(env.group_id, &note, Some(topic_id))
-                            .await;
-                        continue;
-                    }
-                    "clear" => "Wipe my memory? Can't undo this.",
-                    "clearchat" => {
-                        "Delete every message in this topic AND wipe my memory? Can't undo."
-                    }
-                    "reset" => "Nuke EVERYTHING — all topics, all messages, every bot but me, all memory? Can't undo.",
-                    _ => "",
-                };
-                if !ask.is_empty() {
-                    // Quiz-confirm: pick the right answer among decoys.
-                    let mut rng = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.subsec_nanos() as u64)
-                        .unwrap_or(1);
-                    let mut next = || {
-                        rng ^= rng << 13;
-                        rng ^= rng >> 7;
-                        rng ^= rng << 17;
-                        rng
-                    };
-                    let (a, b) = (2 + next() % 8, 2 + next() % 8);
-                    let ans = a + b;
-                    let mut opts: Vec<u64> = vec![ans];
-                    while opts.len() < 4 {
-                        let d = (ans as i64 + (next() % 7) as i64 - 3).max(0) as u64;
-                        if !opts.contains(&d) {
-                            opts.push(d);
-                        }
-                    }
-                    for i in (1..opts.len()).rev() {
-                        opts.swap(i, (next() as usize) % (i + 1));
-                    }
-                    let row: Vec<(String, String)> = opts
-                        .iter()
-                        .map(|o| {
-                            let verdict = if *o == ans { "ok" } else { "no" };
-                            (o.to_string(), format!("v:{cmd}:{verdict}"))
-                        })
-                        .collect();
-                    let prompt = format!("{ask}\n\nTo confirm, tap the answer to {a} + {b}:");
-                    let _ = api
-                        .send_buttons(
-                            env.group_id,
-                            &prompt,
-                            Some(topic_id),
-                            &[row, vec![("Cancel".into(), "v:cancel".into())]],
-                        )
-                        .await;
-                    continue;
-                }
-            }
-            debug!(bot = %bot.name, %text, "turn request");
-            if let Err(e) = handle_turn(&api, bot, env, topic_id, msg.message_id, &text).await {
-                warn!(bot = %bot.name, error = %e, "turn failed");
-                let _ = api.set_reaction(env.group_id, msg.message_id, "⚠️").await;
-                let detail: String = e.to_string().chars().take(300).collect();
-                let _ = api
-                    .send_message(
-                        env.group_id,
-                        &format!("uh — broke on my side: {detail}"),
-                        Some(topic_id),
-                    )
-                    .await;
+            // Spawn and keep polling: each message gets its own task so a
+            // long turn doesn't block the next one.
+            let (api, bot, env, sem) = (api.clone(), bot.clone(), env.clone(), sem.clone());
+            inflight.spawn(async move {
+                handle_message(&api, &bot, &env, topic_id, sem, msg).await;
+            });
+        }
+        // Reap finished tasks; log the ones that went down hard.
+        while let Some(res) = inflight.try_join_next() {
+            if let Err(e) = res {
+                warn!(bot = %bot.name, error = %e, "message task ended badly");
             }
         }
     }
+}
+
+/// One message's full pipeline: attachment → text → command check →
+/// turn. Runs as its own task; turns queue on `sem` so a burst can't
+/// fan out unbounded.
+async fn handle_message(
+    api: &BotApi,
+    bot: &Bot,
+    env: &Env,
+    topic_id: i64,
+    sem: Arc<Semaphore>,
+    msg: crate::botapi::Message,
+) {
+    // Text or caption; media gets downloaded and its local path
+    // appended so the agent can actually look at it.
+    let mut text = msg
+        .text
+        .clone()
+        .or_else(|| msg.caption.clone())
+        .unwrap_or_default();
+    if let Some(att) = attachment(&msg) {
+        match save_media(api, &env.db, &bot.name, msg.message_id, &att).await {
+            Ok(path) => {
+                let note = format!(
+                    "[{} attached: {} — read this file to view it]",
+                    att.desc,
+                    path.display()
+                );
+                text = if text.is_empty() {
+                    note
+                } else {
+                    format!("{text}\n\n{note}")
+                };
+            }
+            Err(e) => {
+                warn!(bot = %bot.name, error = %e, "attachment download failed")
+            }
+        }
+    }
+    if text.trim().is_empty() {
+        return;
+    }
+    // In-chat commands — destructive, so they confirm via an
+    // inline button before anything runs.
+    if let Some(cmd) = text
+        .strip_prefix('/')
+        .map(|c| c.split_whitespace().next().unwrap_or(""))
+    {
+        let ask = match cmd {
+            "backup" => {
+                // Not destructive — no quiz-confirm needed.
+                let note = match crate::backup::upload(api, env.group_id).await {
+                    Ok(files) => {
+                        format!("🗄 backed up {} to General", files.join(", "))
+                    }
+                    Err(e) => format!("⚠️ backup failed: {e}"),
+                };
+                let _ = api
+                    .send_message(env.group_id, &note, Some(topic_id), Some(msg.message_id))
+                    .await;
+                return;
+            }
+            "clear" => "Wipe my memory? Can't undo this.",
+            "clearchat" => {
+                "Delete every message in this topic AND wipe my memory? Can't undo."
+            }
+            "reset" => "Nuke EVERYTHING — all topics, all messages, every bot but me, all memory? Can't undo.",
+            _ => "",
+        };
+        if !ask.is_empty() {
+            // Quiz-confirm: pick the right answer among decoys.
+            let mut rng = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64)
+                .unwrap_or(1);
+            let mut next = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            let (a, b) = (2 + next() % 8, 2 + next() % 8);
+            let ans = a + b;
+            let mut opts: Vec<u64> = vec![ans];
+            while opts.len() < 4 {
+                let d = (ans as i64 + (next() % 7) as i64 - 3).max(0) as u64;
+                if !opts.contains(&d) {
+                    opts.push(d);
+                }
+            }
+            for i in (1..opts.len()).rev() {
+                opts.swap(i, (next() as usize) % (i + 1));
+            }
+            let row: Vec<(String, String)> = opts
+                .iter()
+                .map(|o| {
+                    let verdict = if *o == ans { "ok" } else { "no" };
+                    (o.to_string(), format!("v:{cmd}:{verdict}"))
+                })
+                .collect();
+            let prompt = format!("{ask}\n\nTo confirm, tap the answer to {a} + {b}:");
+            let _ = api
+                .send_buttons(
+                    env.group_id,
+                    &prompt,
+                    Some(topic_id),
+                    &[row, vec![("Cancel".into(), "v:cancel".into())]],
+                )
+                .await;
+            return;
+        }
+    }
+    debug!(bot = %bot.name, %text, "turn request");
+    // Acknowledge immediately — queued behind other turns, the 👀 says
+    // "seen, will get to it".
+    let _ = api.set_reaction(env.group_id, msg.message_id, "👀").await;
+    let _permit = sem.acquire().await.ok();
+    if let Err(e) = handle_turn(api, bot, env, topic_id, msg.message_id, &text).await {
+        warn!(bot = %bot.name, error = %e, "turn failed");
+        let _ = api.set_reaction(env.group_id, msg.message_id, "⚠️").await;
+        let detail: String = e.to_string().chars().take(300).collect();
+        let _ = api
+            .send_message(
+                env.group_id,
+                &format!("uh — broke on my side: {detail}"),
+                Some(topic_id),
+                Some(msg.message_id),
+            )
+            .await;
+    }
+}
+
+/// Pending-turn records left by a dead run: `(message_id, text)` pairs.
+/// New records are one key per message (`pending:<bot>:<mid>`); a legacy
+/// single-slot record (`pending:<bot>` = `"<mid>\n<text>"`) is migrated
+/// so a mid-upgrade crash still resumes.
+async fn recover_pending(db: &Path, bot_name: &str) -> Vec<(i64, String)> {
+    let pfx = pending_prefix(bot_name);
+    let legacy = format!("pending:{bot_name}");
+    db_call(db, move |s| {
+        let mut out = Vec::new();
+        if let Some(v) = s.kv_get(&legacy)? {
+            if let Some((mid, text)) = v.split_once('\n') {
+                if let Ok(mid) = mid.parse::<i64>() {
+                    out.push((mid, text.to_string()));
+                }
+            }
+            let _ = s.kv_del(&legacy);
+        }
+        for (k, v) in s.kv_prefix(&pfx)? {
+            if let Some(mid) = k.rsplit(':').next().and_then(|m| m.parse::<i64>().ok()) {
+                out.push((mid, v));
+            }
+        }
+        Ok(out)
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Execute a confirmed destructive command (button click landed in our
@@ -397,14 +478,15 @@ async fn run_command(api: &BotApi, bot: &Bot, env: &Env, topic_id: i64, cmd: &st
     let wipe = move |s: &Store| -> Result<()> {
         s.clear_memory(&n)?;
         s.kv_del(&format!("greeted:{n}"))?;
-        s.kv_del(&format!("pending:{n}"))
+        s.kv_del(&format!("pending:{n}"))?;
+        s.kv_del_prefix(&format!("pending:{n}:"))
     };
     match cmd {
         "clear" => {
             let _ = db_call(&env.db, wipe).await;
             let _ = api.delete_message(env.group_id, confirm_mid).await;
             let _ = api
-                .send_message(env.group_id, "memory wiped", Some(topic_id))
+                .send_message(env.group_id, "memory wiped", Some(topic_id), None)
                 .await;
         }
         "clearchat" => {
@@ -420,7 +502,7 @@ async fn run_command(api: &BotApi, bot: &Bot, env: &Env, topic_id: i64, cmd: &st
             let _ = api.delete_message(env.group_id, confirm_mid).await;
             let _ = db_call(&env.db, wipe).await;
             if let Some(g) = &bot.greeting {
-                let _ = send_reply(api, env.group_id, topic_id, g).await;
+                let _ = send_reply(api, env.group_id, topic_id, g, None).await;
             }
         }
         "reset" => {
@@ -487,10 +569,10 @@ async fn run_command(api: &BotApi, bot: &Bot, env: &Env, topic_id: i64, cmd: &st
             };
             if let Some(t) = new_tid {
                 let _ = api
-                    .send_message(env.group_id, &format!("🧹 clean slate — {note}"), Some(t))
+                    .send_message(env.group_id, &format!("🧹 clean slate — {note}"), Some(t), None)
                     .await;
                 if let Some(g) = &bot.greeting {
-                    let _ = send_reply(api, env.group_id, t, g).await;
+                    let _ = send_reply(api, env.group_id, t, g, None).await;
                 }
             }
         }
@@ -626,20 +708,22 @@ fn typing_keepalive(api: BotApi, group_id: i64, topic_id: i64) -> tokio::task::J
     })
 }
 
-/// After [`PROGRESS_AFTER`], post one progress message and edit it every
+/// After [`PROGRESS_AFTER`], post one progress message — a reply to the
+/// triggering message so it's traceable — and edit it every
 /// [`PROGRESS_TICK`] with the elapsed count. Returns the task handle and
 /// the shared slot holding the message id (for later deletion).
 fn progress_task(
     api: BotApi,
     group_id: i64,
     topic_id: i64,
+    reply_to: Option<i64>,
 ) -> (tokio::task::JoinHandle<()>, Arc<Mutex<Option<i64>>>) {
     let msg_id = Arc::new(Mutex::new(None));
     let slot = msg_id.clone();
     let handle = tokio::spawn(async move {
         tokio::time::sleep(PROGRESS_AFTER).await;
         let Ok(m) = api
-            .send_message(group_id, "⏳ working…", Some(topic_id))
+            .send_message(group_id, "⏳ working…", Some(topic_id), reply_to)
             .await
         else {
             return;
@@ -736,10 +820,17 @@ fn extract_markers(reply: &str) -> (String, Markers) {
 
 /// Send a reply as one or more rich messages, falling back to plain text
 /// (again split at the cap) when rich parsing rejects the markdown.
-async fn send_reply(api: &BotApi, group_id: i64, topic_id: i64, reply: &str) -> Result<()> {
+/// `reply_to` threads every part back to the triggering message.
+async fn send_reply(
+    api: &BotApi,
+    group_id: i64,
+    topic_id: i64,
+    reply: &str,
+    reply_to: Option<i64>,
+) -> Result<()> {
     for part in split_markdown(reply, RICH_LIMIT) {
         match api
-            .send_rich_message(group_id, InputRichMessage::markdown(&part), Some(topic_id))
+            .send_rich_message(group_id, InputRichMessage::markdown(&part), Some(topic_id), reply_to)
             .await
         {
             Ok(_) => continue,
@@ -748,11 +839,12 @@ async fn send_reply(api: &BotApi, group_id: i64, topic_id: i64, reply: &str) -> 
                 for chunk in split_markdown(&part, TEXT_LIMIT) {
                     // Legacy markdown render first; raw text last resort.
                     if let Err(e) = api
-                        .send_markdown_message(group_id, &chunk, Some(topic_id))
+                        .send_markdown_message(group_id, &chunk, Some(topic_id), reply_to)
                         .await
                     {
                         warn!(error = %e, "legacy markdown send failed, sending raw");
-                        api.send_message(group_id, &chunk, Some(topic_id)).await?;
+                        api.send_message(group_id, &chunk, Some(topic_id), reply_to)
+                            .await?;
                     }
                 }
             }
@@ -785,17 +877,19 @@ async fn handle_turn(
 ) -> Result<()> {
     let _ = api.set_reaction(env.group_id, message_id, "👀").await;
     // Mark the turn pending — if we die mid-turn, the leftover record
-    // (and the lingering 👀) lets a restart re-run it.
-    let pkey = pending_key(&bot.name);
-    let pval = format!("{message_id}\n{text}");
+    // (and the lingering 👀) lets a restart re-run it. One key per
+    // message so concurrent turns don't clobber each other.
+    let pkey = pending_key(&bot.name, message_id);
+    let pval = text.to_string();
     let _ = db_call(&env.db, move |s| s.kv_set(&pkey, &pval)).await;
     let _ = api
         .send_chat_action(env.group_id, "typing", Some(topic_id))
         .await;
     let keepalive = typing_keepalive(api.clone(), env.group_id, topic_id);
-    let (progress, progress_msg) = progress_task(api.clone(), env.group_id, topic_id);
+    let (progress, progress_msg) =
+        progress_task(api.clone(), env.group_id, topic_id, Some(message_id));
 
-    let result = do_turn(env, bot, topic_id, text, 0).await;
+    let result = do_turn(env, bot, topic_id, text, 0, Some(message_id)).await;
 
     keepalive.abort();
     progress.abort();
@@ -805,7 +899,7 @@ async fn handle_turn(
     }
     // Turn over — clear the pending record, then resolve the 👀:
     // ✅ only when the turn spawned helpers; a plain reply leaves no mark.
-    let pkey = pending_key(&bot.name);
+    let pkey = pending_key(&bot.name, message_id);
     let _ = db_call(&env.db, move |s| s.kv_del(&pkey)).await;
     match result {
         Ok(true) => {
@@ -819,16 +913,30 @@ async fn handle_turn(
     result.map(|_| ())
 }
 
-fn pending_key(bot_name: &str) -> String {
-    format!("pending:{bot_name}")
+/// Per-message pending record — concurrent turns each get their own.
+fn pending_key(bot_name: &str, message_id: i64) -> String {
+    format!("pending:{bot_name}:{message_id}")
+}
+
+fn pending_prefix(bot_name: &str) -> String {
+    format!("pending:{bot_name}:")
 }
 
 /// One turn of agent work for `bot` in `topic_id`: context → harness →
 /// markers → memory, helpers, tells → rich reply. Shared by human turns
 /// (depth 0, via `handle_turn`) and `tell`-routed teammate turns.
+/// `reply_to` threads the reply back to the triggering message (None for
+/// bot-to-bot turns — there's no human message to attach to).
 /// Returns `true` when the turn fanned out spawn helpers — real work
 /// worth a ✅; plain chats get no final reaction.
-async fn do_turn(env: &Env, bot: &Bot, topic_id: i64, text: &str, depth: u8) -> Result<bool> {
+async fn do_turn(
+    env: &Env,
+    bot: &Bot,
+    topic_id: i64,
+    text: &str,
+    depth: u8,
+    reply_to: Option<i64>,
+) -> Result<bool> {
     let api = BotApi::new(&bot.token);
     let harness = (env.make)(&bot.provider);
 
@@ -926,7 +1034,7 @@ async fn do_turn(env: &Env, bot: &Bot, topic_id: i64, text: &str, depth: u8) -> 
     } else {
         reply
     };
-    send_reply(&api, env.group_id, topic_id, &reply).await?;
+    send_reply(&api, env.group_id, topic_id, &reply, reply_to).await?;
 
     // `:::backup:::` — the reply asked for a config snapshot; upload
     // ~/verity to General and note it in the topic.
@@ -936,7 +1044,7 @@ async fn do_turn(env: &Env, bot: &Bot, topic_id: i64, text: &str, depth: u8) -> 
             Err(e) => format!("⚠️ backup failed: {e}"),
         };
         let _ = api
-            .send_message(env.group_id, &note, Some(topic_id))
+            .send_message(env.group_id, &note, Some(topic_id), reply_to)
             .await;
     }
 
@@ -962,7 +1070,7 @@ async fn do_turn(env: &Env, bot: &Bot, topic_id: i64, text: &str, depth: u8) -> 
                                         (env2.db.clone(), target.name.clone(), t.message_thread_id);
                                     let _ = db_call(&db, move |s| s.set_bot_topic(&n, tid)).await;
                                     if let Some(g) = &target.greeting {
-                                        let _ = send_reply(&tapi, env2.group_id, tid, g).await;
+                                        let _ = send_reply(&tapi, env2.group_id, tid, g, None).await;
                                     }
                                     tid
                                 }
@@ -973,7 +1081,7 @@ async fn do_turn(env: &Env, bot: &Bot, topic_id: i64, text: &str, depth: u8) -> 
                             },
                         };
                         let prompt = format!("Message from teammate {origin}: {msg}");
-                        if let Err(e) = turn(&env2, &target, ttopic, &prompt, depth + 1).await {
+                        if let Err(e) = turn(&env2, &target, ttopic, &prompt, depth + 1, None).await {
                             warn!(bot = %target.name, error = %e, "tell turn failed");
                         }
                     });
@@ -982,6 +1090,7 @@ async fn do_turn(env: &Env, bot: &Bot, topic_id: i64, text: &str, depth: u8) -> 
                             env.group_id,
                             &format!("📨 handed off to *{tname}* — they'll answer in their own topic"),
                             Some(topic_id),
+                            reply_to,
                         )
                         .await;
                 }
@@ -1015,7 +1124,7 @@ async fn do_turn(env: &Env, bot: &Bot, topic_id: i64, text: &str, depth: u8) -> 
             Err(e) => format!("⚠️ couldn't register *{name}*: {e}"),
         };
         let _ = api
-            .send_markdown_message(env.group_id, &note, Some(topic_id))
+            .send_markdown_message(env.group_id, &note, Some(topic_id), reply_to)
             .await;
     }
     Ok(!markers.spawn.is_empty())
@@ -1030,8 +1139,9 @@ fn turn<'a>(
     topic_id: i64,
     text: &'a str,
     depth: u8,
+    reply_to: Option<i64>,
 ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
-    Box::pin(do_turn(env, bot, topic_id, text, depth))
+    Box::pin(do_turn(env, bot, topic_id, text, depth, reply_to))
 }
 
 async fn find_bot(db: &Path, name: &str) -> Option<Bot> {
@@ -1220,6 +1330,13 @@ mod tests {
             .expect("rich reply");
         let md = rich.1["rich_message"]["markdown"].as_str().unwrap_or("");
         assert!(md.contains("heard: hello verity"), "reply body: {md}");
+        // The answer threads back to the message that asked (id 42).
+        assert_eq!(
+            rich.1["reply_parameters"]["message_id"].as_i64(),
+            Some(42),
+            "reply_parameters: {}",
+            rich.1
+        );
 
         let reactions: Vec<&str> = calls
             .iter()

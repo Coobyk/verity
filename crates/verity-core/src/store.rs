@@ -161,6 +161,31 @@ impl Store {
         Ok(())
     }
 
+    /// All kv rows whose key starts with `prefix` — e.g. the per-message
+    /// `pending:<bot>:` records after a crash.
+    pub fn kv_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let mut s = self
+            .conn
+            .prepare("SELECT key, value FROM kv WHERE substr(key, 1, ?) = ?")?;
+        s.bind((1, prefix.len() as i64))?;
+        s.bind((2, prefix))?;
+        let mut out = Vec::new();
+        while let State::Row = s.next()? {
+            out.push((s.read(0)?, s.read(1)?));
+        }
+        Ok(out)
+    }
+
+    pub fn kv_del_prefix(&self, prefix: &str) -> Result<()> {
+        let mut s = self
+            .conn
+            .prepare("DELETE FROM kv WHERE substr(key, 1, ?) = ?")?;
+        s.bind((1, prefix.len() as i64))?;
+        s.bind((2, prefix))?;
+        s.next()?;
+        Ok(())
+    }
+
     pub fn clear_memory(&self, name: &str) -> Result<()> {
         let mut s = self.conn.prepare("DELETE FROM memory WHERE bot = ?")?;
         s.bind((1, name))?;

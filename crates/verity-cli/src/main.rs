@@ -314,6 +314,7 @@ async fn main() -> Result<()> {
             store.clear_memory(&name)?;
             store.kv_del(&format!("greeted:{name}"))?;
             store.kv_del(&format!("pending:{name}"))?;
+            store.kv_del_prefix(&format!("pending:{name}:"))?;
             println!("cleared {name}'s memory");
         }
 
@@ -328,6 +329,7 @@ async fn main() -> Result<()> {
             store.clear_memory(&name)?;
             store.kv_del(&format!("greeted:{name}"))?;
             store.kv_del(&format!("pending:{name}"))?;
+            store.kv_del_prefix(&format!("pending:{name}:"))?;
             println!("cleared {name}'s topic + memory — fresh start");
         }
 
@@ -610,7 +612,7 @@ async fn main() -> Result<()> {
                 .context("bot has no topic yet — run `verity serve` once")?;
             let api = BotApi::new(&b.token);
             for part in verity_core::rich::split_markdown(&text, verity_core::rich::RICH_LIMIT) {
-                api.send_rich_message(group_id, InputRichMessage::markdown(&part), Some(topic))
+                api.send_rich_message(group_id, InputRichMessage::markdown(&part), Some(topic), None)
                     .await?;
             }
             println!("sent");
