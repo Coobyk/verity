@@ -41,7 +41,14 @@ one topic per bot, bots are real bot accounts with their own avatars.
 - Bots can't see other bots' messages → bot-to-bot comms route through
   verity-core: `:::tell name: msg:::` runs a full turn for the teammate
   (its own instructions/memory/harness) and posts its reply in the
-  calling topic as itself. Depth-capped at 2 so chains stay finite.
+  owner's DM with the teammate (a `typing` probe decides; a teammate
+  the owner never /started falls back to its own topic). Depth-capped
+  at 2 so chains stay finite.
+- DMs are the primary surface: every command (`/clear`, `/clearchat`,
+  `/reset`, `/backup`) works in the bot's DM with the owner, confirm
+  callbacks route by chat, and DM turns get the owner↔bot transcript
+  as context (same ~30 messages, read user-side). Topics remain as
+  fallback plumbing.
   A proper `verity` MCP server (`message_bot`, `spawn_helper`,
   `hand_off`, `list_bots`) remains the upgrade path once agents get
   real tool surfaces.

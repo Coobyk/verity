@@ -562,6 +562,74 @@ impl Tg {
         Ok(out)
     }
 
+    /// Recent history of a private chat with `peer` — the DM twin of
+    /// `topic_history`, same `(id, date, sender, text)` shape so a turn
+    /// gets identical context whichever home it came from.
+    pub async fn dm_history(&self, peer: PeerRef, limit: i32) -> Result<Vec<TopicMessage>> {
+        use grammers_client::types::Media;
+        let mut it = self.client.iter_messages(peer);
+        let mut out: Vec<TopicMessage> = Vec::new();
+        while let Some(m) = it
+            .next()
+            .await
+            .map_err(|e| Error::Mtproto(format!("messages: {e}")))?
+        {
+            if out.len() >= limit as usize {
+                break;
+            }
+            let sender = m
+                .sender()
+                .and_then(|s| {
+                    s.name()
+                        .or_else(|| s.username())
+                        .map(str::to_string)
+                        .or_else(|| Some(s.id().bare_id().to_string()))
+                })
+                .unwrap_or_else(|| "dm".to_string());
+            let text = if m.text().is_empty() {
+                match m.media() {
+                    Some(Media::Photo(_)) => "[image]".into(),
+                    Some(Media::Document(_)) => "[file]".into(),
+                    Some(_) => "[media]".into(),
+                    None => continue,
+                }
+            } else {
+                m.text().to_string()
+            };
+            out.push(TopicMessage {
+                id: m.id(),
+                date: m.date().timestamp(),
+                sender,
+                text,
+            });
+        }
+        out.reverse(); // iter_messages is newest-first
+        Ok(out)
+    }
+
+    /// Delete every message in a private chat — user-side with revoke,
+    /// so the bot's messages go too. `/clearchat` for a DM.
+    pub async fn clear_chat(&self, peer: PeerRef) -> Result<usize> {
+        let mut ids = Vec::new();
+        let mut it = self.client.iter_messages(peer);
+        while let Some(m) = it
+            .next()
+            .await
+            .map_err(|e| Error::Mtproto(format!("messages: {e}")))?
+        {
+            ids.push(m.id());
+        }
+        let mut n = 0;
+        for chunk in ids.chunks(100) {
+            n += self
+                .client
+                .delete_messages(peer, chunk)
+                .await
+                .map_err(|e| Error::Mtproto(format!("deleteMessages: {e}")))?;
+        }
+        Ok(n)
+    }
+
     /// Newest document in General whose file name passes `pred`.
     pub async fn find_general_document(
         &self,

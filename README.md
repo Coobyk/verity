@@ -22,7 +22,8 @@ You ──► verity (grammers, logged in as YOU)
           topics = per-bot threads · you type as yourself
                     ▲
         verity serve (Bot API, one bot token per teammate)
-          bots watch their topic, work quietly, post rich replies
+          bots watch their topic + their DM with you, work quietly,
+          post rich replies
           SQLite holds brains (memory, config) — chats live in Telegram
 ```
 
@@ -36,7 +37,8 @@ Replies can carry `:::` markers, stripped before send:
 
 - `:::remember k = v:::` — persist a fact across turns
 - `:::tell name: task:::` — hand work to a teammate; it replies in
-  the topic as itself (bots can't see each other, so verity routes)
+  your DM with them as itself (bots can't see each other, so verity
+  routes; a teammate you never /started falls back to its topic)
 - `:::spawn label: task:::` — fan out up to 3 helpers; results fold
   back into the reply as collapsible blocks
 - `:::bot_new name | token | instructions | provider:::` — register a
