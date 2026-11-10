@@ -172,9 +172,9 @@ enum BotCmd {
         /// Background hue in degrees (0-360) — default is the site's white
         #[arg(long)]
         hue: Option<f64>,
-        /// Draw pupils in the eyes (off on the site)
+        /// Skip pupils — the site's plain white stare
         #[arg(long)]
-        pupils: bool,
+        no_pupils: bool,
     },
     /// List registered bots
     List,
@@ -711,11 +711,11 @@ async fn run() -> Result<()> {
                     name,
                     seed,
                     hue,
-                    pupils,
+                    no_pupils,
                 } => {
                     let bot = store.get_bot(&name)?.context("no such bot")?;
                     let seed = seed.unwrap_or_else(|| verity_core::pfp::name_seed(&bot.name));
-                    let png = verity_core::pfp::render_opts(seed, 512, hue, pupils)?;
+                    let png = verity_core::pfp::render_opts(seed, 512, hue, !no_pupils)?;
                     let out = Config::db_path()?
                         .parent()
                         .unwrap_or_else(|| Path::new("."))
