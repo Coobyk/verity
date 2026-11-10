@@ -219,6 +219,19 @@ fn prompt(label: &str) -> Result<String> {
     Ok(s.trim().to_string())
 }
 
+/// Interactive config prompt: shows the current value (masked when
+/// `secret`), empty input keeps it and returns None.
+fn prompt_keep(label: &str, current: Option<String>, secret: bool) -> Result<Option<String>> {
+    let hint = match (current, secret) {
+        (Some(v), false) => format!(" [{v}]"),
+        (Some(v), true) if v.len() > 4 => format!(" [••••{}]", &v[v.len() - 4..]),
+        (Some(_), true) => " [••••]".to_string(),
+        (None, _) => String::new(),
+    };
+    let s = prompt(&format!("{label}{hint}"))?;
+    Ok((!s.is_empty()).then_some(s))
+}
+
 async fn tg() -> Result<(Tg, Config)> {
     let cfg = Config::load()?;
     let (api_id, api_hash) = cfg.api_credentials()?;
@@ -298,17 +311,39 @@ async fn run() -> Result<()> {
             pi_bin,
         } => {
             let mut cfg = Config::load()?;
-            if let Some(v) = api_id {
-                cfg.api_id = Some(v);
-            }
-            if let Some(v) = api_hash {
-                cfg.api_hash = Some(v);
-            }
-            if let Some(v) = group_id {
-                cfg.group_id = Some(v);
-            }
-            if let Some(v) = pi_bin {
-                cfg.pi_bin = Some(v);
+            let interactive =
+                api_id.is_none() && api_hash.is_none() && group_id.is_none() && pi_bin.is_none();
+            if interactive {
+                println!("leave blank to keep the current value");
+                if let Some(v) = prompt_keep("api_id (my.telegram.org)", cfg.api_id.map(|v| v.to_string()), false)? {
+                    cfg.api_id = Some(v.parse().context("api_id must be a number")?);
+                }
+                if let Some(v) = prompt_keep("api_hash", cfg.api_hash.clone(), true)? {
+                    cfg.api_hash = Some(v);
+                }
+                if let Some(v) = prompt_keep(
+                    "group_id (Bot-API id, see `verity groups`)",
+                    cfg.group_id.map(|v| v.to_string()),
+                    false,
+                )? {
+                    cfg.group_id = Some(v.parse().context("group_id must be a number")?);
+                }
+                if let Some(v) = prompt_keep("pi_bin", cfg.pi_bin.clone(), false)? {
+                    cfg.pi_bin = Some(v);
+                }
+            } else {
+                if let Some(v) = api_id {
+                    cfg.api_id = Some(v);
+                }
+                if let Some(v) = api_hash {
+                    cfg.api_hash = Some(v);
+                }
+                if let Some(v) = group_id {
+                    cfg.group_id = Some(v);
+                }
+                if let Some(v) = pi_bin {
+                    cfg.pi_bin = Some(v);
+                }
             }
             cfg.save()?;
             println!("saved {}", Config::home()?.join("config.toml").display());

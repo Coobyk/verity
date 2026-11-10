@@ -25,6 +25,3 @@ grammers-client = "0.8"
 grammers-session = "0.8"
 grammers-tl-types = "0.8"
 async-trait = "0.1"
-
-[patch.crates-io]
-xattr = { path = "vendor/xattr" }
