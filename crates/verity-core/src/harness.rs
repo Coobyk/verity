@@ -96,7 +96,8 @@ fn system_prompt(ctx: &TurnContext) -> String {
     }
     s.push_str(
         "\nReply for Telegram Rich Markdown: GFM, tables, and LaTeX formulas are supported. Keep it concise. \
-         To persist a fact, put it on its own line as `:::remember key = value:::` — it is stored as memory and stripped from your reply.",
+         To persist a fact, put it on its own line as `:::remember key = value:::` — it is stored as memory and stripped from your reply. \
+         To snapshot your config/state files into the group's General topic (backup), emit `:::backup:::`.",
     );
     s
 }
@@ -149,7 +150,7 @@ impl Harness for PiHarness {
             )));
         }
         Ok(TurnOutput {
-            reply: String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            reply: strip_thinking(String::from_utf8_lossy(&out.stdout).trim()),
         })
     }
 }
@@ -232,7 +233,7 @@ impl AcpHarness {
             s
         });
 
-        let mut reply = String::new();
+        let mut acc = ReplyAccumulator::new();
         // (rpc id, method, params) requests in flight order
         let mut requests = [
             json!({"protocolVersion": 1, "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false}}),
@@ -285,10 +286,17 @@ impl AcpHarness {
                         .map_err(|e| Error::Harness(format!("acp write: {e}")))?;
                 } else if method == "session/update" {
                     let u = &msg["params"]["update"];
-                    if u["sessionUpdate"].as_str() == Some("agent_message_chunk") {
-                        if let Some(t) = u["content"]["text"].as_str() {
-                            reply.push_str(t);
+                    match u["sessionUpdate"].as_str() {
+                        Some("agent_message_chunk") => {
+                            if let Some(t) = u["content"]["text"].as_str() {
+                                acc.chunk(t);
+                            }
                         }
+                        // Thoughts are never the reply. Any other update
+                        // (tool_call, plan, …) means work happened between
+                        // text blocks — text before it was narration.
+                        Some("agent_thought_chunk") | None => {}
+                        Some(_) => acc.boundary(),
                     }
                 }
                 continue;
@@ -325,13 +333,68 @@ impl AcpHarness {
         let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
         let _ = child.kill().await;
         let stderr = stderr_buf.await.unwrap_or_default();
+        let reply = strip_thinking(acc.finish().trim());
         if reply.is_empty() && !stderr.is_empty() {
             tracing::debug!(stderr = %stderr.chars().take(500).collect::<String>(), "acp: empty reply");
         }
-        Ok(TurnOutput {
-            reply: reply.trim().to_string(),
-        })
+        Ok(TurnOutput { reply })
     }
+}
+
+/// Collects the reply text from `agent_message_chunk` updates. Agents
+/// narrate mid-turn ("checking the file…") as message chunks too, so
+/// concatenating every chunk leaks working traces. Each update that
+/// isn't message/thought text — a tool call, plan change, mode switch —
+/// closes the current segment; the reply is the last non-empty segment:
+/// the final uninterrupted run of message chunks.
+#[derive(Default)]
+struct ReplyAccumulator {
+    current: String,
+    last: String,
+}
+
+impl ReplyAccumulator {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn chunk(&mut self, text: &str) {
+        self.current.push_str(text);
+    }
+
+    fn boundary(&mut self) {
+        if !self.current.trim().is_empty() {
+            self.last = std::mem::take(&mut self.current);
+        } else {
+            self.current.clear();
+        }
+    }
+
+    fn finish(self) -> String {
+        if !self.current.trim().is_empty() {
+            self.current
+        } else {
+            self.last
+        }
+    }
+}
+
+/// Drop `<think>…</think>` / `<thinking>…</thinking>` blocks some models
+/// inline into their visible output. An unclosed tag truncates the rest —
+/// everything after it is still thinking.
+fn strip_thinking(s: &str) -> String {
+    let mut out = s.to_string();
+    for (open, close) in [("<think>", "</think>"), ("<thinking>", "</thinking>")] {
+        loop {
+            let Some(start) = out.find(open) else { break };
+            let Some(end) = out[start + open.len()..].find(close) else {
+                out.truncate(start);
+                break;
+            };
+            out.replace_range(start..start + open.len() + end + close.len(), "");
+        }
+    }
+    out.trim().to_string()
 }
 
 /// Placeholder for the `session/prompt` params; the sessionId is filled
@@ -369,5 +432,60 @@ fn permission_response(id: serde_json::Value, msg: &serde_json::Value) -> serde_
         None => {
             json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "no allow option"}})
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reply_is_last_segment_only() {
+        let mut acc = ReplyAccumulator::new();
+        acc.chunk("let me look at the code…");
+        acc.boundary(); // tool_call
+        acc.chunk("found it — fixing now");
+        acc.boundary(); // tool_call
+        acc.chunk("done, the fix is in harness.rs");
+        assert_eq!(acc.finish(), "done, the fix is in harness.rs");
+    }
+
+    #[test]
+    fn reply_single_segment_when_no_tools() {
+        let mut acc = ReplyAccumulator::new();
+        acc.chunk("sure, ");
+        acc.chunk("here you go");
+        assert_eq!(acc.finish(), "sure, here you go");
+    }
+
+    #[test]
+    fn reply_falls_back_when_turn_ends_on_tool() {
+        let mut acc = ReplyAccumulator::new();
+        acc.chunk("narration");
+        acc.boundary();
+        acc.chunk("real reply");
+        acc.boundary(); // trailing tool_call, no closing message
+        assert_eq!(acc.finish(), "real reply");
+    }
+
+    #[test]
+    fn whitespace_segments_are_dropped() {
+        let mut acc = ReplyAccumulator::new();
+        acc.chunk("answer");
+        acc.boundary();
+        acc.chunk("   \n  ");
+        acc.boundary();
+        acc.chunk("final");
+        assert_eq!(acc.finish(), "final");
+    }
+
+    #[test]
+    fn strips_think_blocks() {
+        let s = "hi<think>hmm, the user wants…</think>there";
+        assert_eq!(strip_thinking(s), "hithere");
+        let s = "<thinking>deep thoughts</thinking>\n\nanswer";
+        assert_eq!(strip_thinking(s), "answer");
+        assert_eq!(strip_thinking("ok<think>never closed"), "ok");
+        assert_eq!(strip_thinking("plain"), "plain");
     }
 }

@@ -42,7 +42,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: BotCmd,
     },
-    /// Wipe everything: bots, memory, state — clean slate (stop serve first)
+    /// Wipe everything: kick all bots but the lead, delete all topics +
+    /// messages, then the local brain — clean slate (stop serve first)
     Reset,
     /// Clear a bot's memory
     Clear { name: String },
@@ -74,6 +75,12 @@ enum Cmd {
         topic: String,
         /// Message text
         text: String,
+        group: Option<String>,
+    },
+    /// Upload ~/.verity (config, session, sqlite brain) to the group's General
+    Backup,
+    /// Pull the newest backup docs from General back into ~/.verity
+    Restore {
         group: Option<String>,
     },
     /// Run the bridge: bots listen, work quietly, reply when done
@@ -142,6 +149,14 @@ enum BotCmd {
     List,
     /// Remove a bot (does not delete its topic)
     Rm { name: String },
+    /// Delete the bot at @BotFather too — unregisters it and kills the
+    /// Telegram account for good. Irreversible.
+    Delete {
+        /// Roster name, @username, or BotFather picker label
+        name: String,
+    },
+    /// List every bot you own at @BotFather (not just registered ones)
+    Mine,
     /// Show/edit a bot's memory
     Memory {
         name: String,
@@ -251,6 +266,43 @@ async fn main() -> Result<()> {
 
         Cmd::Reset => {
             let db = Config::db_path()?;
+            // Wipe the Telegram side while the roster still exists —
+            // every bot member kicked but the lead, every topic
+            // deleted, General purged. The db dies last.
+            match authorized_tg().await {
+                Ok((tg, cfg)) => {
+                    let keep = Store::open(&db)
+                        .and_then(|s| s.primary_bot())
+                        .ok()
+                        .flatten();
+                    match cfg.group_id {
+                        Some(group_id) => match tg.peer(&group_id.to_string()).await {
+                            Ok(peer) => {
+                                let keep_id = match &keep {
+                                    Some(k) => BotApi::new(&k.token)
+                                        .get_me()
+                                        .await
+                                        .ok()
+                                        .map(|u| u.id),
+                                    None => None,
+                                };
+                                let rep = tg.wipe_group(peer, keep_id).await;
+                                println!(
+                                    "group wiped: {} bots kicked, {} topics, {} General messages{}",
+                                    rep.bots_kicked,
+                                    rep.topics_deleted,
+                                    rep.general_messages,
+                                    keep.map(|k| format!(" — kept {}", k.name))
+                                        .unwrap_or_default()
+                                );
+                            }
+                            Err(e) => eprintln!("can't resolve group — skipped wipe: {e}"),
+                        },
+                        None => eprintln!("no group_id configured — skipped group wipe"),
+                    }
+                }
+                Err(e) => eprintln!("{e} — skipped group wipe"),
+            }
             if db.exists() {
                 std::fs::remove_file(&db)?;
             }
@@ -434,6 +486,27 @@ async fn main() -> Result<()> {
                         }
                     );
                 }
+                BotCmd::Delete { name } => {
+                    // Resolve roster names to usernames so the picker
+                    // match hits even when BotFather labels differ.
+                    let want = store
+                        .get_bot(&name)
+                        .ok()
+                        .flatten()
+                        .and_then(|b| b.username)
+                        .unwrap_or_else(|| name.clone());
+                    let (tg, _) = authorized_tg().await?;
+                    println!("asking @BotFather to delete {want}…");
+                    tg.delete_bot(&want).await?;
+                    let _ = store.remove_bot(&name);
+                    println!("deleted {want} for good — username freed");
+                }
+                BotCmd::Mine => {
+                    let (tg, _) = authorized_tg().await?;
+                    for label in tg.my_bots().await? {
+                        println!("{label}");
+                    }
+                }
                 BotCmd::Memory { name, set } => {
                     if let Some(pairs) = set {
                         for p in pairs {
@@ -446,6 +519,33 @@ async fn main() -> Result<()> {
                         println!("{k} = {v}");
                     }
                 }
+            }
+        }
+
+        Cmd::Backup => {
+            let cfg = Config::load()?;
+            let group_id = cfg
+                .group_id
+                .context("no group_id — `verity config --group-id`")?;
+            let bot = Store::open(&Config::db_path()?)?
+                .primary_bot()?
+                .context("no bots registered — `verity bot new`")?;
+            let files = verity_core::backup::upload(&BotApi::new(&bot.token), group_id).await?;
+            println!("uploaded to General: {}", files.join(", "));
+        }
+
+        Cmd::Restore { group } => {
+            let (tg, cfg) = authorized_tg().await?;
+            let peer = tg.peer(&group_of(&cfg, group)?).await?;
+            let files = verity_core::backup::download(&tg, peer).await?;
+            if files.is_empty() {
+                println!("no backup documents found in General");
+            } else {
+                println!(
+                    "restored into {}: {}",
+                    Config::home()?.display(),
+                    files.join(", ")
+                );
             }
         }
 

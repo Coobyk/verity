@@ -4,6 +4,8 @@
 //! with a JSON body. Rich messages (10.1+) carry block-structured content
 //! up to 32,768 chars with LaTeX, tables, and collapsible thinking blocks.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -80,6 +82,20 @@ struct ApiResponse<T> {
     description: Option<String>,
 }
 
+fn unwrap<T>(resp: ApiResponse<T>) -> Result<T> {
+    if resp.ok {
+        resp.result.ok_or_else(|| Error::BotApi {
+            code: -1,
+            description: "empty result".into(),
+        })
+    } else {
+        Err(Error::BotApi {
+            code: resp.error_code.unwrap_or(-1),
+            description: resp.description.unwrap_or_else(|| "unknown".into()),
+        })
+    }
+}
+
 /// A rich message payload for `sendRichMessage`/`sendRichMessageDraft`.
 /// Prefer `markdown` (GFM-compatible); `blocks` is the explicit form.
 #[derive(Debug, Clone, Serialize)]
@@ -127,17 +143,7 @@ impl BotApi {
     async fn call<T: for<'de> Deserialize<'de>>(&self, method: &str, body: &Value) -> Result<T> {
         let url = format!("{}/bot{}/{}", self.base, self.token, method);
         let resp: ApiResponse<T> = self.http.post(&url).json(body).send().await?.json().await?;
-        if resp.ok {
-            resp.result.ok_or_else(|| Error::BotApi {
-                code: -1,
-                description: "empty result".into(),
-            })
-        } else {
-            Err(Error::BotApi {
-                code: resp.error_code.unwrap_or(-1),
-                description: resp.description.unwrap_or_else(|| "unknown".into()),
-            })
-        }
+        unwrap(resp)
     }
 
     pub async fn get_me(&self) -> Result<User> {
@@ -198,6 +204,42 @@ impl BotApi {
             body["message_thread_id"] = t.into();
         }
         self.call("sendRichMessage", &body).await
+    }
+
+    /// Upload a file as a document (multipart). `thread_id` None posts to
+    /// General in a forum group.
+    pub async fn send_document(
+        &self,
+        chat_id: i64,
+        path: &Path,
+        caption: Option<&str>,
+        thread_id: Option<i64>,
+    ) -> Result<Message> {
+        let bytes = std::fs::read(path)?;
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("document", reqwest::multipart::Part::bytes(bytes).file_name(name));
+        if let Some(c) = caption {
+            form = form.text("caption", c.to_string());
+        }
+        if let Some(t) = thread_id {
+            form = form.text("message_thread_id", t.to_string());
+        }
+        let url = format!("{}/bot{}/sendDocument", self.base, self.token);
+        let resp: ApiResponse<Message> = self
+            .http
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await?
+            .json()
+            .await?;
+        unwrap(resp)
     }
 
     /// Stream a partial message while it is being generated.

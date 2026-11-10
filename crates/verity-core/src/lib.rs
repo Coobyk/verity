@@ -6,6 +6,7 @@
 //! - [`harness`]: provider seam; agents run behind `Harness`
 //! - [`bridge`]: the quiet-bot loop routing topic messages to bots
 
+pub mod backup;
 pub mod botapi;
 pub mod bridge;
 pub mod config;

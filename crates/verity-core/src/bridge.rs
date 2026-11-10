@@ -12,6 +12,8 @@
 //!   in this topic as itself (bots can't see each other, so verity routes)
 //! - `:::spawn label: task:::` — fan out up to 3 short-lived helpers on
 //!   the same harness; results fold into the reply as `<details>` blocks
+//! - `:::backup:::` — upload `~/.verity` (config, session, brain) to
+//!   General as documents
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -75,6 +77,9 @@ struct Env {
 /// Supervisor sweep interval: how often the bridge looks for newly
 /// registered bots and starts their loops.
 const BOT_SWEEP: Duration = Duration::from_secs(10);
+/// Default `~/.verity` → General backup cadence while `serve` runs;
+/// `VERITY_BACKUP_EVERY` (seconds) overrides, `0` disables.
+const DEFAULT_BACKUP_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
 impl Bridge {
     /// Run every bot in the store forever. Individual bot loops log and
@@ -87,6 +92,38 @@ impl Bridge {
             tg: self.tg.clone(),
             peer: self.tg_peer,
         };
+        // Periodic backup of ~/.verity into General — the off-machine
+        // copy that survives a dead laptop or a move to a VM. First one
+        // lands a full interval in; `/backup` or `:::backup:::` for now.
+        let every = std::env::var("VERITY_BACKUP_EVERY")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_BACKUP_EVERY);
+        if !every.is_zero() {
+            let env = env.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(every).await;
+                    let bot = db_call(&env.db, |s| s.primary_bot())
+                        .await
+                        .ok()
+                        .flatten();
+                    match bot {
+                        Some(b) => {
+                            let api = BotApi::new(&b.token);
+                            match crate::backup::upload(&api, env.group_id).await {
+                                Ok(files) => {
+                                    info!(n = files.len(), "backup uploaded to General")
+                                }
+                                Err(e) => warn!(error = %e, "periodic backup failed"),
+                            }
+                        }
+                        None => warn!("periodic backup skipped — no bots registered"),
+                    }
+                }
+            });
+        }
         // Supervisor: run a loop per bot in the store, and pick up bots
         // registered later (`bot new` or a `:::bot_new:::` marker) without
         // a restart.
@@ -128,7 +165,7 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
     info!(bot = %bot.name, username = ?me.username, "polling");
 
     // Ensure the bot owns a forum topic named after it.
-    let topic_id = match bot.topic_id {
+    let mut topic_id = match bot.topic_id {
         Some(t) => t,
         None => {
             let t = api.create_forum_topic(env.group_id, &bot.name).await?;
@@ -170,11 +207,23 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
 
     loop {
         // Self-terminate if this bot was removed from the store (e.g.
-        // by a /reset) — otherwise the supervisor keeps us alive.
+        // by a /reset) — otherwise the supervisor keeps us alive. The
+        // fresh record also catches a recreated topic: reset deletes
+        // ours and makes a new one we should start listening to.
         let n = bot.name.clone();
-        if !matches!(db_call(&env.db, move |s| s.get_bot(&n)).await, Ok(Some(_))) {
-            info!(bot = %bot.name, "unregistered — stopping loop");
-            return Ok(());
+        match db_call(&env.db, move |s| s.get_bot(&n)).await {
+            Ok(Some(fresh)) => {
+                if let Some(t) = fresh.topic_id {
+                    if t != topic_id {
+                        info!(bot = %bot.name, old = topic_id, new = t, "topic swapped — following");
+                        topic_id = t;
+                    }
+                }
+            }
+            _ => {
+                info!(bot = %bot.name, "unregistered — stopping loop");
+                return Ok(());
+            }
         }
         let updates = match api.get_updates(offset, 30).await {
             Ok(u) => u,
@@ -234,11 +283,24 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
                 .map(|c| c.split_whitespace().next().unwrap_or(""))
             {
                 let ask = match cmd {
+                    "backup" => {
+                        // Not destructive — no quiz-confirm needed.
+                        let note = match crate::backup::upload(&api, env.group_id).await {
+                            Ok(files) => {
+                                format!("🗄 backed up {} to General", files.join(", "))
+                            }
+                            Err(e) => format!("⚠️ backup failed: {e}"),
+                        };
+                        let _ = api
+                            .send_message(env.group_id, &note, Some(topic_id))
+                            .await;
+                        continue;
+                    }
                     "clear" => "Wipe my memory? Can't undo this.",
                     "clearchat" => {
                         "Delete every message in this topic AND wipe my memory? Can't undo."
                     }
-                    "reset" => "Delete every other topic and wipe ALL my memory? Can't undo.",
+                    "reset" => "Nuke EVERYTHING — all topics, all messages, every bot but me, all memory? Can't undo.",
                     _ => "",
                 };
                 if !ask.is_empty() {
@@ -336,9 +398,24 @@ async fn run_command(api: &BotApi, bot: &Bot, env: &Env, topic_id: i64, cmd: &st
             }
         }
         "reset" => {
-            // 1. Archive every other bot's transcript into General, kick
-            //    it from the group, and delete its registration — reset
-            //    means the whole team, not just topics.
+            // 1. Wipe the whole group user-side: every bot member but us
+            //    (admins included — the Bot API can't kick those), every
+            //    topic, every message in General. Registered teammates
+            //    get forgotten below either way; stray bots and topics
+            //    the store no longer knows die here too.
+            if let (Some(tg), Some(peer)) = (&env.tg, &env.peer) {
+                let keep = api.get_me().await.ok().map(|u| u.id);
+                let rep = tg.wipe_group(*peer, keep).await;
+                info!(
+                    kicked = rep.bots_kicked,
+                    topics = rep.topics_deleted,
+                    general = rep.general_messages,
+                    "group wiped"
+                );
+            }
+            // 2. Forget every teammate. Without a user session step 1
+            //    never ran, so do a best-effort kick + topic delete via
+            //    the Bot API too (works on non-admin members).
             let others = db_call(&env.db, |s| s.list_bots())
                 .await
                 .unwrap_or_default()
@@ -346,51 +423,49 @@ async fn run_command(api: &BotApi, bot: &Bot, env: &Env, topic_id: i64, cmd: &st
                 .filter(|b| b.name != bot.name)
                 .collect::<Vec<_>>();
             for b in others {
-                if let (Some(tg), Some(peer), Some(t)) = (&env.tg, &env.peer, b.topic_id) {
-                    if let Ok(msgs) = tg.topic_history(*peer, t, 200).await {
-                        let mut buf = format!("📁 {} archive:\n", b.name);
-                        for m in msgs {
-                            let line = format!("{}: {}\n", m.sender, m.text);
-                            if buf.len() + line.len() > 3_900 {
-                                let _ = api.send_message(env.group_id, &buf, None).await;
-                                buf = String::new();
-                            }
-                            buf.push_str(&line);
-                        }
-                        if !buf.trim().is_empty() {
-                            let _ = api.send_message(env.group_id, &buf, None).await;
-                        }
+                if env.tg.is_none() {
+                    if let Ok(me) = BotApi::new(&b.token).get_me().await {
+                        let _ = api.kick_member(env.group_id, me.id).await;
                     }
-                }
-                if let Ok(me) = BotApi::new(&b.token).get_me().await {
-                    let _ = api.kick_member(env.group_id, me.id).await;
+                    if let Some(t) = b.topic_id {
+                        let _ = api.delete_forum_topic(env.group_id, t).await;
+                    }
                 }
                 let n = b.name.clone();
                 let _ = db_call(&env.db, move |s| s.remove_bot(&n)).await;
             }
-            // 2. Delete every other topic except General (id 1), then
-            //    clear our own topic's messages too.
-            if let (Some(tg), Some(peer)) = (&env.tg, &env.peer) {
-                if let Ok(topics) = tg.list_topics(*peer).await {
-                    for t in topics {
-                        if t.id != 1 && t.id != topic_id {
-                            let _ = api.delete_forum_topic(env.group_id, t.id).await;
-                        }
-                    }
+            // 3. Our topic goes too — already wiped above (or now) — and
+            //    recreated empty. The poll loop follows the new id from
+            //    the store, so we stay live without a serve restart.
+            let _ = api.delete_forum_topic(env.group_id, topic_id).await;
+            let new_tid = match api.create_forum_topic(env.group_id, &bot.name).await {
+                Ok(t) => Some(t.message_thread_id),
+                Err(e) => {
+                    warn!(bot = %bot.name, error = %e, "reset: topic recreate failed");
+                    None
                 }
-                if let Ok(msgs) = tg.topic_history(*peer, topic_id, 200).await {
-                    for m in msgs {
-                        let _ = api.delete_message(env.group_id, m.id as i64).await;
-                    }
-                }
+            };
+            if let Some(t) = new_tid {
+                let (db, n) = (env.db.clone(), bot.name.clone());
+                let _ = db_call(&db, move |s| s.set_bot_topic(&n, t)).await;
             }
+            // 4. Brain wipe: every memory row and transient flag, for
+            //    every bot — not just ours.
+            let _ = db_call(&env.db, |s| s.wipe_transient()).await;
             let _ = api.delete_message(env.group_id, confirm_mid).await;
-            let n = bot.name.clone();
-            let _ = db_call(&env.db, move |s| s.clear_other_topics(&n))
-                .await;
-            let _ = db_call(&env.db, wipe).await;
-            if let Some(g) = &bot.greeting {
-                let _ = send_reply(api, env.group_id, topic_id, g).await;
+            // 5. Leave exactly one thing behind: a fresh backup in
+            //    General, so the wipe still has a restore point.
+            let note = match crate::backup::upload(api, env.group_id).await {
+                Ok(files) => format!("fresh backup in General: {}", files.join(", ")),
+                Err(e) => format!("backup failed: {e}"),
+            };
+            if let Some(t) = new_tid {
+                let _ = api
+                    .send_message(env.group_id, &format!("🧹 clean slate — {note}"), Some(t))
+                    .await;
+                if let Some(g) = &bot.greeting {
+                    let _ = send_reply(api, env.group_id, t, g).await;
+                }
             }
         }
         _ => {}
@@ -483,6 +558,8 @@ struct Markers {
     spawn: Vec<(String, String)>,
     /// (name, token, instructions, optional provider) from `bot_new`.
     bot_new: Vec<(String, String, String, Option<String>)>,
+    /// `:::backup:::` — ship ~/.verity to General after the reply.
+    backup: bool,
 }
 
 /// Pull `:::verb …:::` lines out of a reply. Returns the cleaned reply
@@ -519,6 +596,7 @@ fn extract_markers(reply: &str) -> (String, Markers) {
                         markers.spawn.push((l.into(), t.into()));
                     }
                 }
+                "backup" => markers.backup = true,
                 // `bot_new name | token | instructions [| provider]`
                 "bot_new" => {
                     let mut f = rest.split('|').map(str::trim);
@@ -555,14 +633,14 @@ async fn send_reply(api: &BotApi, group_id: i64, topic_id: i64, reply: &str) -> 
         {
             Ok(_) => continue,
             Err(e) => {
-                debug!(error = %e, "rich send failed, falling back to text");
+                warn!(error = %e, "rich send failed, falling back to text");
                 for chunk in split_markdown(&part, TEXT_LIMIT) {
                     // Legacy markdown render first; raw text last resort.
-                    if api
+                    if let Err(e) = api
                         .send_markdown_message(group_id, &chunk, Some(topic_id))
                         .await
-                        .is_err()
                     {
+                        warn!(error = %e, "legacy markdown send failed, sending raw");
                         api.send_message(group_id, &chunk, Some(topic_id)).await?;
                     }
                 }
@@ -738,6 +816,18 @@ async fn do_turn(env: &Env, bot: &Bot, topic_id: i64, text: &str, depth: u8) -> 
         reply
     };
     send_reply(&api, env.group_id, topic_id, &reply).await?;
+
+    // `:::backup:::` — the reply asked for a config snapshot; upload
+    // ~/.verity to General and note it in the topic.
+    if markers.backup {
+        let note = match crate::backup::upload(&api, env.group_id).await {
+            Ok(files) => format!("🗄 backed up {} to General", files.join(", ")),
+            Err(e) => format!("⚠️ backup failed: {e}"),
+        };
+        let _ = api
+            .send_message(env.group_id, &note, Some(topic_id))
+            .await;
+    }
 
     // 6. Tells: route work to teammates. The teammate answers in ITS OWN
     //    topic — bots never post outside their own thread. Detached so

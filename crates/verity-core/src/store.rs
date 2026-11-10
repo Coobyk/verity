@@ -109,18 +109,30 @@ impl Store {
         )?;
         let mut out = Vec::new();
         while let State::Row = stmt.next()? {
-            out.push(Bot {
-                name: stmt.read(0)?,
-                token: stmt.read(1)?,
-                username: stmt.read::<Option<String>, _>(2)?,
-                topic_id: stmt.read::<Option<i64>, _>(3)?,
-                instructions: stmt.read(4)?,
-                provider: stmt.read(5)?,
-                model: stmt.read::<Option<String>, _>(6)?,
-                greeting: stmt.read::<Option<String>, _>(7)?,
-            });
+            out.push(read_bot(&stmt)?);
         }
         Ok(out)
+    }
+
+    /// The lead bot — first one registered. Singleton jobs like the
+    /// periodic backup go through it so they always come from the same
+    /// sender (not whichever name sorts first).
+    pub fn primary_bot(&self) -> Result<Option<Bot>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, token, username, topic_id, instructions, provider, model, greeting
+             FROM bots ORDER BY rowid LIMIT 1",
+        )?;
+        match stmt.next()? {
+            State::Row => Ok(Some(read_bot(&stmt)?)),
+            State::Done => Ok(None),
+        }
+    }
+
+    /// Forget everything except registrations — all memory and the
+    /// transient kv flags. `/reset` leaves a truly clean brain.
+    pub fn wipe_transient(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM memory; DELETE FROM kv")?;
+        Ok(())
     }
 
     pub fn kv_set(&self, key: &str, value: &str) -> Result<()> {
@@ -202,6 +214,16 @@ impl Store {
         Ok(())
     }
 
+    /// Write a consistent copy of the whole db to `path` via
+    /// `VACUUM INTO` — safe while `serve` keeps writing to the live db.
+    /// Fails if `path` already exists, so it's removed first.
+    pub fn vacuum_into(&self, path: &Path) -> Result<()> {
+        let _ = std::fs::remove_file(path);
+        let esc = path.to_string_lossy().replace('\'', "''");
+        self.conn.execute(format!("VACUUM INTO '{esc}'"))?;
+        Ok(())
+    }
+
     pub fn recall(&self, bot: &str) -> Result<Vec<(String, String)>> {
         let mut stmt = self
             .conn
@@ -213,4 +235,17 @@ impl Store {
         }
         Ok(out)
     }
+}
+
+fn read_bot(stmt: &sqlite::Statement) -> Result<Bot> {
+    Ok(Bot {
+        name: stmt.read(0)?,
+        token: stmt.read(1)?,
+        username: stmt.read::<Option<String>, _>(2)?,
+        topic_id: stmt.read::<Option<i64>, _>(3)?,
+        instructions: stmt.read(4)?,
+        provider: stmt.read(5)?,
+        model: stmt.read::<Option<String>, _>(6)?,
+        greeting: stmt.read::<Option<String>, _>(7)?,
+    })
 }
