@@ -93,7 +93,14 @@ enum Cmd {
         no_context: bool,
     },
     /// Post into a topic as a bot
-    Send { bot: String, text: String },
+    Send {
+        bot: String,
+        /// Message text — or a path to upload as a document with --file
+        text: String,
+        /// Upload `text` as a file (sendDocument) instead of a message
+        #[arg(long)]
+        file: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -700,7 +707,7 @@ async fn run() -> Result<()> {
             }
         }
 
-        Cmd::Send { bot, text } => {
+        Cmd::Send { bot, text, file } => {
             let store = Store::open(&Config::db_path()?)?;
             let b = store.get_bot(&bot)?.context("no such bot")?;
             let cfg = Config::load()?;
@@ -709,9 +716,19 @@ async fn run() -> Result<()> {
                 .topic_id
                 .context("bot has no topic yet — run `verity serve` once")?;
             let api = BotApi::new(&b.token);
-            for part in verity_core::rich::split_markdown(&text, verity_core::rich::RICH_LIMIT) {
-                api.send_rich_message(group_id, InputRichMessage::markdown(&part), Some(topic), None)
+            if file {
+                api.send_document(group_id, std::path::Path::new(&text), None, Some(topic))
                     .await?;
+            } else {
+                for part in verity_core::rich::split_markdown(&text, verity_core::rich::RICH_LIMIT) {
+                    api.send_rich_message(
+                        group_id,
+                        InputRichMessage::markdown(&part),
+                        Some(topic),
+                        None,
+                    )
+                    .await?;
+                }
             }
             println!("sent");
         }
