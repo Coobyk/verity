@@ -607,6 +607,131 @@ impl Tg {
         }
     }
 
+    /// Automate @BotFather: `/newapp` → pick the bot → title →
+    /// description → cover photo → host URL → short name. Returns
+    /// BotFather's final reply (contains the t.me/<bot>/<short> link).
+    /// `bot` matches a picker button label, like in [`Self::delete_bot`].
+    pub async fn create_mini_app(
+        &self,
+        bot: &str,
+        title: &str,
+        description: &str,
+        photo: &Path,
+        url: &str,
+        short_name: &str,
+    ) -> Result<String> {
+        let bf = self.botfather().await?;
+        let bf_ref = PeerRef::from(&bf);
+
+        let mut last = self.last_msg_id(bf_ref).await;
+        self.client
+            .send_message(&bf, InputMessage::new().text("/newapp"))
+            .await
+            .map_err(|e| Error::Mtproto(format!("send: {e}")))?;
+        let picker = self.wait_reply_msg(bf_ref, last).await?;
+        let picker_id = picker.id();
+
+        let want = bot.trim_start_matches('@').to_lowercase();
+        let data = Self::button_labels(&picker)
+            .into_iter()
+            .find(|(label, _)| label.to_lowercase().contains(&want))
+            .map(|(_, data)| data);
+        match data {
+            Some(data) if !data.is_empty() => {
+                self.client
+                    .invoke(&tl::functions::messages::GetBotCallbackAnswer {
+                        game: false,
+                        peer: bf_ref.into(),
+                        msg_id: picker.id(),
+                        data: Some(data),
+                        password: None,
+                    })
+                    .await
+                    .map_err(|e| Error::Mtproto(format!("callback: {e}")))?;
+            }
+            _ => {
+                self.client
+                    .send_message(&bf, InputMessage::new().text(format!("@{want}")))
+                    .await
+                    .map_err(|e| Error::Mtproto(format!("send: {e}")))?;
+            }
+        }
+
+        // Post-pick prompt — fresh message or edited picker. BotFather's
+        // /newapp order isn't fixed (photo can come last), so each reply
+        // decides the next input instead of walking a rigid sequence.
+        let mut prompt = self.wait_confirm(bf_ref, picker_id).await?;
+        let mut photo_sent = false;
+        for _ in 0..10 {
+            if prompt.contains(&format!("t.me/")) && prompt.contains(&format!("/{short_name}")) {
+                return Ok(prompt);
+            }
+            let l = prompt.to_lowercase();
+            if l.contains("sorry")
+                || l.contains("taken")
+                || l.contains("occupied")
+                || l.contains("invalid")
+            {
+                return Err(Error::Mtproto(format!("botfather rejected a step: {prompt}")));
+            }
+            last = self.last_msg_id(bf_ref).await;
+            if l.contains("gif") || l.contains("skip") {
+                // Optional demo-GIF step — decline it.
+                self.send_line(&bf, "/empty").await?;
+            } else if l.contains("photo") {
+                // BotFather wants the cover as a real photo, not a document.
+                let uploaded = self
+                    .client
+                    .upload_file(photo)
+                    .await
+                    .map_err(|e| Error::Mtproto(format!("upload: {e}")))?;
+                self.client
+                    .send_message(&bf, InputMessage::new().photo(uploaded))
+                    .await
+                    .map_err(|e| Error::Mtproto(format!("send: {e}")))?;
+                photo_sent = true;
+            } else if l.contains("title") {
+                self.send_line(&bf, title).await?;
+            } else if l.contains("description") {
+                let d = if description.is_empty() {
+                    "/empty"
+                } else {
+                    description
+                };
+                self.send_line(&bf, d).await?;
+            } else if l.contains("url") || l.contains("link") || l.contains("address") {
+                self.send_line(&bf, url).await?;
+            } else if l.contains("name") {
+                self.send_line(&bf, short_name).await?;
+            } else {
+                return Err(Error::Mtproto(format!("botfather, stuck: {prompt}")));
+            }
+            prompt = self.wait_reply(bf_ref, last).await?;
+        }
+        Err(Error::Mtproto(format!(
+            "botfather: never finished (photo_sent={photo_sent}, last: {prompt})"
+        )))
+    }
+
+    /// Send a raw text line to @BotFather (mid-flow repairs);
+    /// returns his reply.
+    pub async fn bf_send(&self, text: &str) -> Result<String> {
+        let bf = self.botfather().await?;
+        let bf_ref = PeerRef::from(&bf);
+        let last = self.last_msg_id(bf_ref).await;
+        self.send_line(&bf, text).await?;
+        self.wait_reply(bf_ref, last).await
+    }
+
+    /// One text message to a peer — shorthand for the BotFather flows.
+    async fn send_line(&self, peer: &grammers_client::types::Peer, text: &str) -> Result<()> {
+        self.client
+            .send_message(peer, InputMessage::new().text(text))
+            .await
+            .map_err(|e| Error::Mtproto(format!("send: {e}")))?;
+        Ok(())
+    }
+
     async fn botfather(&self) -> Result<grammers_client::types::Peer> {
         self.client
             .resolve_username("botfather")

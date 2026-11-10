@@ -155,6 +155,27 @@ enum BotCmd {
         /// Roster name, @username, or BotFather picker label
         name: String,
     },
+    /// Register a Mini App at @BotFather (/newapp) — prints the
+    /// t.me/<bot>/<short> link you can drop anywhere to launch it
+    App {
+        /// Roster name or @username of the bot that owns the app
+        bot: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long, default_value = "")]
+        desc: String,
+        /// Cover photo BotFather asks for (png/jpg)
+        #[arg(long)]
+        photo: String,
+        /// https URL the app is served from
+        #[arg(long)]
+        url: String,
+        /// Short name — the link becomes t.me/<bot>/<short>
+        #[arg(long)]
+        short: String,
+    },
+    /// Send a raw line to @BotFather (repair a stuck flow)
+    Bf { text: String },
     /// List every bot you own at @BotFather (not just registered ones)
     Mine,
     /// Show/edit a bot's memory
@@ -523,6 +544,38 @@ async fn run() -> Result<()> {
                     tg.delete_bot(&want).await?;
                     let _ = store.remove_bot(&name);
                     println!("deleted {want} for good — username freed");
+                }
+                BotCmd::App {
+                    bot,
+                    title,
+                    desc,
+                    photo,
+                    url,
+                    short,
+                } => {
+                    let want = store
+                        .get_bot(&bot)
+                        .ok()
+                        .flatten()
+                        .and_then(|b| b.username)
+                        .unwrap_or_else(|| bot.clone());
+                    let (tg, _) = authorized_tg().await?;
+                    println!("asking @BotFather…");
+                    let done = tg
+                        .create_mini_app(
+                            &want,
+                            &title,
+                            &desc,
+                            std::path::Path::new(&photo),
+                            &url,
+                            &short,
+                        )
+                        .await?;
+                    println!("{done}");
+                }
+                BotCmd::Bf { text } => {
+                    let (tg, _) = authorized_tg().await?;
+                    println!("{}", tg.bf_send(&text).await?);
                 }
                 BotCmd::Mine => {
                     let (tg, _) = authorized_tg().await?;
