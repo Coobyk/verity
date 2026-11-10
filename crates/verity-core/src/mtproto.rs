@@ -274,8 +274,17 @@ impl Tg {
             let input = ask("Login code (from Telegram)")?;
             let input = input.trim().to_string();
             if input.eq_ignore_ascii_case("resend") {
-                sent = self.resend_code(phone, &sent.phone_code_hash).await?;
-                println!("code sent via {}", describe_code_type(&sent.code_type));
+                match self.resend_code(phone, &sent.phone_code_hash).await {
+                    Ok(s) => {
+                        sent = s;
+                        println!("code sent via {}", describe_code_type(&sent.code_type));
+                    }
+                    Err(e) => eprintln!(
+                        "resend failed: {e}\n\
+                         (Telegram is likely rate-limiting this number — wait a while,\n\
+                         and the code already sent may still be valid)"
+                    ),
+                }
                 continue;
             }
             break input;
