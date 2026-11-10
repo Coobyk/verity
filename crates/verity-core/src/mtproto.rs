@@ -299,11 +299,23 @@ impl Tg {
                         Some(tl::enums::Peer::User(p)) => name_of(p.user_id),
                         _ => "group".to_string(),
                     };
+                    // Media-only messages carry no text — mark them so
+                    // "what do you see in this image" still has context.
+                    let text = if m.message.is_empty() {
+                        match &m.media {
+                            Some(tl::enums::MessageMedia::Photo(_)) => "[image]".into(),
+                            Some(tl::enums::MessageMedia::Document(_)) => "[file]".into(),
+                            Some(_) => "[media]".into(),
+                            None => String::new(),
+                        }
+                    } else {
+                        m.message
+                    };
                     Some(TopicMessage {
                         id: m.id,
                         date: m.date as i64,
                         sender,
-                        text: m.message,
+                        text,
                     })
                 }
                 _ => None,

@@ -273,9 +273,35 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
             if msg.from.as_ref().map(|u| u.is_bot).unwrap_or(true) {
                 continue; // never react to bots (incl. ourselves)
             }
-            let Some(text) = msg.text.clone().or_else(|| msg.caption.clone()) else {
+            // Text or caption; media gets downloaded and its local path
+            // appended so the agent can actually look at it.
+            let mut text = msg
+                .text
+                .clone()
+                .or_else(|| msg.caption.clone())
+                .unwrap_or_default();
+            if let Some(att) = attachment(&msg) {
+                match save_media(&api, &env.db, &bot.name, msg.message_id, &att).await {
+                    Ok(path) => {
+                        let note = format!(
+                            "[{} attached: {} — read this file to view it]",
+                            att.desc,
+                            path.display()
+                        );
+                        text = if text.is_empty() {
+                            note
+                        } else {
+                            format!("{text}\n\n{note}")
+                        };
+                    }
+                    Err(e) => {
+                        warn!(bot = %bot.name, error = %e, "attachment download failed")
+                    }
+                }
+            }
+            if text.trim().is_empty() {
                 continue;
-            };
+            }
             // In-chat commands — destructive, so they confirm via an
             // inline button before anything runs.
             if let Some(cmd) = text
@@ -470,6 +496,91 @@ async fn run_command(api: &BotApi, bot: &Bot, env: &Env, topic_id: i64, cmd: &st
         }
         _ => {}
     }
+}
+
+/// A downloadable attachment found on a message.
+struct Attachment {
+    file_id: String,
+    /// Human description for the prompt note — `image`, `file "x.pdf"`.
+    desc: String,
+    /// Extension for the local filename (no dot).
+    ext: String,
+}
+
+/// Pick a message's attachment worth downloading: the largest photo
+/// size, or a sent-as-file document. Stickers/video/voice don't make
+/// the cut yet — they still show as `[media]` in the transcript.
+fn attachment(msg: &crate::botapi::Message) -> Option<Attachment> {
+    if let Some(photos) = &msg.photo {
+        if let Some(p) = photos.iter().max_by_key(|p| p.width * p.height) {
+            return Some(Attachment {
+                file_id: p.file_id.clone(),
+                desc: "image".into(),
+                ext: "jpg".into(),
+            });
+        }
+    }
+    if let Some(d) = &msg.document {
+        // Bot API getFile caps at 20 MB — don't bother past that.
+        if d.file_size.map(|s| s > 20 * 1024 * 1024).unwrap_or(false) {
+            return None;
+        }
+        let ext = d
+            .file_name
+            .as_deref()
+            .and_then(|n| n.rsplit_once('.'))
+            .map(|(_, e)| e.chars().take(8).collect::<String>())
+            .unwrap_or_else(|| "bin".into());
+        let desc = match &d.file_name {
+            Some(n) => format!("file \"{n}\""),
+            None => d
+                .mime_type
+                .as_deref()
+                .and_then(|m| m.strip_prefix("image/").map(|_| "image".into()))
+                .unwrap_or_else(|| "file".into()),
+        };
+        return Some(Attachment {
+            file_id: d.file_id.clone(),
+            desc,
+            ext,
+        });
+    }
+    None
+}
+
+/// Download an attachment to `<verity home>/media/<bot>/<msgid>.<ext>`
+/// (the db dir is the bot home) and prune files older than a week.
+async fn save_media(
+    api: &BotApi,
+    db: &Path,
+    bot: &str,
+    msg_id: i64,
+    att: &Attachment,
+) -> Result<PathBuf> {
+    let dir = db
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("media")
+        .join(bot);
+    std::fs::create_dir_all(&dir)?;
+    // Sweep stale downloads — media is only useful during its turn.
+    let week = Duration::from_secs(7 * 24 * 3600);
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let stale = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|t| t.elapsed().map(|a| a > week).unwrap_or(false))
+                .unwrap_or(false);
+            if stale {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let remote = api.file_path(&att.file_id).await?;
+    let dest = dir.join(format!("{msg_id}.{}", att.ext));
+    api.download_file(&remote, &dest).await?;
+    Ok(dest)
 }
 
 /// Pull the recent topic transcript via the user session, as

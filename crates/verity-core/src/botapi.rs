@@ -48,7 +48,27 @@ pub struct Message {
     pub text: Option<String>,
     /// Media caption — photos/docs/etc. carry their text here.
     pub caption: Option<String>,
+    /// Attached photo, smallest→largest sizes (pick the biggest).
+    pub photo: Option<Vec<PhotoSize>>,
+    /// Attached file — includes images sent "uncompressed".
+    pub document: Option<Document>,
     pub reply_to_message: Option<Box<Message>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PhotoSize {
+    pub file_id: String,
+    pub width: i64,
+    pub height: i64,
+    pub file_size: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Document {
+    pub file_id: String,
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub file_size: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -240,6 +260,32 @@ impl BotApi {
             .json()
             .await?;
         unwrap(resp)
+    }
+
+    /// `getFile` — resolve a `file_id` to the server-side `file_path`
+    /// used by [`Self::download_file`].
+    pub async fn file_path(&self, file_id: &str) -> Result<String> {
+        #[derive(Deserialize)]
+        struct F {
+            file_path: Option<String>,
+        }
+        let f: F = self.call("getFile", &json!({ "file_id": file_id })).await?;
+        f.file_path.ok_or_else(|| Error::BotApi {
+            code: -1,
+            description: "getFile: no file_path".into(),
+        })
+    }
+
+    /// Download a `file_path` (from `getFile`) to a local `dest` —
+    /// `GET {base}/file/bot<token>/<file_path>`.
+    pub async fn download_file(&self, file_path: &str, dest: &Path) -> Result<()> {
+        let url = format!("{}/file/bot{}/{}", self.base, self.token, file_path);
+        let bytes = self.http.get(&url).send().await?.bytes().await?;
+        if let Some(dir) = dest.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(dest, &bytes)?;
+        Ok(())
     }
 
     /// Stream a partial message while it is being generated.
