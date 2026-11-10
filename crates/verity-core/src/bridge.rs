@@ -12,7 +12,7 @@
 //!   in this topic as itself (bots can't see each other, so verity routes)
 //! - `:::spawn label: task:::` — fan out up to 3 short-lived helpers on
 //!   the same harness; results fold into the reply as `<details>` blocks
-//! - `:::backup:::` — upload `~/.verity` (config, session, brain) to
+//! - `:::backup:::` — upload `~/verity` (config, session, brain) to
 //!   General as documents
 
 use std::future::Future;
@@ -77,7 +77,7 @@ struct Env {
 /// Supervisor sweep interval: how often the bridge looks for newly
 /// registered bots and starts their loops.
 const BOT_SWEEP: Duration = Duration::from_secs(10);
-/// Default `~/.verity` → General backup cadence while `serve` runs;
+/// Default `~/verity` → General backup cadence while `serve` runs;
 /// `VERITY_BACKUP_EVERY` (seconds) overrides, `0` disables.
 const DEFAULT_BACKUP_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
@@ -92,7 +92,7 @@ impl Bridge {
             tg: self.tg.clone(),
             peer: self.tg_peer,
         };
-        // Periodic backup of ~/.verity into General — the off-machine
+        // Periodic backup of ~/verity into General — the off-machine
         // copy that survives a dead laptop or a move to a VM. First one
         // lands a full interval in; `/backup` or `:::backup:::` for now.
         let every = std::env::var("VERITY_BACKUP_EVERY")
@@ -669,7 +669,7 @@ struct Markers {
     spawn: Vec<(String, String)>,
     /// (name, token, instructions, optional provider) from `bot_new`.
     bot_new: Vec<(String, String, String, Option<String>)>,
-    /// `:::backup:::` — ship ~/.verity to General after the reply.
+    /// `:::backup:::` — ship ~/verity to General after the reply.
     backup: bool,
 }
 
@@ -929,7 +929,7 @@ async fn do_turn(env: &Env, bot: &Bot, topic_id: i64, text: &str, depth: u8) -> 
     send_reply(&api, env.group_id, topic_id, &reply).await?;
 
     // `:::backup:::` — the reply asked for a config snapshot; upload
-    // ~/.verity to General and note it in the topic.
+    // ~/verity to General and note it in the topic.
     if markers.backup {
         let note = match crate::backup::upload(&api, env.group_id).await {
             Ok(files) => format!("🗄 backed up {} to General", files.join(", ")),

@@ -1,4 +1,6 @@
 /target
 *.session
-.verity/
+config.toml
+state.sqlite*
 deaths/
+.wrangler/

@@ -77,9 +77,9 @@ enum Cmd {
         text: String,
         group: Option<String>,
     },
-    /// Upload ~/.verity (config, session, sqlite brain) to the group's General
+    /// Upload ~/verity (config, session, sqlite brain) to the group's General
     Backup,
-    /// Pull the newest backup docs from General back into ~/.verity
+    /// Pull the newest backup docs from General back into ~/verity
     Restore {
         group: Option<String>,
     },

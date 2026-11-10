@@ -1,4 +1,4 @@
-//! `~/.verity` backup into the group's General topic — config, session,
+//! `~/verity` backup into the group's General topic — config, session,
 //! and the sqlite brain ride along as documents so a dead laptop (or a
 //! move to a VM) doesn't lose the team. `verity restore` pulls it back.
 //!
@@ -26,7 +26,7 @@ const CAPTION: &str = "🗄 verity backup";
 /// How far back a restore scans the channel for backup docs.
 const RESTORE_SCAN: usize = 500;
 
-/// Upload every `~/.verity` file to the group's General topic (thread
+/// Upload every `~/verity` file to the group's General topic (thread
 /// `None`). Returns the file names sent.
 pub async fn upload(api: &BotApi, group_id: i64) -> Result<Vec<String>> {
     let home = Config::home()?;
@@ -89,7 +89,7 @@ async fn snapshot(db: &Path, file_name: &str) -> Result<PathBuf> {
     Ok(snap)
 }
 
-/// Pull the newest backup docs out of General back into `~/.verity`,
+/// Pull the newest backup docs out of General back into `~/verity`,
 /// overwriting what's there. Returns the file names restored.
 pub async fn download(tg: &Tg, peer: PeerRef) -> Result<Vec<String>> {
     let docs = tg.find_general_documents(peer, FILES, RESTORE_SCAN).await?;

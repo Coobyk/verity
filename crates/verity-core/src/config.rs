@@ -1,4 +1,4 @@
-//! `~/.verity` layout: `config.toml`, `state.sqlite`, `tg.session`.
+//! `~/verity` layout: `config.toml`, `state.sqlite`, `tg.session`.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -34,7 +34,7 @@ impl Config {
             return Ok(PathBuf::from(h));
         }
         dirs::home_dir()
-            .map(|h| h.join(".verity"))
+            .map(|h| h.join("verity"))
             .ok_or_else(|| Error::Config("cannot resolve home directory".into()))
     }
 

@@ -42,7 +42,7 @@ Replies can carry `:::` markers, stripped before send:
 - `:::bot_new name | token | instructions | provider:::` — register a
   brand-new teammate mid-run; the bridge validates the token and it
   creates its own topic seconds later
-- `:::backup:::` — upload `~/.verity` (config, session, sqlite brain)
+- `:::backup:::` — upload `~/verity` (config, session, sqlite brain)
   as documents in General
 
 Bots registered while `serve` runs start automatically — the bridge
@@ -50,7 +50,7 @@ re-scans the roster every 10s.
 
 ## Backup
 
-`~/.verity` is the whole install — `config.toml`, `tg.session` (your
+`~/verity` is the whole install — `config.toml`, `tg.session` (your
 MTProto login), and `state.sqlite` (bot roster + memory). Back it up
 into the group's General topic and pull it back on another machine:
 
