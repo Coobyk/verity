@@ -84,10 +84,15 @@ fn box_blur(a: &mut [u8], w: usize, h: usize, r: usize, tmp: &mut [u8]) {
 }
 
 /// Render a BallsMaker blob at `size`×`size`, return PNG bytes.
-/// Faithful port: black goo blob + white capsule eyes + pupils on a
-/// seeded vivid background (the site offers white/black/transparent —
-/// a colorful bg reads better as a tiny avatar).
+/// Faithful default: black goo blob + white capsule eyes on white —
+/// the site's export. `hue` swaps in a vivid bg, `pupils` adds pupils.
 pub fn render(seed: u64, size: u32) -> Result<Vec<u8>> {
+    render_opts(seed, size, None, false)
+}
+
+/// [`render`] with knobs: `hue` = bg hue in degrees (None → white),
+/// `pupils` = draw the dark pupil inside each eye.
+pub fn render_opts(seed: u64, size: u32, hue: Option<f64>, pupils: bool) -> Result<Vec<u8>> {
     let mut rng = Rng(seed.max(1));
     let s = size as f32;
     let k = s / 900.0; // the original canvas is 900×900
@@ -165,13 +170,16 @@ pub fn render(seed: u64, size: u32) -> Result<Vec<u8>> {
     let (bcx, bcy) = (sx as f32 / count as f32, sy as f32 / count as f32);
     let (bw, bh) = ((max_x - min_x) as f32, (max_y - min_y) as f32);
 
-    // 4. Composite: seeded bg → near-black blob.
+    // 4. Composite: white bg (the site's default) or a vivid hue →
+    //    pure-black blob, matching the export's fillStyle "#000".
     let mut px =
         Pixmap::new(size, size).ok_or_else(|| Error::Other("pfp: pixmap alloc failed".into()))?;
-    let hue = rng.range(0.0, 360.0);
-    let (br_, bg_, bb_) = hsl(hue, 0.62, 0.5);
+    let (br_, bg_, bb_) = match hue {
+        Some(h) => hsl(h, 0.62, 0.5),
+        None => (255, 255, 255),
+    };
     px.fill(Color::from_rgba8(br_, bg_, bb_, 255));
-    let blob_c = PremultipliedColorU8::from_rgba(0x1a, 0x1a, 0x22, 255)
+    let blob_c = PremultipliedColorU8::from_rgba(0, 0, 0, 255)
         .ok_or_else(|| Error::Other("pfp: color".into()))?;
     for (i, on) in alpha.iter().enumerate() {
         if *on == 255 {
@@ -192,23 +200,34 @@ pub fn render(seed: u64, size: u32) -> Result<Vec<u8>> {
     pupil.set_color_rgba8(0x1a, 0x1a, 0x22, 255);
     pupil.anti_alias = true;
     for ex in [bcx - gap / 2.0, bcx + gap / 2.0] {
-        for (dx, dy, dw, dh, paint) in [
-            // Eye capsule — the JS uses roundRect, ellipse fallback reads the same.
-            (-ew / 2.0, -eh / 2.0, ew, eh, &eye),
-            // Pupil: slight downward look, like the site's toggle.
-            (
-                -ew * 0.14,
-                eh * 0.12 - eh * 0.11,
+        // Eye capsule — a stadium (rect + two cap discs), matching the
+        // site's roundRect. A plain oval reads egg-shaped, not right.
+        let half = (eh - ew) / 2.0;
+        if let Some(rect) = Rect::from_xywh(ex - ew / 2.0, ey - half, ew, half * 2.0) {
+            let mut pb = PathBuilder::new();
+            pb.push_rect(rect);
+            if let Some(p) = pb.finish() {
+                px.fill_path(&p, &eye, FillRule::Winding, Transform::identity(), None);
+            }
+        }
+        for cy in [ey - half, ey + half] {
+            let mut pb = PathBuilder::new();
+            pb.push_circle(ex, cy, ew / 2.0);
+            if let Some(p) = pb.finish() {
+                px.fill_path(&p, &eye, FillRule::Winding, Transform::identity(), None);
+            }
+        }
+        if pupils {
+            if let Some(rect) = Rect::from_xywh(
+                ex - ew * 0.14,
+                ey + eh * 0.12 - eh * 0.11,
                 ew * 0.28,
                 eh * 0.22,
-                &pupil,
-            ),
-        ] {
-            if let Some(rect) = Rect::from_xywh(ex + dx, ey + dy, dw, dh) {
+            ) {
                 let mut pb = PathBuilder::new();
                 pb.push_oval(rect);
                 if let Some(p) = pb.finish() {
-                    px.fill_path(&p, paint, FillRule::Winding, Transform::identity(), None);
+                    px.fill_path(&p, &pupil, FillRule::Winding, Transform::identity(), None);
                 }
             }
         }

@@ -169,6 +169,12 @@ enum BotCmd {
         /// same name always gets the same face unless a seed is given
         #[arg(long)]
         seed: Option<u64>,
+        /// Background hue in degrees (0-360) — default is the site's white
+        #[arg(long)]
+        hue: Option<f64>,
+        /// Draw pupils in the eyes (off on the site)
+        #[arg(long)]
+        pupils: bool,
     },
     /// List registered bots
     List,
@@ -701,10 +707,15 @@ async fn run() -> Result<()> {
                         println!("{label}");
                     }
                 }
-                BotCmd::Pfp { name, seed } => {
+                BotCmd::Pfp {
+                    name,
+                    seed,
+                    hue,
+                    pupils,
+                } => {
                     let bot = store.get_bot(&name)?.context("no such bot")?;
                     let seed = seed.unwrap_or_else(|| verity_core::pfp::name_seed(&bot.name));
-                    let png = verity_core::pfp::render(seed, 512)?;
+                    let png = verity_core::pfp::render_opts(seed, 512, hue, pupils)?;
                     let out = Config::db_path()?
                         .parent()
                         .unwrap_or_else(|| Path::new("."))
