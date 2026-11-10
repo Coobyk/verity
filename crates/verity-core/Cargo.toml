@@ -20,6 +20,7 @@ grammers-session.workspace = true
 grammers-mtsender = "0.8"
 grammers-tl-types.workspace = true
 async-trait.workspace = true
+sevenz-rust2 = "0.24"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

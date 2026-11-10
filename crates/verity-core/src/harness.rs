@@ -116,7 +116,7 @@ fn system_prompt(ctx: &TurnContext) -> String {
     s.push_str(
         "\nReply for Telegram Rich Markdown: GFM, tables, and LaTeX formulas are supported. Keep it concise. \
          To persist a fact, put it on its own line as `:::remember key = value:::` — it is stored as memory and stripped from your reply. \
-         To snapshot your config/state files into the group's General topic (backup), emit `:::backup:::`.",
+         To archive all of ~/verity (and your $HOME settings) into the group's General topic (backup), emit `:::backup:::`.",
     );
     s
 }

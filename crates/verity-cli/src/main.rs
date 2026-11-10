@@ -77,9 +77,11 @@ enum Cmd {
         text: String,
         group: Option<String>,
     },
-    /// Upload ~/verity (config, session, sqlite brain) to the group's General
+    /// 7z ~/verity (minus target/) + $HOME settings into one archive;
+    /// send it to the group's General topic
     Backup,
-    /// Pull the newest backup docs from General back into ~/verity
+    /// Pull the newest backup archive from General back into ~/verity
+    /// (and the _home/ overlay back into $HOME)
     Restore {
         group: Option<String>,
     },

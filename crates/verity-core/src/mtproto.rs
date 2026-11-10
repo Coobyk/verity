@@ -14,6 +14,24 @@ use grammers_tl_types as tl;
 
 use crate::{Error, Result};
 
+/// How many recent channel messages a document search scans.
+const RESTORE_SCAN_LIMIT: usize = 500;
+
+/// General is forum topic 1; pre-forum messages carry no reply_to at
+/// all, which is the same stream.
+fn in_general(m: &Message) -> bool {
+    match &m.raw {
+        tl::enums::Message::Message(tl::types::Message { reply_to, .. }) => match reply_to {
+            None => true,
+            Some(tl::enums::MessageReplyHeader::Header(h)) => {
+                h.reply_to_top_id.is_none_or(|t| t == 1)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 pub struct Tg {
     // held so the pool keeps a live session for its lifetime
     #[allow(dead_code)]
@@ -325,6 +343,36 @@ impl Tg {
         Ok(out)
     }
 
+    /// Newest document in General whose file name passes `pred`.
+    pub async fn find_general_document(
+        &self,
+        peer: PeerRef,
+        pred: impl Fn(&str) -> bool,
+    ) -> Result<Option<Message>> {
+        let mut it = self.client.iter_messages(peer);
+        let mut scanned = 0;
+        while let Some(m) = it
+            .next()
+            .await
+            .map_err(|e| Error::Mtproto(format!("messages: {e}")))?
+        {
+            scanned += 1;
+            if scanned > RESTORE_SCAN_LIMIT {
+                break;
+            }
+            if !in_general(&m) {
+                continue;
+            }
+            let Some(Media::Document(doc)) = m.media() else {
+                continue;
+            };
+            if pred(doc.name()) {
+                return Ok(Some(m));
+            }
+        }
+        Ok(None)
+    }
+
     /// Newest message per file name among documents posted to the
     /// group's General topic. Scans the `scan` most recent channel
     /// messages (newest first); stops early once every name matched.
@@ -346,19 +394,7 @@ impl Tg {
             if scanned > scan || found.len() == want.len() {
                 break;
             }
-            // General is forum topic 1; pre-forum messages carry no
-            // reply_to at all, which is the same stream.
-            let in_general = match &m.raw {
-                tl::enums::Message::Message(tl::types::Message { reply_to, .. }) => match reply_to {
-                    None => true,
-                    Some(tl::enums::MessageReplyHeader::Header(h)) => {
-                        h.reply_to_top_id.is_none_or(|t| t == 1)
-                    }
-                    _ => false,
-                },
-                _ => false,
-            };
-            if !in_general {
+            if !in_general(&m) {
                 continue;
             }
             let Some(Media::Document(doc)) = m.media() else {

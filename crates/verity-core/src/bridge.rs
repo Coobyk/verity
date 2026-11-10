@@ -18,8 +18,8 @@
 //!   in this topic as itself (bots can't see each other, so verity routes)
 //! - `:::spawn label: task:::` — fan out up to 3 short-lived helpers on
 //!   the same harness; results fold into the reply as `<details>` blocks
-//! - `:::backup:::` — upload `~/verity` (config, session, brain) to
-//!   General as documents
+//! - `:::backup:::` — 7z `~/verity` (minus `target/`) + `$HOME` settings
+//!   into one archive, uploaded to General
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
