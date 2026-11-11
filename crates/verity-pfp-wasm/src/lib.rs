@@ -8,7 +8,7 @@ thread_local! {
     static OUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Render an avatar. `hue < 0` = the site's white bg. Returns a
+/// Render an avatar. `hue < 0` = classic black-on-white, else a
 /// pointer into wasm memory.
 #[no_mangle]
 pub extern "C" fn pfp_render(seed: u64, size: u32, hue: f64) -> *mut u8 {

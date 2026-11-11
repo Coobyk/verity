@@ -52,7 +52,7 @@
     <label>name <input id="name" type="text" placeholder="Verity" /></label>
     <button id="byname">seed from name</button>
     <label>seed <input id="seed" type="number" value="42" /></label>
-    <label>hue <input id="hue" type="range" min="-1" max="360" value="-1" /> <span id="huev">auto-white</span></label>
+    <label>hue <input id="hue" type="range" min="-1" max="360" value="-1" /> <span id="huev">auto = black</span></label>
     <button id="roll">🎲 reroll</button>
     <button id="add" class="primary">+ add</button>
     <span id="status"></span>
@@ -120,7 +120,7 @@ document.getElementById("byname").onclick = () => {
 };
 document.getElementById("hue").oninput = e => {
   document.getElementById("huev").textContent =
-    e.target.value < 0 ? "auto-white" : e.target.value;
+    e.target.value < 0 ? "auto = black" : e.target.value;
 };
 </script>
 </body>
