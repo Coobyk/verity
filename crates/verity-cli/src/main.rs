@@ -175,8 +175,8 @@ enum BotCmd {
         /// same name always gets the same face unless a seed is given
         #[arg(long)]
         seed: Option<u64>,
-        /// Base hue in degrees (0-360) — paints the shape as a colorful
-        /// gradient; default is near-black on white
+        /// Base hue in degrees (0-360) — paints the shape one solid
+        /// colour; default is near-black on white
         #[arg(long)]
         hue: Option<f64>,
     },
