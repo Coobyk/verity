@@ -1,6 +1,6 @@
 //! BallsMaker — seeded geometric avatars. One regular shape (circle,
 //! square, triangle, pentagon, hexagon, star, capsule, diamond) in
-//! near-black — or a colorful gradient — on off-white, gooified (rasterize → blur → threshold →
+//! near-black — or one solid colour — on off-white, gooified (rasterize → blur → threshold →
 //! marching-squares contour) so the corners melt, two stadium eye
 //! cut-outs. Deterministic per seed, so `:::pfp:::` and
 //! `verity bot pfp --seed` reproduce exactly.
@@ -112,8 +112,8 @@ pub fn render(seed: u64, size: u32) -> Result<Vec<u8>> {
     render_opts(seed, size, None)
 }
 
-/// [`render`] with a knob: `hue` = base hue for a colorful gradient
-/// across the shape (None → near-black on off-white).
+/// [`render`] with a knob: `hue` paints the shape one solid colour
+/// (None → near-black on off-white).
 pub fn render_opts(seed: u64, size: u32, hue: Option<f64>) -> Result<Vec<u8>> {
     if size == 0 {
         return Err(PfpError::Other("pfp: size 0".into()));
@@ -161,9 +161,8 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>) -> Result<Vec<u8>> {
     paint.anti_alias = true;
     let k = (s / MW as f64) as f32;
 
-    // body — one path of all traced loops; near-black, or a
-    // three-hue gradient swept across the shape's bbox when a
-    // base hue is given
+    // body — one path of all traced loops; near-black, or one solid
+    // colour when a hue is given
     let mut pb = PathBuilder::new();
     for lp in &loops {
         pb.move_to(lp[0].0 as f32 * k, lp[0].1 as f32 * k);
@@ -175,29 +174,8 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>) -> Result<Vec<u8>> {
     if let Some(p) = pb.finish() {
         match hue {
             Some(h) => {
-                let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, 0.0f32, 0.0f32);
-                for lp in &loops {
-                    for &(x, y) in lp {
-                        x0 = x0.min(x as f32 * k);
-                        y0 = y0.min(y as f32 * k);
-                        x1 = x1.max(x as f32 * k);
-                        y1 = y1.max(y as f32 * k);
-                    }
-                }
-                let stop = |pos, dh| {
-                    let (r, g, b) = hsl(h + dh, 0.72, 0.55);
-                    GradientStop::new(pos, Color::from_rgba8(r, g, b, 255))
-                };
-                match LinearGradient::new(
-                    Point::from_xy(x0, y0),
-                    Point::from_xy(x1, y1),
-                    vec![stop(0.0, 0.0), stop(0.5, 110.0), stop(1.0, 220.0)],
-                    SpreadMode::Pad,
-                    Transform::identity(),
-                ) {
-                    Some(lg) => paint.shader = lg,
-                    None => paint.set_color_rgba8(0x0a, 0x0a, 0x0a, 255),
-                }
+                let (r, g, b) = hsl(h, 0.72, 0.55);
+                paint.set_color_rgba8(r, g, b, 255);
             }
             None => paint.set_color_rgba8(0x0a, 0x0a, 0x0a, 255),
         }

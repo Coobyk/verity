@@ -42,6 +42,12 @@ enum Cmd {
         #[arg(long)]
         phone: Option<String>,
     },
+    /// Restyle your own profile picture — `random` (default) rolls a
+    /// fresh seed and colour, or pass a seed number for a known face
+    Pfp {
+        /// `random` or a seed number
+        what: Option<String>,
+    },
     /// Bot management
     Bot {
         #[command(subcommand)]
@@ -300,6 +306,34 @@ async fn resolve_topic(
         .context("no such topic")
 }
 
+/// Render a BallsMaker avatar for `bot`, save pfp-<name>.png next to
+/// the db, and upload it via the Bot API.
+async fn set_pfp(bot: &Bot, seed: u64, hue: Option<f64>) -> Result<()> {
+    let png = verity_core::pfp::render_opts(seed, 512, hue)?;
+    let out = Config::db_path()?
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("pfp-{}.png", bot.name));
+    std::fs::write(&out, &png)?;
+    BotApi::new(&bot.token).set_profile_photo(png).await?;
+    println!("pfp set for {} (seed {seed}) → {}", bot.name, out.display());
+    Ok(())
+}
+
+/// Entropy for `verity pfp random` — /dev/urandom, time as fallback.
+fn rand_u64() -> u64 {
+    if let Ok(b) = std::fs::read("/dev/urandom") {
+        if b.len() >= 8 {
+            return u64::from_le_bytes(b[..8].try_into().unwrap());
+        }
+    }
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e3779b97f4a7c15);
+    n ^ (std::process::id() as u64).wrapping_mul(0x2545F4914F6CDD1D)
+}
+
 /// Tokio worker threads default to a 2 MiB stack; deep synchronous
 /// chains (dependency parsers, drop glue unwinding a burst of failed
 /// futures) can exhaust it — that aborts the whole process, no unwind.
@@ -413,6 +447,23 @@ async fn run() -> Result<()> {
             .await?;
             tg.save_session(&Config::session_path()?)?;
             println!("logged in; session saved");
+        }
+
+        Cmd::Pfp { what } => {
+            let bot = Store::open(&Config::db_path()?)?
+                .primary_bot()?
+                .context("no bots registered — `verity bot new`")?;
+            let (seed, hue) = match what.as_deref() {
+                None | Some("random") => {
+                    (rand_u64().max(1), (rand_u64() % 360) as f64)
+                }
+                Some(w) => {
+                    let seed: u64 = w.parse().context("use `random` or a seed number")?;
+                    (seed, (seed % 360) as f64)
+                }
+            };
+            set_pfp(&bot, seed, Some(hue)).await?;
+            println!("hue {hue:.0}° — `verity pfp {seed}` replays this face");
         }
 
         Cmd::Reset => {
@@ -708,14 +759,7 @@ async fn run() -> Result<()> {
                 BotCmd::Pfp { name, seed, hue } => {
                     let bot = store.get_bot(&name)?.context("no such bot")?;
                     let seed = seed.unwrap_or_else(|| verity_core::pfp::name_seed(&bot.name));
-                    let png = verity_core::pfp::render_opts(seed, 512, hue)?;
-                    let out = Config::db_path()?
-                        .parent()
-                        .unwrap_or_else(|| Path::new("."))
-                        .join(format!("pfp-{}.png", bot.name));
-                    std::fs::write(&out, &png)?;
-                    BotApi::new(&bot.token).set_profile_photo(png).await?;
-                    println!("pfp set for {} (seed {seed}) → {}", bot.name, out.display());
+                    set_pfp(&bot, seed, hue).await?;
                 }
                 BotCmd::Memory { name, set } => {
                     if let Some(pairs) = set {
