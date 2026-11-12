@@ -121,6 +121,27 @@ class TdRepository(context: Context) {
     /** forumTopicId -> a real message id inside the thread. */
     private val topicMsgId = ConcurrentHashMap<Long, Long>()
 
+    /** userId -> local path of the downloaded small profile photo. */
+    val avatars = MutableStateFlow<Map<Long, String>>(emptyMap())
+
+    /** fileId -> userId, so UpdateFile completions find their owner. */
+    private val avatarFileToUser = ConcurrentHashMap<Int, Long>()
+
+    private fun cacheUser(u: TdApi.User) {
+        users[u.id] = u
+        val f = u.profilePhoto?.small ?: return
+        avatarFileToUser[f.id] = u.id
+        if (f.local.isDownloadingCompleted && f.local.path.isNotEmpty()) {
+            avatars.update { it + (u.id to f.local.path) }
+        } else {
+            scope.launch {
+                runCatching {
+                    exec(TdApi.DownloadFile(f.id, 16, 0, 0, false))
+                }
+            }
+        }
+    }
+
     private class OpenConv(
         val chatId: Long,
         val topicId: Long,
@@ -187,9 +208,18 @@ class TdRepository(context: Context) {
             TdApi.UpdateChatLastMessage.CONSTRUCTOR -> scheduleRefresh()
 
             TdApi.UpdateUser.CONSTRUCTOR -> {
-                val u = (obj as TdApi.UpdateUser).user
-                users[u.id] = u
+                cacheUser((obj as TdApi.UpdateUser).user)
                 scheduleRefresh()
+            }
+
+            TdApi.UpdateFile.CONSTRUCTOR -> {
+                val f = (obj as TdApi.UpdateFile).file
+                val uid = avatarFileToUser[f.id]
+                if (uid != null && f.local.isDownloadingCompleted &&
+                    f.local.path.isNotEmpty()
+                ) {
+                    avatars.update { it + (uid to f.local.path) }
+                }
             }
 
             TdApi.UpdateNewMessage.CONSTRUCTOR ->
@@ -343,7 +373,7 @@ class TdRepository(context: Context) {
                         is TdApi.ChatTypePrivate -> {
                             val user = users[type.userId]
                                 ?: runCatching { exec(TdApi.GetUser(type.userId)) }
-                                    .getOrNull()?.also { users[it.id] = it }
+                                    .getOrNull()?.also { cacheUser(it) }
                             if (user != null && user.type is TdApi.UserTypeBot) {
                                 dmRows += DirectChat(
                                     userId = type.userId,
@@ -431,6 +461,7 @@ class TdRepository(context: Context) {
         val all = ArrayList<TdApi.Message>()
         try {
             var from = 0L
+            var idle = 0
             while (all.size < 200 && openConv === open) {
                 val page = if (open.topicId != 0L) {
                     // GetMessageThreadHistory wants a message id inside
@@ -447,10 +478,16 @@ class TdRepository(context: Context) {
                     ).messages
                 } ?: break
                 val fresh = if (from == 0L) page.toList() else page.drop(1)
-                if (fresh.isEmpty()) break
+                if (fresh.isEmpty()) {
+                    // Short/empty page can mean TDLib's server fetch is
+                    // still in flight — wait a beat and retry the call.
+                    if (++idle >= 4) break
+                    delay(400)
+                    continue
+                }
+                idle = 0
                 all += fresh
                 from = page.last().id
-                if (page.size < 100) break
             }
         } catch (e: Exception) {
             if (openConv === open) status.value = e.message ?: "Can't load history"
@@ -548,7 +585,7 @@ class TdRepository(context: Context) {
                 senderId = s.userId
                 val u = users[s.userId]
                     ?: runCatching { exec(TdApi.GetUser(s.userId)) }
-                        .getOrNull()?.also { users[it.id] = it }
+                        .getOrNull()?.also { cacheUser(it) }
                 sender = u?.let { displayName(it) } ?: "user ${s.userId}"
             }
             is TdApi.MessageSenderChat -> {

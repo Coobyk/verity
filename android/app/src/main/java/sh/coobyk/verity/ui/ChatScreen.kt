@@ -121,7 +121,8 @@ fun ChatScreen(vm: AppViewModel, conv: Conversation) {
                         tint = MainText,
                     )
                 }
-                Column(Modifier.weight(1f)) {
+                UserAvatar(ui.avatars[conv.id], conv.title, 36.dp)
+                Column(Modifier.weight(1f).padding(start = 10.dp)) {
                     Text(
                         conv.title,
                         color = MainText,
@@ -179,7 +180,11 @@ fun ChatScreen(vm: AppViewModel, conv: Conversation) {
                 items(msgs, key = { it.id }, contentType = { "msg" }) { m ->
                     val enter = m.id > baseId && played.add(m.id)
                     val row: @Composable () -> Unit = {
-                        MessageRow(m, mine = me != null && m.senderId == me)
+                        MessageRow(
+                            m,
+                            mine = me != null && m.senderId == me,
+                            avatarPath = m.senderId?.let { ui.avatars[it] },
+                        )
                     }
                     if (enter) {
                         val appear = remember {
@@ -221,7 +226,7 @@ fun ChatScreen(vm: AppViewModel, conv: Conversation) {
 }
 
 @Composable
-private fun MessageRow(m: ChatMessage, mine: Boolean) {
+private fun MessageRow(m: ChatMessage, mine: Boolean, avatarPath: String?) {
     if (mine) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
             Box(
@@ -235,8 +240,10 @@ private fun MessageRow(m: ChatMessage, mine: Boolean) {
             }
         }
     } else {
-        Column(Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 6.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 6.dp)) {
+            UserAvatar(avatarPath, m.sender, 30.dp)
+            Column(Modifier.padding(start = 10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     m.sender,
                     color = DimText,
@@ -250,6 +257,7 @@ private fun MessageRow(m: ChatMessage, mine: Boolean) {
             }
             m.blocks.forEach {
                 MessageBlock(it, 21.sp, Modifier.padding(top = 2.dp))
+            }
             }
         }
     }

@@ -28,6 +28,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val connected: Boolean = false,
         /** One-shot message consumed by the snackbar; null when idle. */
         val status: String? = null,
+        /** userId -> local path of downloaded profile photo. */
+        val avatars: Map<Long, String> = emptyMap(),
     )
 
     private val repo = TdRepository(app)
@@ -58,6 +60,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { repo.dms.collect { v -> ui.update { it.copy(dms = v) } } }
         viewModelScope.launch {
             repo.connected.collect { v -> ui.update { it.copy(connected = v) } }
+        }
+        viewModelScope.launch {
+            repo.avatars.collect { v -> ui.update { it.copy(avatars = v) } }
         }
         viewModelScope.launch {
             repo.status.collect { v ->
