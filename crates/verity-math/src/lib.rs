@@ -15,10 +15,13 @@ use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
 use typst_layout::PagedDocument;
 
-/// Bundled fonts — Noto Sans Math (MATH table) + Noto Serif for \text{} runs.
+/// Bundled fonts — New Computer Modern (the classic TeX look):
+/// Math-Book for equations, CM10 regular/italic/bold for \text{} runs.
 static FONT_FILES: &[&[u8]] = &[
-    include_bytes!("../fonts/NotoSansMath-Regular.ttf"),
-    include_bytes!("../fonts/NotoSerif-Regular.ttf"),
+    include_bytes!("../fonts/NewCMMath-Book.otf"),
+    include_bytes!("../fonts/NewCM10-Regular.otf"),
+    include_bytes!("../fonts/NewCM10-Italic.otf"),
+    include_bytes!("../fonts/NewCM10-Bold.otf"),
 ];
 
 /// Vendored typst sources — mitex spec package + a per-render body file.
@@ -110,8 +113,8 @@ pub fn render_latex(tex: &str, display: bool, density: f32, dark: bool) -> Resul
     let color = if dark { "white" } else { "black" };
     let main_src = format!(
         "#set page(width: auto, height: auto, margin: 4pt, fill: none)\n\
-         #set text(fill: {color}, font: \"Noto Serif\")\n\
-         #show math.equation: set text(font: \"Noto Sans Math\")\n\
+         #set text(fill: {color}, font: \"New Computer Modern\")\n\
+         #show math.equation: set text(font: \"New Computer Modern Math\")\n\
          #import \"specs/mod.typ\": mitex-scope\n\
          #math.equation(block: {display}, eval(read(\"body.typ\"), mode: \"math\", scope: mitex-scope))"
     );
