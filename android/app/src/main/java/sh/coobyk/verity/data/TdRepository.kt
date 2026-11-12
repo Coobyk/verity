@@ -424,26 +424,39 @@ class TdRepository(context: Context) {
     }
 
     private suspend fun loadHistory(open: OpenConv) {
-        val arr = try {
-            if (open.topicId != 0L) {
-                // GetMessageThreadHistory wants a message id inside
-                // the thread, not the forumTopicId.
-                if (open.msgId == 0L) null
-                else exec(
-                    TdApi.GetMessageThreadHistory(
-                        open.chatId, open.msgId, 0L, 0, 100,
-                    ),
-                ).messages
-            } else {
-                exec(TdApi.GetChatHistory(open.chatId, 0L, 0, 50, false)).messages
+        // TDLib serves history from its local DB first — a single call
+        // can return just the last message while the rest is still
+        // fetching. Page backward (offset=0 re-includes fromMessageId,
+        // so drop it on later pages) until we're satisfied.
+        val all = ArrayList<TdApi.Message>()
+        try {
+            var from = 0L
+            while (all.size < 200 && openConv === open) {
+                val page = if (open.topicId != 0L) {
+                    // GetMessageThreadHistory wants a message id inside
+                    // the thread, not the forumTopicId.
+                    if (open.msgId == 0L) break
+                    exec(
+                        TdApi.GetMessageThreadHistory(
+                            open.chatId, open.msgId, from, 0, 100,
+                        ),
+                    ).messages
+                } else {
+                    exec(
+                        TdApi.GetChatHistory(open.chatId, from, 0, 100, false),
+                    ).messages
+                } ?: break
+                val fresh = if (from == 0L) page.toList() else page.drop(1)
+                if (fresh.isEmpty()) break
+                all += fresh
+                from = page.last().id
+                if (page.size < 100) break
             }
         } catch (e: Exception) {
             if (openConv === open) status.value = e.message ?: "Can't load history"
             return
         }
-        val rows = (arr ?: emptyArray())
-            .map { toChatMessage(it) }
-            .sortedBy { it.id }
+        val rows = all.map { toChatMessage(it) }.sortedBy { it.id }
         if (openConv === open) {
             messages.value = rows
         }
