@@ -153,12 +153,11 @@ fun ChatScreen(vm: AppViewModel, conv: Conversation) {
                 val wasEmpty = prevSize == 0
                 prevSize = msgs.size
                 if (msgs.isEmpty()) return@LaunchedEffect
-                val lastVisible =
-                    listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+                val firstVisible =
+                    listState.layoutInfo.visibleItemsInfo.firstOrNull()?.index ?: 0
                 when {
-                    wasEmpty -> listState.scrollToItem(msgs.size - 1)
-                    lastVisible >= msgs.size - 3 ->
-                        listState.animateScrollToItem(msgs.size - 1)
+                    wasEmpty -> listState.scrollToItem(0)
+                    firstVisible <= 2 -> listState.animateScrollToItem(0)
                 }
             }
             // Baseline = newest id once history loads; only messages
@@ -172,12 +171,21 @@ fun ChatScreen(vm: AppViewModel, conv: Conversation) {
                 }
             }
             val played = remember { HashSet<Long>() }
+            // reverseLayout anchors index 0 (newest) to the viewport bottom —
+            // when the IME shrinks the viewport the tail stays glued above
+            // the composer instead of sliding under it.
             LazyColumn(
                 state = listState,
+                reverseLayout = true,
                 modifier = Modifier.weight(1f).fillMaxWidth(),
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
             ) {
-                items(msgs, key = { it.id }, contentType = { "msg" }) { m ->
+                items(
+                    count = msgs.size,
+                    key = { msgs[msgs.size - 1 - it].id },
+                    contentType = { "msg" },
+                ) { i ->
+                    val m = msgs[msgs.size - 1 - i]
                     val enter = m.id > baseId && played.add(m.id)
                     val row: @Composable () -> Unit = {
                         MessageRow(
