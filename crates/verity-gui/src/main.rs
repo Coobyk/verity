@@ -60,6 +60,8 @@ enum Ev {
         dms: Vec<DmRow>,
         selected: Option<Sel>,
         messages: Vec<TopicMessage>,
+        /// Your own user id — messages carrying it render as "mine".
+        me: Option<i64>,
     },
     /// New messages for one view (ignored if not selected anymore).
     Messages {
@@ -177,6 +179,7 @@ async fn refresh_all(
     selected: &mut Option<Sel>,
     tx: &mpsc::Sender<Ev>,
 ) {
+    let me = tg.self_id().await.ok();
     match tg.list_topics(group).await {
         Ok(topics) => {
             *dms = build_dms(tg, group).await;
@@ -194,6 +197,7 @@ async fn refresh_all(
             };
             let _ = tx.send(Ev::Snapshot {
                 topics,
+                me,
                 dms: dms
                     .iter()
                     .map(|d| DmRow {
@@ -317,6 +321,8 @@ struct Root {
     dms: Vec<DmRow>,
     selected: Option<Sel>,
     messages: Vec<TopicMessage>,
+    /// Your user id — `sender_id == me` renders as your bubble.
+    me: Option<i64>,
     input: String,
     status: String,
     /// Id of the newest message shown — auto-scroll only on arrivals.
@@ -336,6 +342,7 @@ impl Root {
             dms: vec![],
             selected: None,
             messages: vec![],
+            me: None,
             input: String::new(),
             status: "connecting…".into(),
             last_msg: None,
@@ -388,9 +395,11 @@ impl Root {
                     dms,
                     selected,
                     messages,
+                    me,
                 } => {
                     self.topics = topics;
                     self.dms = dms;
+                    self.me = me.or(self.me);
                     self.selected = selected;
                     self.last_msg = messages.last().map(|m| m.id);
                     self.messages = messages;
@@ -510,17 +519,22 @@ impl Focusable for Root {
 impl Render for Root {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected;
-        let dim = rgb(0x8b949e);
-        let text = rgb(0xc9d1d9);
-        let accent = rgb(0x58a6ff);
-        let selected_bg = rgb(0x1f6feb);
-        let hover_bg = rgb(0x21262d);
+        let me = self.me;
+        // Grok's palette: pure-black canvas, near-invisible hairlines,
+        // X-grey dim text, dark pill bubbles for your own messages.
+        let dim = rgb(0x71767b);
+        let text = rgb(0xe7e9ea);
+        let hairline = rgb(0x2f3336);
+        let hover_bg = rgb(0x16181c);
+        let selected_bg = rgb(0x1e1f22);
+        let bubble = rgb(0x2f3336);
+        let composer_bg = rgb(0x16181c);
 
         let section = |label: &'static str| {
             div()
-                .px_2()
-                .pt_3()
-                .pb_1()
+                .px_4()
+                .pt_5()
+                .pb_2()
                 .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(dim)
@@ -529,30 +543,30 @@ impl Render for Root {
 
         let sidebar = div()
             .id("sidebar")
-            .w(px(230.0))
+            .w(px(264.0))
             .h_full()
-            .bg(rgb(0x161b22))
             .border_r_1()
-            .border_color(rgb(0x30363d))
+            .border_color(hairline)
             .overflow_y_scroll()
             .flex()
             .flex_col()
             .child(
                 div()
-                    .p_3()
-                    .text_lg()
-                    .font_weight(FontWeight::BOLD)
+                    .px_4()
+                    .py_4()
+                    .text_xl()
+                    .font_weight(FontWeight::SEMIBOLD)
                     .child("Verity"),
             )
-            .child(section("TOPICS"))
+            .child(section("Topics"))
             .children(self.topics.iter().map(|t| {
                 let id = t.id;
                 div()
                     .id(ElementId::Name(format!("topic-{id}").into()))
                     .mx_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
                     .cursor_pointer()
                     .when(selected == Some(Sel::Topic(id)), |d| d.bg(selected_bg))
                     .hover(|d| d.bg(hover_bg))
@@ -561,15 +575,15 @@ impl Render for Root {
                         this.select(Sel::Topic(id), cx);
                     }))
             }))
-            .child(section("DIRECT"))
+            .child(section("Direct"))
             .children(self.dms.iter().map(|d| {
                 let uid = d.user_id;
                 div()
                     .id(ElementId::Name(format!("dm-{uid}").into()))
                     .mx_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
                     .cursor_pointer()
                     .when(selected == Some(Sel::Dm(uid)), |d| d.bg(selected_bg))
                     .hover(|d| d.bg(hover_bg))
@@ -581,10 +595,10 @@ impl Render for Root {
             }));
 
         let header = div()
-            .h(px(44.0))
-            .px_4()
+            .h(px(52.0))
+            .px_5()
             .border_b_1()
-            .border_color(rgb(0x30363d))
+            .border_color(hairline)
             .flex()
             .items_center()
             .justify_between()
@@ -595,72 +609,123 @@ impl Render for Root {
             )
             .child(div().text_xs().text_color(dim).child(self.status.clone()));
 
+        // One centered reading column — Grok keeps the transcript
+        // narrow on wide windows instead of stretching edge to edge.
         let messages = div()
             .id("messages")
             .flex_1()
             .h_full()
-            .p_4()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
-            .flex()
-            .flex_col()
-            .gap_2()
-            .children(self.messages.iter().map(|m| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(div().text_xs().text_color(accent).child(m.sender.clone()))
-                            .child(div().text_xs().text_color(dim).child(hhmm(m.date))),
-                    )
-                    .child(div().text_color(text).child(m.text.clone()))
-            }))
-            .when(self.messages.is_empty(), |d| {
-                d.child(div().text_color(dim).child(if self.status.is_empty() {
-                    "no messages".to_string()
-                } else {
-                    self.status.clone()
-                }))
-            });
-
-        let hint = match self.selected {
-            Some(Sel::Topic(_)) => {
-                "Message this topic…  (Enter sends, Esc clears, ↑↓ switch, ⌃R refresh)"
-            }
-            Some(Sel::Dm(_)) => {
-                "Message the bot…  (Enter sends, Esc clears, ↑↓ switch, ⌃R refresh)"
-            }
-            None => "Select a topic or a bot…",
-        };
-        let composer = div()
-            .h(px(44.0))
-            .bg(rgb(0x161b22))
-            .border_t_1()
-            .border_color(rgb(0x30363d))
-            .px_4()
-            .flex()
-            .items_center()
             .child(
                 div()
-                    .text_color(if self.input.is_empty() { dim } else { text })
-                    .child(if self.input.is_empty() {
-                        hint.to_string()
-                    } else {
-                        format!("{}▌", self.input)
+                    .w_full()
+                    .max_w(px(720.0))
+                    .mx_auto()
+                    .px_5()
+                    .py_4()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .children(self.messages.iter().map(|m| {
+                        let mine = me.is_some() && m.sender_id == me;
+                        if mine {
+                            // Your message: dark pill, right edge, no
+                            // name tag — Grok trusts you know you.
+                            div()
+                                .flex()
+                                .justify_end()
+                                .child(
+                                    div()
+                                        .max_w(px(520.0))
+                                        .bg(bubble)
+                                        .rounded_2xl()
+                                        .px_4()
+                                        .py_2()
+                                        .text_color(text)
+                                        .child(m.text.clone()),
+                                )
+                        } else {
+                            // Theirs: bare text with a whispered name,
+                            // like Grok's own replies.
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(dim)
+                                                .child(m.sender.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(dim)
+                                                .child(hhmm(m.date)),
+                                        ),
+                                )
+                                .child(div().text_color(text).child(m.text.clone()))
+                        }
+                    }))
+                    .when(self.messages.is_empty(), |d| {
+                        d.child(div().text_color(dim).child(if self.status.is_empty() {
+                            "no messages".to_string()
+                        } else {
+                            self.status.clone()
+                        }))
                     }),
             );
+
+        let hint = match self.selected {
+            Some(Sel::Topic(_)) => "Message this topic",
+            Some(Sel::Dm(_)) => "Message the bot",
+            None => "Select a conversation",
+        };
+        // Grok's floating pill composer — detached from the edges,
+        // rounded, faint border, centred under the reading column.
+        let composer = div().px_5().pb_5().pt_2().child(
+            div()
+                .w_full()
+                .max_w(px(720.0))
+                .mx_auto()
+                .h(px(48.0))
+                .bg(composer_bg)
+                .border_1()
+                .border_color(hairline)
+                .rounded_full()
+                .px_5()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_color(if self.input.is_empty() { dim } else { text })
+                        .child(if self.input.is_empty() {
+                            format!("{hint}…")
+                        } else {
+                            format!("{}▌", self.input)
+                        }),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(dim)
+                        .child(if self.input.is_empty() { "" } else { "↵" }),
+                ),
+        );
 
         let chat = div()
             .flex_1()
             .h_full()
-            .bg(rgb(0x0d1117))
             .flex()
             .flex_col()
             .child(header)
-            .child(div().flex_1().h_full().flex().child(messages))
+            .child(messages)
             .child(composer);
 
         div()
@@ -671,6 +736,7 @@ impl Render for Root {
             }))
             .size_full()
             .flex()
+            .bg(black())
             .text_color(text)
             .child(sidebar)
             .child(chat)

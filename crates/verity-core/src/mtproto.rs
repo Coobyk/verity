@@ -108,6 +108,9 @@ pub struct TopicMessage {
     pub id: i32,
     pub date: i64,
     pub sender: String,
+    /// Bare user id of the author, when the message names one — the
+    /// GUI uses it to tell "my" messages from everyone else's.
+    pub sender_id: Option<i64>,
     pub text: String,
 }
 
@@ -631,9 +634,11 @@ impl Tg {
             .into_iter()
             .filter_map(|m| match m {
                 tl::enums::Message::Message(m) => {
-                    let sender = match m.from_id {
-                        Some(tl::enums::Peer::User(p)) => name_of(p.user_id),
-                        _ => "group".to_string(),
+                    let (sender, sender_id) = match m.from_id {
+                        Some(tl::enums::Peer::User(p)) => {
+                            (name_of(p.user_id), Some(p.user_id))
+                        }
+                        _ => ("group".to_string(), None),
                     };
                     // Media-only messages carry no text — mark them so
                     // "what do you see in this image" still has context.
@@ -651,6 +656,7 @@ impl Tg {
                         id: m.id,
                         date: m.date as i64,
                         sender,
+                        sender_id,
                         text,
                     })
                 }
@@ -676,8 +682,9 @@ impl Tg {
             if out.len() >= limit as usize {
                 break;
             }
-            let sender = m
-                .sender()
+            let from = m.sender();
+            let sender_id = from.as_ref().map(|s| s.id().bare_id());
+            let sender = from
                 .and_then(|s| {
                     s.name()
                         .or_else(|| s.username())
@@ -699,6 +706,7 @@ impl Tg {
                 id: m.id(),
                 date: m.date().timestamp(),
                 sender,
+                sender_id,
                 text,
             });
         }
@@ -1554,6 +1562,7 @@ impl Tg {
     /// `(id, date, sender, text)` shape history calls return, so a
     /// live event slots into the same view as fetched history.
     fn topic_message(m: &Message) -> TopicMessage {
+        let sender_id = m.sender().map(|s| s.id().bare_id());
         let sender = m
             .sender()
             .and_then(|s| {
@@ -1577,6 +1586,7 @@ impl Tg {
             id: m.id(),
             date: m.date().timestamp(),
             sender,
+            sender_id,
             text,
         }
     }
