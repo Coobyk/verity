@@ -35,12 +35,17 @@ data class DirectChat(
     val available: Boolean,
 )
 
+sealed interface MsgBlock {
+    data class Text(val ft: TdApi.FormattedText) : MsgBlock
+    data class Math(val tex: String, val display: Boolean) : MsgBlock
+}
+
 data class ChatMessage(
     val id: Long,
     val date: Long, // epoch seconds
     val sender: String,
     val senderId: Long?,
-    val text: TdApi.FormattedText,
+    val blocks: List<MsgBlock>,
 )
 
 enum class ConversationKind { TOPIC, DM }
@@ -188,10 +193,10 @@ class TdRepository(context: Context) {
                 val open = openConv
                 if (open != null && u.chatId == open.chatId) {
                     scope.launch {
-                        val newText = contentFormatted(u.chatId, u.messageId, u.newContent)
+                        val newBlocks = contentBlocks(u.chatId, u.messageId, u.newContent)
                         messages.update { list ->
                             list.map {
-                                if (it.id == u.messageId) it.copy(text = newText) else it
+                                if (it.id == u.messageId) it.copy(blocks = newBlocks) else it
                             }
                         }
                     }
@@ -535,17 +540,17 @@ class TdRepository(context: Context) {
             date = m.date.toLong(),
             sender = sender,
             senderId = senderId,
-            text = contentFormatted(m.chatId, m.id, m.content),
+            blocks = contentBlocks(m.chatId, m.id, m.content),
         )
     }
 
-    private suspend fun contentFormatted(
+    private suspend fun contentBlocks(
         chatId: Long,
         messageId: Long,
         content: TdApi.MessageContent,
-    ): TdApi.FormattedText =
+    ): List<MsgBlock> =
         when (val c = content) {
-            is TdApi.MessageText -> c.text
+            is TdApi.MessageText -> textOnly(c.text)
             is TdApi.MessageRichMessage -> {
                 var rm = c.message
                 if (!rm.isFull) {
@@ -553,23 +558,25 @@ class TdRepository(context: Context) {
                         exec(TdApi.GetFullRichMessage(chatId, messageId))
                     }.getOrNull() ?: rm
                 }
-                richToFormatted(rm)
+                richToBlocks(rm)
             }
-            is TdApi.MessagePhoto -> orCaption(c.caption, "[photo]")
-            is TdApi.MessageVideo -> orCaption(c.caption, "[video]")
-            is TdApi.MessageDocument -> orCaption(
-                c.caption, c.document.fileName.ifBlank { "[file]" },
+            is TdApi.MessagePhoto -> textOnly(orCaption(c.caption, "[photo]"))
+            is TdApi.MessageVideo -> textOnly(orCaption(c.caption, "[video]"))
+            is TdApi.MessageDocument -> textOnly(
+                orCaption(c.caption, c.document.fileName.ifBlank { "[file]" }),
             )
-            is TdApi.MessageVoiceNote -> orCaption(c.caption, "[voice]")
-            else -> plain(
+            is TdApi.MessageVoiceNote -> textOnly(orCaption(c.caption, "[voice]"))
+            else -> textOnly(plain(
                 when (c) {
                     is TdApi.MessageSticker -> "[sticker ${c.sticker.emoji}]"
                     is TdApi.MessageAnimatedEmoji -> c.emoji
                     is TdApi.MessagePoll -> "[poll]"
                     else -> "[${c.javaClass.simpleName.removePrefix("Message")}]"
                 },
-            )
+            ))
         }
+
+    private fun textOnly(ft: TdApi.FormattedText) = listOf(MsgBlock.Text(ft))
 
     private fun orCaption(ft: TdApi.FormattedText, fallback: String): TdApi.FormattedText =
         if (ft.text.isBlank()) plain(fallback) else ft
@@ -581,6 +588,15 @@ class TdRepository(context: Context) {
     private class Flatten {
         val sb = StringBuilder()
         val entities = mutableListOf<TdApi.TextEntity>()
+        val blocks = mutableListOf<MsgBlock>()
+
+        /** Emits the pending text run as a Text block and resets the builder. */
+        fun flush() {
+            val ft = result()
+            if (ft.text.isNotBlank()) blocks += MsgBlock.Text(ft)
+            sb.clear()
+            entities.clear()
+        }
 
         fun span(type: TdApi.TextEntityType, body: () -> Unit) {
             val start = sb.length
@@ -621,7 +637,10 @@ class TdRepository(context: Context) {
                         rich(rt.text)
                     }
                 is TdApi.RichTextCustomEmoji -> sb.append(rt.alternativeText)
-                is TdApi.RichTextMathematicalExpression -> sb.append(rt.expression)
+                is TdApi.RichTextMathematicalExpression -> {
+                    flush()
+                    blocks += MsgBlock.Math(rt.expression, display = false)
+                }
                 is TdApi.RichTextIcon -> Unit
                 is TdApi.RichTextAnchor -> Unit
                 is TdApi.RichTextButton -> rich(rt.button.text)
@@ -663,10 +682,10 @@ class TdRepository(context: Context) {
                         .also { br(nl) }
                 is TdApi.PageBlockPreformatted ->
                     span(TdApi.TextEntityTypePre()) { rich(b.text) }.also { br(nl) }
-                is TdApi.PageBlockMathematicalExpression ->
-                    span(TdApi.TextEntityTypeCode()) {
-                        sb.append(b.expression)
-                    }.also { br(nl) }
+                is TdApi.PageBlockMathematicalExpression -> {
+                    flush()
+                    blocks += MsgBlock.Math(b.expression, display = true)
+                }
                 is TdApi.PageBlockBlockQuote -> {
                     b.blocks.forEach { block(it, depth + 1) }
                     b.credit?.let {
@@ -763,10 +782,11 @@ class TdRepository(context: Context) {
         }
     }
 
-    private fun richToFormatted(rm: TdApi.RichMessage): TdApi.FormattedText {
+    private fun richToBlocks(rm: TdApi.RichMessage): List<MsgBlock> {
         val f = Flatten()
         rm.blocks.forEach { f.block(it) }
-        return f.result()
+        f.flush()
+        return f.blocks
     }
 
     private fun displayName(u: TdApi.User): String =

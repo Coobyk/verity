@@ -1,0 +1,16 @@
+[package]
+name = "verity-math"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+jni = "0.21"
+typst = "0.15"
+typst-render = "0.15"
+mitex = "0.2.4"
+once_cell = "1"
+mitex-spec-gen = "0.2.4"
+typst-layout = "0.15"

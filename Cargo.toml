@@ -6,6 +6,7 @@ members = [
     "crates/verity-pfp",
     "crates/verity-pfp-wasm",
     "crates/verity-gui",
+    "crates/verity-math",
 ]
 
 # xattr 0.2.3 (via zed-async-tar → gpui) references libc::ENOATTR,

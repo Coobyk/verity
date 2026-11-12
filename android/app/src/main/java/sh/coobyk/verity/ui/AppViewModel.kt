@@ -10,6 +10,7 @@ import org.drinkless.tdlib.TdApi
 import sh.coobyk.verity.data.ChatMessage
 import sh.coobyk.verity.data.Conversation
 import sh.coobyk.verity.data.DirectChat
+import sh.coobyk.verity.data.MsgBlock
 import sh.coobyk.verity.data.TdRepository
 import sh.coobyk.verity.data.Topic
 
@@ -118,7 +119,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             date = System.currentTimeMillis() / 1000,
             sender = "You",
             senderId = ui.value.me,
-            text = TdApi.FormattedText(trimmed, null),
+            blocks = listOf(MsgBlock.Text(TdApi.FormattedText(trimmed, null))),
         )
 
         viewModelScope.launch {

@@ -1,7 +1,11 @@
 package sh.coobyk.verity.ui
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.util.LruCache
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -11,6 +15,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
@@ -36,12 +41,15 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.material3.LocalTextStyle
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -54,12 +62,17 @@ import androidx.compose.ui.text.withStyle
 import org.drinkless.tdlib.TdApi
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import sh.coobyk.verity.data.ChatMessage
 import sh.coobyk.verity.data.Conversation
 import sh.coobyk.verity.data.ConversationKind
+import sh.coobyk.verity.data.MsgBlock
+import sh.coobyk.verity.math.TypstBridge
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -159,7 +172,7 @@ private fun MessageRow(m: ChatMessage, mine: Boolean) {
                     .background(BubbleFill)
                     .padding(horizontal = 14.dp, vertical = 9.dp),
             ) {
-                Text(styled(m.text), color = MainText, fontSize = 15.sp, lineHeight = 20.sp)
+                Column { m.blocks.forEach { MessageBlock(it, 20.sp) } }
             }
         }
     } else {
@@ -176,12 +189,78 @@ private fun MessageRow(m: ChatMessage, mine: Boolean) {
                 Spacer(Modifier.width(6.dp))
                 Text(formatTime(m.date), color = DimText, fontSize = 12.sp)
             }
-            Text(
-                styled(m.text),
-                color = MainText,
-                fontSize = 15.sp,
-                lineHeight = 21.sp,
-                modifier = Modifier.padding(top = 2.dp),
+            m.blocks.forEach {
+                MessageBlock(it, 21.sp, Modifier.padding(top = 2.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun MessageBlock(
+    b: MsgBlock,
+    lineHeight: TextUnit,
+    modifier: Modifier = Modifier,
+) {
+    when (b) {
+        is MsgBlock.Text -> Text(
+            styled(b.ft),
+            color = MainText,
+            fontSize = 15.sp,
+            lineHeight = lineHeight,
+            modifier = modifier,
+        )
+        is MsgBlock.Math -> MathView(b.tex, b.display, lineHeight)
+    }
+}
+
+private object MathBitmaps {
+    val cache = LruCache<String, Bitmap>(64)
+}
+
+@Composable
+private fun MathView(tex: String, display: Boolean, lineHeight: TextUnit) {
+    val density = LocalDensity.current
+    val key = "${if (display) "d" else "i"}:$tex"
+    val bmp by produceState<Bitmap?>(MathBitmaps.cache.get(key), tex, display, density) {
+        if (value == null) {
+            value = withContext(Dispatchers.Default) {
+                runCatching {
+                    TypstBridge.render(tex, display, density.density)
+                        ?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
+                }.getOrNull()?.also { MathBitmaps.cache.put(key, it) }
+            }
+        }
+    }
+    val b = bmp
+    if (b == null) {
+        Text(
+            buildAnnotatedString {
+                withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) {
+                    append(tex)
+                }
+            },
+            color = MainText,
+            fontSize = 13.5.sp,
+        )
+    } else {
+        val img = remember(b) { b.asImageBitmap() }
+        if (display) {
+            Box(
+                Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Image(
+                    img,
+                    contentDescription = tex,
+                    modifier = Modifier.widthIn(max = 560.dp),
+                )
+            }
+        } else {
+            Image(
+                img,
+                contentDescription = tex,
+                modifier = Modifier.height(with(density) { (lineHeight * 1.4f).toDp() }),
             )
         }
     }
