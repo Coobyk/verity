@@ -1,6 +1,18 @@
 [workspace]
 resolver = "2"
-members = ["crates/verity-core", "crates/verity-cli", "crates/verity-pfp", "crates/verity-pfp-wasm"]
+members = [
+    "crates/verity-core",
+    "crates/verity-cli",
+    "crates/verity-pfp",
+    "crates/verity-pfp-wasm",
+    "crates/verity-gui",
+]
+
+# xattr 0.2.3 (via zed-async-tar → gpui) references libc::ENOATTR,
+# which newer libc removed on Linux (the real errno is ENODATA).
+# Vendored copy carries the one-line per-OS fix.
+[patch.crates-io]
+xattr = { path = "vendor/xattr-0.2.3" }
 
 [workspace.package]
 version = "0.1.0"

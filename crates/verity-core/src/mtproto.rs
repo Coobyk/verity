@@ -5,8 +5,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use grammers_client::client::updates::UpdateStream;
 use grammers_client::types::{Media, Message, PasswordToken};
-use grammers_client::{Client, InputMessage};
+use grammers_client::{Client, InputMessage, UpdatesConfiguration};
 use grammers_mtsender::{InvocationError, SenderPool};
 use grammers_session::defs::{PeerAuth, PeerInfo, PeerRef, UpdateState, UpdatesState};
 use grammers_session::storages::SqliteSession;
@@ -37,6 +38,9 @@ pub struct Tg {
     // held so the pool keeps a live session for its lifetime
     session: Arc<SqliteSession>,
     client: Client,
+    // the pool's update feed — claimed at connect so socket events
+    // aren't dropped on the floor; `updates()` drains it
+    updates: tokio::sync::Mutex<UpdateStream>,
     api_id: i32,
     api_hash: String,
 }
@@ -107,6 +111,38 @@ pub struct TopicMessage {
     pub text: String,
 }
 
+/// One row of the account's chat list — the GUI's sidebar. Unlike
+/// [`GroupInfo`] this covers user DMs too, so bot conversations
+/// show up alongside groups.
+#[derive(Debug, Clone)]
+pub struct DialogInfo {
+    /// Bot-API style chat id — same shape [`GroupInfo::chat_id`].
+    pub chat_id: i64,
+    pub title: String,
+    pub peer: PeerRef,
+    /// True when this dialog is a bot account.
+    pub is_bot: bool,
+    /// `private` for user DMs; `forum`/`group`/`chat`/`channel`
+    /// otherwise, matching [`GroupInfo::kind`].
+    pub kind: &'static str,
+}
+
+/// A normalized nudge for the GUI — enough to know which chat
+/// stream to refresh.
+#[derive(Debug, Clone)]
+pub enum TgEvent {
+    /// A new or edited message landed in `chat_hint` (Bot-API style
+    /// id). `topic` is the forum topic id when the message lives in
+    /// one; `None` for DMs and the pre-forum/general stream.
+    Message {
+        chat_hint: i64,
+        topic: Option<i64>,
+        msg: TopicMessage,
+    },
+    /// Anything else Telegram pushed (reads, typing, pins…).
+    Other,
+}
+
 /// A bot sitting in the group — member or admin. `input` is what
 /// `channels.editBanned` needs to kick it.
 #[derive(Debug, Clone)]
@@ -149,10 +185,21 @@ impl Tg {
         crate::config::chmod_private(session_path); // user session = full account access
         let pool = SenderPool::new(session.clone(), api_id);
         let client = Client::new(&pool);
+        // Claim the pool's update feed — with no receiver holding it,
+        // socket events would be dropped silently. `catch_up` replays
+        // messages that arrived while we were offline.
+        let updates = client.stream_updates(
+            pool.updates,
+            UpdatesConfiguration {
+                catch_up: true,
+                ..Default::default()
+            },
+        );
         tokio::spawn(pool.runner.run());
         Ok(Self {
             session,
             client,
+            updates: tokio::sync::Mutex::new(updates),
             api_id,
             api_hash,
         })
@@ -351,6 +398,25 @@ impl Tg {
         Err(Error::Mtproto(format!("no group matches '{id_or_title}'")))
     }
 
+    /// Resolve a bare user id to a [`PeerRef`] by scanning the dialog
+    /// list — how the GUI opens a DM with a bot knowing only its id
+    /// (the dialogs fetch supplies the access hash).
+    pub async fn peer_for_user(&self, user_id: i64) -> Result<PeerRef> {
+        use grammers_client::types::Peer;
+        let mut dialogs = self.client.iter_dialogs();
+        while let Some(dialog) = dialogs
+            .next()
+            .await
+            .map_err(|e| Error::Mtproto(format!("dialogs: {e}")))?
+        {
+            let peer = dialog.peer();
+            if matches!(peer, Peer::User(_)) && peer.id().bare_id() == user_id {
+                return Ok(PeerRef::from(peer));
+            }
+        }
+        Err(Error::Mtproto(format!("no dialog for user {user_id}")))
+    }
+
     /// List every group/channel in your dialogs with Bot-API chat ids —
     /// answers "what's my group_id" without external tools.
     pub async fn list_groups(&self) -> Result<Vec<GroupInfo>> {
@@ -387,6 +453,39 @@ impl Tg {
                 Peer::User(_) => continue,
             };
             out.push(info);
+        }
+        Ok(out)
+    }
+
+    /// Every dialog in the account's chat list — the GUI's sidebar.
+    /// [`Self::list_groups`]'s superset: user DMs (bots included) come
+    /// along too.
+    pub async fn list_dialogs(&self) -> Result<Vec<DialogInfo>> {
+        use grammers_client::types::Peer;
+        let mut out = Vec::new();
+        let mut dialogs = self.client.iter_dialogs();
+        while let Some(dialog) = dialogs
+            .next()
+            .await
+            .map_err(|e| Error::Mtproto(format!("dialogs: {e}")))?
+        {
+            let peer = dialog.peer();
+            let (is_bot, kind) = match peer {
+                Peer::User(u) => (u.is_bot(), "private"),
+                Peer::Group(g) if g.is_megagroup() => {
+                    let is_forum = matches!(&g.raw, tl::enums::Chat::Channel(c) if c.forum);
+                    (false, if is_forum { "forum" } else { "group" })
+                }
+                Peer::Group(_) => (false, "chat"),
+                Peer::Channel(_) => (false, "channel"),
+            };
+            out.push(DialogInfo {
+                chat_id: peer.id().bot_api_dialog_id(),
+                title: peer.name().unwrap_or_default().to_string(),
+                peer: PeerRef::from(peer),
+                is_bot,
+                kind,
+            });
         }
         Ok(out)
     }
@@ -1449,6 +1548,85 @@ impl Tg {
             .await
             .map_err(|e| Error::Mtproto(format!("send: {e}")))?;
         Ok(())
+    }
+
+    /// Rebuild a `NewMessage`/`MessageEdited` payload into the
+    /// `(id, date, sender, text)` shape history calls return, so a
+    /// live event slots into the same view as fetched history.
+    fn topic_message(m: &Message) -> TopicMessage {
+        let sender = m
+            .sender()
+            .and_then(|s| {
+                s.name()
+                    .or_else(|| s.username())
+                    .map(str::to_string)
+                    .or_else(|| Some(s.id().bare_id().to_string()))
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        let text = if m.text().is_empty() {
+            match m.media() {
+                Some(Media::Photo(_)) => "[image]".into(),
+                Some(Media::Document(_)) => "[file]".into(),
+                Some(_) => "[media]".into(),
+                None => String::new(),
+            }
+        } else {
+            m.text().to_string()
+        };
+        TopicMessage {
+            id: m.id(),
+            date: m.date().timestamp(),
+            sender,
+            text,
+        }
+    }
+
+    /// Drain the update queue — every event received since the last
+    /// poll, normalized for the GUI ("something new in chat X topic
+    /// Y — refresh it"). `UpdateStream::next` blocks until the socket
+    /// delivers; the short timeout turns it into a drain: queued
+    /// events pop instantly and one empty wait marks the queue dry.
+    /// Cancelling `next` mid-wait is safe — processed updates stay
+    /// buffered inside the stream.
+    pub async fn updates(&self) -> Result<Vec<TgEvent>> {
+        use grammers_client::Update;
+        let mut stream = self.updates.lock().await;
+        let mut out = Vec::new();
+        loop {
+            let update =
+                match tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
+                    .await
+                {
+                    Ok(Ok(u)) => u,
+                    // Once events are in hand a stream error only means
+                    // "the rest didn't arrive" — return what we got.
+                    Ok(Err(e)) if !out.is_empty() => {
+                        eprintln!("updates: {e}");
+                        break;
+                    }
+                    Ok(Err(e)) => return Err(Error::Mtproto(format!("updates: {e}"))),
+                    Err(_) => break,
+                };
+            out.push(match update {
+                Update::NewMessage(m) | Update::MessageEdited(m) => {
+                    // Forum posts carry the topic id as reply_to_top_id;
+                    // DMs and plain replies never set it.
+                    let topic = match m.reply_header() {
+                        Some(tl::enums::MessageReplyHeader::Header(h)) => {
+                            h.reply_to_top_id.map(|t| t as i64)
+                        }
+                        _ => None,
+                    };
+                    TgEvent::Message {
+                        chat_hint: m.peer_id().bot_api_dialog_id(),
+                        topic,
+                        msg: Self::topic_message(&m),
+                    }
+                }
+                _ => TgEvent::Other,
+            });
+        }
+        Ok(out)
     }
 }
 
