@@ -106,7 +106,7 @@ fun ChatScreen(vm: AppViewModel, conv: Conversation) {
 
     // Centered max-width column like the desktop client.
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
-        Column(Modifier.widthIn(max = 680.dp).fillMaxSize()) {
+        Column(Modifier.widthIn(max = 680.dp).fillMaxSize().imePadding()) {
             // Header
             Row(
                 Modifier
@@ -351,7 +351,6 @@ private fun Composer(
     Surface(
         modifier = Modifier
             .fillMaxWidth()
-            .imePadding()
             .padding(horizontal = 12.dp, vertical = 10.dp),
         shape = RoundedCornerShape(28.dp),
         color = ComposerFill,
