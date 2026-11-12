@@ -96,7 +96,10 @@ fn capsule(c: f64, w: f64, h: f64, tilt: f64) -> Vec<(f64, f64)> {
     (0..32)
         .map(|i| {
             let (a, sgn) = if i < 16 {
-                (std::f64::consts::PI + i as f64 * std::f64::consts::PI / 16.0, -1.0)
+                (
+                    std::f64::consts::PI + i as f64 * std::f64::consts::PI / 16.0,
+                    -1.0,
+                )
             } else {
                 ((i - 16) as f64 * std::f64::consts::PI / 16.0, 1.0)
             };
@@ -132,14 +135,14 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>) -> Result<Vec<u8>> {
     // every shape is a vertex loop (circles → 48-gons); circumradius
     // scaled so the bbox lands near 2r
     let verts = match rng.u(8) {
-        0 => ngon(48, c, r, 0.0), // circle
+        0 => ngon(48, c, r, 0.0),                                      // circle
         1 => ngon(4, c, r * 1.35, std::f64::consts::FRAC_PI_4 + tilt), // square
-        2 => ngon(3, c, r * 1.16, up),                               // triangle
-        3 => ngon(5, c, r * 1.05, up),                               // pentagon
-        4 => ngon(6, c, r, tilt),                                    // hexagon
-        5 => star(c, r * 1.1, up),                                   // star
-        6 => capsule(c, r * 1.25, r * 2.0, tilt),                    // capsule
-        _ => ngon(4, c, r * 1.41, tilt),                             // diamond
+        2 => ngon(3, c, r * 1.16, up),                                 // triangle
+        3 => ngon(5, c, r * 1.05, up),                                 // pentagon
+        4 => ngon(6, c, r, tilt),                                      // hexagon
+        5 => star(c, r * 1.1, up),                                     // star
+        6 => capsule(c, r * 1.25, r * 2.0, tilt),                      // capsule
+        _ => ngon(4, c, r * 1.41, tilt),                               // diamond
     };
 
     // rasterize → blur → threshold → trace — the metaball goo on a
@@ -153,8 +156,8 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>) -> Result<Vec<u8>> {
         return Err(PfpError::Other("pfp: empty shape".into()));
     }
 
-    let mut px =
-        Pixmap::new(size, size).ok_or_else(|| PfpError::Other("pfp: pixmap alloc failed".into()))?;
+    let mut px = Pixmap::new(size, size)
+        .ok_or_else(|| PfpError::Other("pfp: pixmap alloc failed".into()))?;
     px.fill(Color::from_rgba8(bgc.0, bgc.1, bgc.2, 255));
 
     let mut paint = Paint::default();
@@ -278,10 +281,16 @@ fn trace(f: &[f32], mw: usize) -> Vec<Vec<(f64, f64)>> {
     let pts_of = |f: &[f32], e: usize| -> (f64, f64) {
         if e < mw * mw {
             let (ex, ey) = (e % mw, e / mw);
-            (ex as f64 + interp(f[ey * mw + ex], f[ey * mw + ex + 1]), ey as f64)
+            (
+                ex as f64 + interp(f[ey * mw + ex], f[ey * mw + ex + 1]),
+                ey as f64,
+            )
         } else {
             let (ex, ey) = ((e - mw * mw) % mw, (e - mw * mw) / mw);
-            (ex as f64, ey as f64 + interp(f[ey * mw + ex], f[(ey + 1) * mw + ex]))
+            (
+                ex as f64,
+                ey as f64 + interp(f[ey * mw + ex], f[(ey + 1) * mw + ex]),
+            )
         }
     };
     for y in 0..mw - 1 {
@@ -346,7 +355,11 @@ fn trace(f: &[f32], mw: usize) -> Vec<Vec<(f64, f64)>> {
         {
             used[nid] = true;
             let sg = segs[nid];
-            let (exit_pt, exit_edge) = if sg.0 == edge { (sg.3, sg.1) } else { (sg.2, sg.0) };
+            let (exit_pt, exit_edge) = if sg.0 == edge {
+                (sg.3, sg.1)
+            } else {
+                (sg.2, sg.0)
+            };
             loop_pts.push(exit_pt);
             edge = exit_edge;
         }

@@ -109,6 +109,11 @@ const BOT_SWEEP: Duration = Duration::from_secs(10);
 /// instance owns the token we keep one probe per this interval so we
 /// resume on our own if the other poller ever goes away.
 const CONFLICT_BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// A poll loop's heartbeat may go quiet for at most this long before
+/// the supervisor declares it wedged and kills it. Kept above
+/// `CONFLICT_BACKOFF_MAX` + the 30s getUpdates long-poll so a standby
+/// loop waiting out a token conflict isn't mistaken for dead.
+const LOOP_STALL: u64 = 420;
 /// Default `~/verity` → General backup cadence while `serve` runs;
 /// `VERITY_BACKUP_EVERY` (seconds) overrides, `0` disables.
 const DEFAULT_BACKUP_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
@@ -158,25 +163,54 @@ impl Bridge {
         // Supervisor: run a loop per bot in the store, and pick up bots
         // registered later (`bot new` or a `:::bot_new:::` marker) without
         // a restart.
-        let running = std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashSet::<String>::new(),
-        ));
+        // A live loop: its task handle (abort on wedge, reap on death)
+        // plus a heartbeat the poll loop stamps every iteration.
+        struct LoopEntry {
+            handle: tokio::task::JoinHandle<()>,
+            beat: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        }
+        let running = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            LoopEntry,
+        >::new()));
         loop {
             let bots = db_call(&env.db, |s| s.list_bots())
                 .await
                 .unwrap_or_default();
+            {
+                // Reap the dead, then kill the wedged. A finished
+                // handle means the loop exited (an unregistered record
+                // stays gone — the sweep just won't respawn it). A
+                // stale beat means the task is stuck inside a call —
+                // abort it so the spawn below gives the bot a fresh
+                // loop.
+                let now = now_secs();
+                let mut map = running.lock().unwrap();
+                map.retain(|_, e| !e.handle.is_finished());
+                map.retain(|name, e| {
+                    let age = now.saturating_sub(e.beat.load(std::sync::atomic::Ordering::Relaxed));
+                    if age > LOOP_STALL {
+                        warn!(bot = %name, silent_secs = age, "loop wedged — killing for respawn");
+                        e.handle.abort();
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
             if bots.is_empty() && running.lock().unwrap().is_empty() {
                 warn!("no bots registered — `verity bot new`");
             }
             for bot in bots {
-                if !running.lock().unwrap().insert(bot.name.clone()) {
+                if running.lock().unwrap().contains_key(&bot.name) {
                     continue;
                 }
-                let (env, running2) = (env.clone(), running.clone());
+                let beat = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now_secs()));
+                let (env, running2, beat2) = (env.clone(), running.clone(), beat.clone());
                 let bot_name = bot.name.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     loop {
-                        match run_bot(&bot, &env).await {
+                        match run_bot(&bot, &env, &beat2).await {
                             Ok(()) => break, // clean exit (only if polling ends gracefully)
                             Err(e) => {
                                 warn!(bot = %bot.name, error = %e, "bot loop failed, restarting in 10s");
@@ -185,9 +219,13 @@ impl Bridge {
                         }
                     }
                     // Free the slot — if the record still exists the
-                    // sweep respawns us; a /reset'd bot stays gone.
+                    // sweep respawns us; a reset bot stays gone.
                     running2.lock().unwrap().remove(&bot.name);
                 });
+                running
+                    .lock()
+                    .unwrap()
+                    .insert(bot_name.clone(), LoopEntry { handle, beat });
                 info!(bot = %bot_name, "loop started");
             }
             tokio::time::sleep(BOT_SWEEP).await;
@@ -195,7 +233,14 @@ impl Bridge {
     }
 }
 
-async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+async fn run_bot(bot: &Bot, env: &Env, beat: &std::sync::atomic::AtomicU64) -> Result<()> {
     let api = BotApi::new(&bot.token);
     let me = api.get_me().await?;
     info!(bot = %bot.name, username = ?me.username, "polling");
@@ -257,9 +302,12 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
     }
 
     loop {
+        // Prove liveness to the supervisor's watchdog — a stale beat
+        // (hung HTTP, deadlocked task) gets us aborted and respawned.
+        beat.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
         // Self-terminate if this bot was removed from the store (e.g.
-        // by a /reset) — otherwise the supervisor keeps us alive. The
-        // fresh record also catches a recreated topic: reset deletes
+        // by a confirmed reset) — otherwise the supervisor keeps us
+        // alive. The fresh record also catches a recreated topic: reset deletes
         // ours and makes a new one we should start listening to.
         let n = bot.name.clone();
         match db_call(&env.db, move |s| s.get_bot(&n)).await {
@@ -308,9 +356,9 @@ async fn run_bot(bot: &Bot, env: &Env) -> Result<()> {
         };
         for update in updates {
             offset = update.update_id + 1;
-            // Confirm-button clicks for the destructive commands —
-            // they land wherever the command was run: our topic or the
-            // owner's DM.
+            // Confirm-button clicks for agent-requested destructive
+            // ops — they land wherever the quiz was posted: our topic
+            // or the owner's DM.
             if let Some(cb) = update.callback_query {
                 if let (Some(data), Some(m)) = (cb.data, cb.message) {
                     let dm = m.chat.id > 0 && env.owner_id == Some(m.chat.id);
@@ -445,77 +493,6 @@ async fn handle_message(
             return;
         }
     }
-    // In-chat commands — destructive, so they confirm via an
-    // inline button before anything runs. Same set in the topic and
-    // the owner's DM (only the owner ever reaches this in a DM).
-    let cmd = text
-        .strip_prefix('/')
-        .map(|c| c.split_whitespace().next().unwrap_or(""));
-    if let Some(cmd) = cmd {
-        let ask = match cmd {
-            "backup" => {
-                // Not destructive — no quiz-confirm needed.
-                let note = match crate::backup::upload(api, env.group_id).await {
-                    Ok(files) => {
-                        format!("🗄 backed up {} to General", files.join(", "))
-                    }
-                    Err(e) => format!("⚠️ backup failed: {e}"),
-                };
-                let _ = api
-                    .send_message(chat_id, &note, thread, Some(msg.message_id))
-                    .await;
-                return;
-            }
-            "clear" => "Wipe my memory? Can't undo this.",
-            "clearchat" => {
-                "Delete every message in this chat AND wipe my memory? Can't undo."
-            }
-            "reset" => "Nuke EVERYTHING — all topics, all messages, every bot but me, all memory? Can't undo.",
-            _ => "",
-        };
-        if !ask.is_empty() {
-            // Quiz-confirm: pick the right answer among decoys.
-            let mut rng = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos() as u64)
-                .unwrap_or(1);
-            let mut next = || {
-                rng ^= rng << 13;
-                rng ^= rng >> 7;
-                rng ^= rng << 17;
-                rng
-            };
-            let (a, b) = (2 + next() % 8, 2 + next() % 8);
-            let ans = a + b;
-            let mut opts: Vec<u64> = vec![ans];
-            while opts.len() < 4 {
-                let d = (ans as i64 + (next() % 7) as i64 - 3).max(0) as u64;
-                if !opts.contains(&d) {
-                    opts.push(d);
-                }
-            }
-            for i in (1..opts.len()).rev() {
-                opts.swap(i, (next() as usize) % (i + 1));
-            }
-            let row: Vec<(String, String)> = opts
-                .iter()
-                .map(|o| {
-                    let verdict = if *o == ans { "ok" } else { "no" };
-                    (o.to_string(), format!("v:{cmd}:{verdict}"))
-                })
-                .collect();
-            let prompt = format!("{ask}\n\nTo confirm, tap the answer to {a} + {b}:");
-            let _ = api
-                .send_buttons(
-                    chat_id,
-                    &prompt,
-                    thread,
-                    &[row, vec![("Cancel".into(), "v:cancel".into())]],
-                )
-                .await;
-            return;
-        }
-    }
     debug!(bot = %bot.name, %text, "turn request");
     // Acknowledge immediately — queued behind other turns, the 🕒 says
     // "seen, will get to it". `handle_turn` swaps it to 👀 on start.
@@ -591,8 +568,62 @@ async fn dm_peer(env: &Env, api: &BotApi, bot: &Bot) -> Option<PeerRef> {
     Some(p)
 }
 
-/// Execute a confirmed destructive command (button click landed where
-/// the command ran — our topic or the owner's DM). `confirm_mid` is the
+/// Post the arithmetic quiz that gates a destructive op. Triggered by
+/// the agent's `:::clear|clearchat|reset:::` markers — Verity asks, a
+/// human confirms; the op never runs on the agent's word alone.
+/// `v:{cmd}:{verdict}` callbacks land wherever the quiz was posted.
+async fn ask_quiz(api: &BotApi, chat_id: i64, thread: Option<i64>, cmd: &str) {
+    let ask = match cmd {
+        "clear" => "Wipe my memory? Can't undo this.",
+        "clearchat" => "Delete every message in this chat AND wipe my memory? Can't undo.",
+        "reset" => {
+            "Nuke EVERYTHING — all topics, all messages, every bot but me, all memory? Can't undo."
+        }
+        _ => return,
+    };
+    // Quiz-confirm: pick the right answer among decoys.
+    let mut rng = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(1);
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let (a, b) = (2 + next() % 8, 2 + next() % 8);
+    let ans = a + b;
+    let mut opts: Vec<u64> = vec![ans];
+    while opts.len() < 4 {
+        let d = (ans as i64 + (next() % 7) as i64 - 3).max(0) as u64;
+        if !opts.contains(&d) {
+            opts.push(d);
+        }
+    }
+    for i in (1..opts.len()).rev() {
+        opts.swap(i, (next() as usize) % (i + 1));
+    }
+    let row: Vec<(String, String)> = opts
+        .iter()
+        .map(|o| {
+            let verdict = if *o == ans { "ok" } else { "no" };
+            (o.to_string(), format!("v:{cmd}:{verdict}"))
+        })
+        .collect();
+    let prompt = format!("{ask}\n\nTo confirm, tap the answer to {a} + {b}:");
+    let _ = api
+        .send_buttons(
+            chat_id,
+            &prompt,
+            thread,
+            &[row, vec![("Cancel".into(), "v:cancel".into())]],
+        )
+        .await;
+}
+
+/// Execute a confirmed destructive op (button click landed where the
+/// quiz was posted — our topic or the owner's DM). `confirm_mid` is the
 /// prompt message to clean up after.
 async fn run_command(
     api: &BotApi,
@@ -962,6 +993,10 @@ struct Markers {
     bot_new: Vec<(String, String, String, Option<String>)>,
     /// `:::backup:::` — ship ~/verity to General after the reply.
     backup: bool,
+    /// `:::clear|clearchat|reset:::` — destructive ops the reply asks
+    /// for. Each posts the arithmetic quiz; only a human's right answer
+    /// actually runs it.
+    cmds: Vec<String>,
     /// `:::pfp [seed]:::` — regenerate the bot's avatar.
     pfp: Option<u64>,
     /// `:::shutdown:::` / `:::restart:::` — how the service should die
@@ -1021,6 +1056,9 @@ fn extract_markers(reply: &str) -> (String, Markers) {
                     }
                 }
                 "backup" => markers.backup = true,
+                // Destructive ops route through the human's quiz, never
+                // straight to execution.
+                "clear" | "clearchat" | "reset" => markers.cmds.push(verb.into()),
                 // `:::pfp:::` or `:::pfp <seed>:::` — new BallsMaker face.
                 "pfp" => {
                     let seed = rest.parse::<u64>().ok().unwrap_or_else(|| {
@@ -1331,6 +1369,13 @@ async fn do_turn(
             Err(e) => format!("⚠️ backup failed: {e}"),
         };
         let _ = api.send_message(chat_id, &note, thread, reply_to).await;
+    }
+
+    // `:::clear|clearchat|reset:::` — destructive ops the reply asked
+    // for. They never execute on the agent's word: each posts the
+    // arithmetic quiz and only a human's right answer runs it.
+    for cmd in &markers.cmds {
+        ask_quiz(&api, chat_id, thread, cmd).await;
     }
 
     // `:::pfp:::` — fresh BallsMaker avatar, uploaded as this bot.

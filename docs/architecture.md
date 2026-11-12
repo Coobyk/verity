@@ -44,8 +44,10 @@ one topic per bot, bots are real bot accounts with their own avatars.
   owner's DM with the teammate (a `typing` probe decides; a teammate
   the owner never /started falls back to its own topic). Depth-capped
   at 2 so chains stay finite.
-- DMs are the primary surface: every command (`/clear`, `/clearchat`,
-  `/reset`, `/backup`) works in the bot's DM with the owner, confirm
+- DMs are the primary surface: there are no in-chat commands — the
+  agent acts through `:::` markers instead. Destructive ones
+  (`:::clear:::`, `:::clearchat:::`, `:::reset:::`) post an arithmetic
+  quiz and only a human's correct tap executes them; confirm
   callbacks route by chat, and DM turns get the owner↔bot transcript
   as context (same ~30 messages, read user-side). Topics remain as
   fallback plumbing.

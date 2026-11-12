@@ -454,9 +454,7 @@ async fn run() -> Result<()> {
                 .primary_bot()?
                 .context("no bots registered — `verity bot new`")?;
             let (seed, hue) = match what.as_deref() {
-                None | Some("random") => {
-                    (rand_u64().max(1), (rand_u64() % 360) as f64)
-                }
+                None | Some("random") => (rand_u64().max(1), (rand_u64() % 360) as f64),
                 Some(w) => {
                     let seed: u64 = w.parse().context("use `random` or a seed number")?;
                     (seed, (seed % 360) as f64)

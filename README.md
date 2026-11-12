@@ -62,7 +62,7 @@ MTProto login), and `state.sqlite` (bot roster + memory). Back it up
 into the group's General topic and pull it back on another machine:
 
 ```bash
-verity backup      # upload via any registered bot (also: /backup in a topic)
+verity backup      # upload via any registered bot (or a bot emits :::backup:::)
 verity restore     # download the newest set via your user session
 ```
 

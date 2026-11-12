@@ -118,7 +118,9 @@ fn system_prompt(ctx: &TurnContext) -> String {
          To persist a fact, put it on its own line as `:::remember key = value:::` — it is stored as memory and stripped from your reply. \
          To archive all of ~/verity (and your $HOME settings) into the group's General topic (backup), emit `:::backup:::`. \
          To restart the bridge (e.g. after rebuilding its binary), emit `:::restart:::`; to stop it for good, `:::shutdown:::` — \
-         both fire only after your reply posts, so never `systemctl` the verity service yourself.",
+         both fire only after your reply posts, so never `systemctl` the verity service yourself. \
+         Destructive ops exist too — `:::clear:::` (wipe your memory), `:::clearchat:::` (delete every message here AND wipe memory), `:::reset:::` (nuke everything: all topics, all messages, every bot but you, all memory). \
+         None of them run on your word alone: each posts an arithmetic quiz and only the human's correct tap executes it — propose them when the situation calls for it, never casually.",
     );
     s
 }
