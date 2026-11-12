@@ -5,6 +5,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -17,13 +18,18 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -46,6 +52,7 @@ import sh.coobyk.verity.data.ConversationKind
 @Composable
 fun ListScreen(vm: AppViewModel) {
     val ui by vm.ui.collectAsStateWithLifecycle()
+    val pinned by vm.pinned.collectAsStateWithLifecycle()
 
     Column(Modifier.fillMaxSize()) {
         Row(
@@ -78,12 +85,20 @@ fun ListScreen(vm: AppViewModel) {
             if (ui.topics.isEmpty()) {
                 item { EmptyHint(if (ui.connected) "No topics yet" else "Connecting to Telegram…") }
             }
-            items(ui.topics, key = { "topic-${it.id}" }) { t ->
+            items(
+                // Stable sort keeps name order inside pinned/unpinned groups.
+                ui.topics.sortedByDescending { "topic-${it.id}" in pinned },
+                key = { "topic-${it.id}" },
+            ) { t ->
                 Box(Modifier.animateItem()) {
+                val key = "topic-${t.id}"
+                var menu by remember { mutableStateOf(false) }
                 ConversationRow(
                     title = t.title,
                     subtitle = "",
                     dimmed = false,
+                    pinned = key in pinned,
+                    onLongClick = { menu = true },
                     onClick = {
                         vm.open(
                             Conversation(
@@ -94,6 +109,12 @@ fun ListScreen(vm: AppViewModel) {
                         )
                     },
                 )
+                PinMenu(
+                    expanded = menu,
+                    pinned = key in pinned,
+                    onDismiss = { menu = false },
+                    onToggle = { vm.togglePin(key) },
+                )
                 }
             }
 
@@ -101,8 +122,13 @@ fun ListScreen(vm: AppViewModel) {
             if (ui.dms.isEmpty()) {
                 item { EmptyHint(if (ui.connected) "No direct chats" else "—") }
             }
-            items(ui.dms, key = { "dm-${it.userId}" }) { d ->
+            items(
+                ui.dms.sortedByDescending { "dm-${it.userId}" in pinned },
+                key = { "dm-${it.userId}" },
+            ) { d ->
                 Box(Modifier.animateItem()) {
+                val key = "dm-${d.userId}"
+                var menu by remember { mutableStateOf(false) }
                 val subtitle = listOfNotNull(
                     d.label.ifBlank { null },
                     if (d.available) null else "unavailable",
@@ -111,7 +137,9 @@ fun ListScreen(vm: AppViewModel) {
                     title = d.name,
                     subtitle = subtitle,
                     dimmed = !d.available,
+                    pinned = key in pinned,
                     avatarPath = ui.avatars[d.userId],
+                    onLongClick = { menu = true },
                     onClick = {
                         vm.open(
                             Conversation(
@@ -123,6 +151,12 @@ fun ListScreen(vm: AppViewModel) {
                             ),
                         )
                     },
+                )
+                PinMenu(
+                    expanded = menu,
+                    pinned = key in pinned,
+                    onDismiss = { menu = false },
+                    onToggle = { vm.togglePin(key) },
                 )
                 }
             }
@@ -192,24 +226,55 @@ internal fun UserAvatar(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun PinMenu(
+    expanded: Boolean,
+    pinned: Boolean,
+    onDismiss: () -> Unit,
+    onToggle: () -> Unit,
+) {
+    DropdownMenu(
+        expanded = expanded,
+        onDismissRequest = onDismiss,
+        modifier = Modifier.background(ComposerFill),
+    ) {
+        DropdownMenuItem(
+            text = {
+                Text(
+                    if (pinned) "Unpin from top" else "Pin to top",
+                    color = MainText,
+                )
+            },
+            onClick = {
+                onToggle()
+                onDismiss()
+            },
+        )
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ConversationRow(
     title: String,
     subtitle: String,
     dimmed: Boolean,
     onClick: () -> Unit,
+    pinned: Boolean = false,
     avatarPath: String? = null,
+    onLongClick: (() -> Unit)? = null,
 ) {
     Row(
         Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .alpha(if (dimmed) 0.4f else 1f)
             .padding(start = 16.dp, end = 20.dp, top = 10.dp, bottom = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         UserAvatar(avatarPath, title, 40.dp)
-        Column(Modifier.padding(start = 12.dp)) {
+        Column(Modifier.weight(1f).padding(start = 12.dp)) {
             Text(
                 title,
                 color = MainText,
@@ -227,6 +292,14 @@ private fun ConversationRow(
                     overflow = TextOverflow.Ellipsis,
                 )
             }
+        }
+        if (pinned) {
+            Text(
+                "PINNED",
+                color = DimText,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Medium,
+            )
         }
     }
     HorizontalDivider(color = Hairline, thickness = 0.5.dp)

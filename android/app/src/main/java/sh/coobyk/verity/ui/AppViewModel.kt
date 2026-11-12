@@ -1,6 +1,7 @@
 package sh.coobyk.verity.ui
 
 import android.app.Application
+import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -46,6 +47,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * in Chat/Settings screens, consumed by App.kt's nav transition.
      */
     val backProgress = MutableStateFlow(-1f)
+
+    /**
+     * Pinned conversation keys ("dm:123" / "topic:456") — surfaced by
+     * long-pressing a row on the main list. Persisted in SharedPreferences.
+     */
+    private val prefs = app.getSharedPreferences("verity", Context.MODE_PRIVATE)
+    val pinned =
+        MutableStateFlow(prefs.getStringSet("pinned", emptySet()).orEmpty())
+
+    fun togglePin(key: String) {
+        pinned.update { cur ->
+            (if (key in cur) cur - key else cur + key).also {
+                prefs.edit().putStringSet("pinned", it).apply()
+            }
+        }
+    }
 
     // Auth flows, consumed by LoginScreen / App.kt's screen gate.
     val authState = repo.authState
