@@ -115,10 +115,17 @@ class TdRepository(context: Context) {
     /** userId -> User. */
     private val users = ConcurrentHashMap<Long, TdApi.User>()
 
-    /** topic messageThreadId -> forum supergroup chatId. */
+    /** forumTopicId -> forum supergroup chatId. */
     private val topicChat = ConcurrentHashMap<Long, Long>()
 
-    private class OpenConv(val chatId: Long, val threadId: Long)
+    /** forumTopicId -> a real message id inside the thread. */
+    private val topicMsgId = ConcurrentHashMap<Long, Long>()
+
+    private class OpenConv(
+        val chatId: Long,
+        val topicId: Long,
+        val msgId: Long,
+    )
 
     @Volatile
     private var openConv: OpenConv? = null
@@ -371,8 +378,10 @@ class TdRepository(context: Context) {
         }.getOrNull() ?: return
         for (t in res.topics) {
             val info = t.info
-            topicChat[info.forumTopicId.toLong()] = chatId
-            out += Topic(id = info.forumTopicId.toLong(), title = info.name)
+            val tid = info.forumTopicId.toLong()
+            topicChat[tid] = chatId
+            t.lastMessage?.let { topicMsgId[tid] = it.id }
+            out += Topic(id = tid, title = info.name)
         }
     }
 
@@ -393,7 +402,7 @@ class TdRepository(context: Context) {
     fun openChat(conv: Conversation) {
         val open = when (conv.kind) {
             // For a private chat, chat.id == user.id.
-            ConversationKind.DM -> OpenConv(conv.id, 0L)
+            ConversationKind.DM -> OpenConv(conv.id, 0L, 0L)
             ConversationKind.TOPIC -> {
                 val chatId = topicChat[conv.id]
                 if (chatId == null) {
@@ -401,7 +410,7 @@ class TdRepository(context: Context) {
                     refreshChats()
                     return
                 }
-                OpenConv(chatId, conv.id)
+                OpenConv(chatId, conv.id, topicMsgId[conv.id] ?: 0L)
             }
         }
         openConv = open
@@ -416,12 +425,13 @@ class TdRepository(context: Context) {
 
     private suspend fun loadHistory(open: OpenConv) {
         val arr = try {
-            if (open.threadId != 0L) {
-                // A forum topic IS a message thread — its id is the
-                // topic-create service message's id.
-                exec(
+            if (open.topicId != 0L) {
+                // GetMessageThreadHistory wants a message id inside
+                // the thread, not the forumTopicId.
+                if (open.msgId == 0L) null
+                else exec(
                     TdApi.GetMessageThreadHistory(
-                        open.chatId, open.threadId, 0L, 0, 100,
+                        open.chatId, open.msgId, 0L, 0, 100,
                     ),
                 ).messages
             } else {
@@ -444,7 +454,7 @@ class TdRepository(context: Context) {
         val inThread =
             (m.topicId as? TdApi.MessageTopicForum)?.forumTopicId?.toLong()
         if (open != null && m.chatId == open.chatId &&
-            (open.threadId == 0L || inThread == open.threadId)
+            (open.topicId == 0L || inThread == open.topicId)
         ) {
             scope.launch {
                 val row = toChatMessage(m)
@@ -471,7 +481,7 @@ class TdRepository(context: Context) {
         messages.update { it + optimistic }
         val content = TdApi.InputMessageText(TdApi.FormattedText(text, null), null, false)
         val sent = try {
-            exec(TdSend.message(open.chatId, open.threadId, content))
+            exec(TdSend.message(open.chatId, open.topicId, content))
         } catch (e: Exception) {
             messages.update { list -> list.filterNot { it.id == optimistic.id } }
             status.value = e.message ?: "Send failed"

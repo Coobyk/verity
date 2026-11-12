@@ -6,6 +6,13 @@ import android.util.LruCache
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.MutableTransitionState
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -77,6 +84,7 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ChatScreen(vm: AppViewModel, conv: Conversation) {
     val ui by vm.ui.collectAsStateWithLifecycle()
@@ -148,7 +156,21 @@ fun ChatScreen(vm: AppViewModel, conv: Conversation) {
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
             ) {
                 items(msgs, key = { it.id }) { m ->
-                    MessageRow(m, mine = me != null && m.senderId == me)
+                    // New items compose hidden and ease in; placed items
+                    // slide when the list reshuffles.
+                    val appear = remember {
+                        MutableTransitionState(false).apply { targetState = true }
+                    }
+                    AnimatedVisibility(
+                        appear,
+                        modifier = Modifier.animateItemPlacement(),
+                        enter =
+                            fadeIn(tween(220)) +
+                                slideInVertically(tween(220)) { it / 4 },
+                        exit = fadeOut(),
+                    ) {
+                        MessageRow(m, mine = me != null && m.senderId == me)
+                    }
                 }
             }
 

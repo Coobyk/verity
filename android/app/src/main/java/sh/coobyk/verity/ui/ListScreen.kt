@@ -1,6 +1,8 @@
 package sh.coobyk.verity.ui
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -27,6 +29,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import sh.coobyk.verity.data.Conversation
 import sh.coobyk.verity.data.ConversationKind
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ListScreen(vm: AppViewModel) {
     val ui by vm.ui.collectAsStateWithLifecycle()
@@ -63,6 +66,7 @@ fun ListScreen(vm: AppViewModel) {
                 item { EmptyHint(if (ui.connected) "No topics yet" else "Connecting to Telegram…") }
             }
             items(ui.topics, key = { "topic-${it.id}" }) { t ->
+                Box(Modifier.animateItemPlacement()) {
                 ConversationRow(
                     title = t.title,
                     subtitle = "",
@@ -77,6 +81,7 @@ fun ListScreen(vm: AppViewModel) {
                         )
                     },
                 )
+                }
             }
 
             item { SectionHeader("Direct") }
@@ -84,6 +89,7 @@ fun ListScreen(vm: AppViewModel) {
                 item { EmptyHint(if (ui.connected) "No direct chats" else "—") }
             }
             items(ui.dms, key = { "dm-${it.userId}" }) { d ->
+                Box(Modifier.animateItemPlacement()) {
                 val subtitle = listOfNotNull(
                     d.label.ifBlank { null },
                     if (d.available) null else "unavailable",
@@ -104,6 +110,7 @@ fun ListScreen(vm: AppViewModel) {
                         )
                     },
                 )
+                }
             }
         }
     }
