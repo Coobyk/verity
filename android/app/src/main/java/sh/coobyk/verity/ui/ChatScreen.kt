@@ -47,6 +47,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -159,29 +160,53 @@ fun ChatScreen(vm: AppViewModel, conv: Conversation) {
                         listState.animateScrollToItem(msgs.size - 1)
                 }
             }
+            // Baseline = newest id once history loads; only messages
+            // newer than that (live arrivals, optimistic sends) get the
+            // entrance animation — rows scrolled into view from history
+            // render instantly, keeping scrolling cheap.
+            var baseId by remember { mutableLongStateOf(Long.MIN_VALUE) }
+            LaunchedEffect(msgs.isNotEmpty()) {
+                if (baseId == Long.MIN_VALUE && msgs.isNotEmpty()) {
+                    baseId = msgs.last().id
+                }
+            }
+            val played = remember { HashSet<Long>() }
             LazyColumn(
                 state = listState,
                 modifier = Modifier.weight(1f).fillMaxWidth(),
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
             ) {
-                items(msgs, key = { it.id }) { m ->
-                    // New items compose hidden and ease in; placed items
-                    // slide when the list reshuffles.
-                    val appear = remember {
-                        MutableTransitionState(false).apply { targetState = true }
-                    }
-                    AnimatedVisibility(
-                        appear,
-                        modifier = Modifier.animateItem(
-                            fadeInSpec = null,
-                            fadeOutSpec = null,
-                        ),
-                        enter =
-                            fadeIn(tween(220)) +
-                                slideInVertically(tween(220)) { it / 4 },
-                        exit = fadeOut(),
-                    ) {
+                items(msgs, key = { it.id }, contentType = { "msg" }) { m ->
+                    val enter = m.id > baseId && played.add(m.id)
+                    val row: @Composable () -> Unit = {
                         MessageRow(m, mine = me != null && m.senderId == me)
+                    }
+                    if (enter) {
+                        val appear = remember {
+                            MutableTransitionState(false).apply { targetState = true }
+                        }
+                        AnimatedVisibility(
+                            appear,
+                            modifier = Modifier.animateItem(
+                                fadeInSpec = null,
+                                fadeOutSpec = null,
+                            ),
+                            enter =
+                                fadeIn(tween(220)) +
+                                    slideInVertically(tween(220)) { it / 4 },
+                            exit = fadeOut(),
+                        ) {
+                            row()
+                        }
+                    } else {
+                        Box(
+                            Modifier.animateItem(
+                                fadeInSpec = null,
+                                fadeOutSpec = null,
+                            ),
+                        ) {
+                            row()
+                        }
                     }
                 }
             }
@@ -238,7 +263,7 @@ private fun MessageBlock(
 ) {
     when (b) {
         is MsgBlock.Text -> Text(
-            styled(b.ft),
+            remember(b.ft) { styled(b.ft) },
             color = MainText,
             fontSize = 15.sp,
             lineHeight = lineHeight,
