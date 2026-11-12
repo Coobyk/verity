@@ -66,7 +66,7 @@ fun ListScreen(vm: AppViewModel) {
                 item { EmptyHint(if (ui.connected) "No topics yet" else "Connecting to Telegram…") }
             }
             items(ui.topics, key = { "topic-${it.id}" }) { t ->
-                Box(Modifier.animateItemPlacement()) {
+                Box(Modifier.animateItem()) {
                 ConversationRow(
                     title = t.title,
                     subtitle = "",
@@ -89,7 +89,7 @@ fun ListScreen(vm: AppViewModel) {
                 item { EmptyHint(if (ui.connected) "No direct chats" else "—") }
             }
             items(ui.dms, key = { "dm-${it.userId}" }) { d ->
-                Box(Modifier.animateItemPlacement()) {
+                Box(Modifier.animateItem()) {
                 val subtitle = listOfNotNull(
                     d.label.ifBlank { null },
                     if (d.available) null else "unavailable",

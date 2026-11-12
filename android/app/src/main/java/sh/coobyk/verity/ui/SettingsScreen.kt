@@ -1,6 +1,6 @@
 package sh.coobyk.verity.ui
 
-import androidx.activity.compose.BackHandler
+import androidx.activity.compose.PredictiveBackHandler
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -36,7 +36,14 @@ import sh.coobyk.verity.BuildConfig
 fun SettingsScreen(vm: AppViewModel) {
     val ui by vm.ui.collectAsStateWithLifecycle()
 
-    BackHandler { vm.closeSettings() }
+    PredictiveBackHandler { progress ->
+        try {
+            progress.collect { vm.backProgress.value = it.progress }
+            vm.closeSettings()
+        } finally {
+            vm.backProgress.value = -1f
+        }
+    }
 
     Column(Modifier.fillMaxSize()) {
         Row(

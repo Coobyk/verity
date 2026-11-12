@@ -38,6 +38,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val showSettings = MutableStateFlow(false)
     val sending = MutableStateFlow(false)
 
+    /**
+     * Predictive-back progress, 0f..1f while a back gesture drags toward
+     * the main list; -1f when idle/cancelled. Set by PredictiveBackHandler
+     * in Chat/Settings screens, consumed by App.kt's nav transition.
+     */
+    val backProgress = MutableStateFlow(-1f)
+
     // Auth flows, consumed by LoginScreen / App.kt's screen gate.
     val authState = repo.authState
     val authError = repo.authError

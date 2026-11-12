@@ -3,7 +3,7 @@ package sh.coobyk.verity.ui
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.LruCache
-import androidx.activity.compose.BackHandler
+import androidx.activity.compose.PredictiveBackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.animation.AnimatedVisibility
@@ -92,7 +92,16 @@ fun ChatScreen(vm: AppViewModel, conv: Conversation) {
     val sending by vm.sending.collectAsStateWithLifecycle()
     val me = ui.me
 
-    BackHandler { vm.back() }
+    // Streams gesture progress so App.kt can seek the nav transition;
+    // completes → vm.back(), cancels → progress resets to -1f.
+    PredictiveBackHandler { progress ->
+        try {
+            progress.collect { vm.backProgress.value = it.progress }
+            vm.back()
+        } finally {
+            vm.backProgress.value = -1f
+        }
+    }
 
     // Centered max-width column like the desktop client.
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
@@ -163,7 +172,10 @@ fun ChatScreen(vm: AppViewModel, conv: Conversation) {
                     }
                     AnimatedVisibility(
                         appear,
-                        modifier = Modifier.animateItemPlacement(),
+                        modifier = Modifier.animateItem(
+                            fadeInSpec = null,
+                            fadeOutSpec = null,
+                        ),
                         enter =
                             fadeIn(tween(220)) +
                                 slideInVertically(tween(220)) { it / 4 },
