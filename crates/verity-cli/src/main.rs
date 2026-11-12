@@ -36,6 +36,12 @@ enum Cmd {
         create_group: Option<String>,
         #[arg(long)]
         pi_bin: Option<String>,
+        /// Bind address for the mobile-app JSON API (e.g. 0.0.0.0:8787)
+        #[arg(long)]
+        api_bind: Option<String>,
+        /// Bearer token the API requires on every route but /api/health
+        #[arg(long)]
+        api_token: Option<String>,
     },
     /// Log in to Telegram (MTProto) as yourself
     Login {
@@ -370,13 +376,17 @@ async fn run() -> Result<()> {
             group_id,
             create_group,
             pi_bin,
+            api_bind,
+            api_token,
         } => {
             let mut cfg = Config::load()?;
             let interactive = api_id.is_none()
                 && api_hash.is_none()
                 && group_id.is_none()
                 && create_group.is_none()
-                && pi_bin.is_none();
+                && pi_bin.is_none()
+                && api_bind.is_none()
+                && api_token.is_none();
             if interactive {
                 println!("leave blank to keep the current value");
                 if let Some(v) = prompt_keep(
@@ -426,6 +436,12 @@ async fn run() -> Result<()> {
                 }
                 if let Some(v) = pi_bin {
                     cfg.pi_bin = Some(v);
+                }
+                if let Some(v) = api_bind {
+                    cfg.api_bind = Some(v);
+                }
+                if let Some(v) = api_token {
+                    cfg.api_token = Some(v);
                 }
             }
             cfg.save()?;

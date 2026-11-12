@@ -87,7 +87,7 @@ fn describe_next_type(t: &tl::enums::auth::CodeType) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TopicInfo {
     pub id: i64,
     pub title: String,
@@ -103,7 +103,7 @@ pub struct GroupInfo {
     pub kind: &'static str,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TopicMessage {
     pub id: i32,
     pub date: i64,
@@ -635,9 +635,7 @@ impl Tg {
             .filter_map(|m| match m {
                 tl::enums::Message::Message(m) => {
                     let (sender, sender_id) = match m.from_id {
-                        Some(tl::enums::Peer::User(p)) => {
-                            (name_of(p.user_id), Some(p.user_id))
-                        }
+                        Some(tl::enums::Peer::User(p)) => (name_of(p.user_id), Some(p.user_id)),
                         _ => ("group".to_string(), None),
                     };
                     // Media-only messages carry no text — mark them so

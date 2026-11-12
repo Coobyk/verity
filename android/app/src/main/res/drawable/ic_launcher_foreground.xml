@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Simple check mark — kept inside the inner ~66dp adaptive-icon safe zone. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#E7E9EA"
+        android:pathData="M46,62 L40,55 L36,59 L46,70 L74,41 L70,37 Z" />
+</vector>

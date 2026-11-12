@@ -160,6 +160,35 @@ impl Bridge {
                 }
             });
         }
+        // Mobile-app JSON API — bound only when config asks for it and a
+        // user session exists to serve Telegram data through. No
+        // `api_token` means the API itself refuses every non-health
+        // route; never run it open.
+        let cfg = crate::config::Config::load().unwrap_or_default();
+        if let (Some(bind), Some(tg)) = (cfg.api_bind.clone(), env.tg.clone()) {
+            let group = match env.peer {
+                Some(p) => Some(p),
+                None => tg.peer(&env.group_id.to_string()).await.ok(),
+            };
+            match group {
+                Some(group) => {
+                    let api = crate::api::Api {
+                        tg,
+                        group,
+                        db: env.db.clone(),
+                        token: cfg.api_token.clone(),
+                    };
+                    tokio::spawn(async move {
+                        if let Err(e) = crate::api::serve(&bind, api).await {
+                            warn!(error = %e, "api server stopped");
+                        }
+                    });
+                }
+                None => warn!("api_bind set but group peer unresolvable — api disabled"),
+            }
+        } else if cfg.api_bind.is_some() {
+            warn!("api_bind set but no user session — api disabled");
+        }
         // Supervisor: run a loop per bot in the store, and pick up bots
         // registered later (`bot new` or a `:::bot_new:::` marker) without
         // a restart.

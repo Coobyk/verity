@@ -26,6 +26,12 @@ pub struct Config {
     pub group_id: Option<i64>,
     /// Binary used by the Pi harness (`pi` or `pirs`).
     pub pi_bin: Option<String>,
+    /// Address the mobile-app JSON API binds to during `verity serve`
+    /// (e.g. "0.0.0.0:8787"). Absent = API disabled.
+    pub api_bind: Option<String>,
+    /// Bearer token for that API — every route except /api/health
+    /// requires it; absent = the API refuses everything.
+    pub api_token: Option<String>,
 }
 
 impl Config {

@@ -20,6 +20,10 @@ grammers-session.workspace = true
 grammers-mtsender = "0.8"
 grammers-tl-types.workspace = true
 async-trait.workspace = true
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 sevenz-rust2 = "0.24"
 tiny-skia.workspace = true
 verity-pfp = { path = "../verity-pfp" }

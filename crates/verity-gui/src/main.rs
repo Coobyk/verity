@@ -632,19 +632,16 @@ impl Render for Root {
                         if mine {
                             // Your message: dark pill, right edge, no
                             // name tag — Grok trusts you know you.
-                            div()
-                                .flex()
-                                .justify_end()
-                                .child(
-                                    div()
-                                        .max_w(px(520.0))
-                                        .bg(bubble)
-                                        .rounded_2xl()
-                                        .px_4()
-                                        .py_2()
-                                        .text_color(text)
-                                        .child(m.text.clone()),
-                                )
+                            div().flex().justify_end().child(
+                                div()
+                                    .max_w(px(520.0))
+                                    .bg(bubble)
+                                    .rounded_2xl()
+                                    .px_4()
+                                    .py_2()
+                                    .text_color(text)
+                                    .child(m.text.clone()),
+                            )
                         } else {
                             // Theirs: bare text with a whispered name,
                             // like Grok's own replies.
@@ -657,17 +654,9 @@ impl Render for Root {
                                         .flex()
                                         .gap_2()
                                         .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(dim)
-                                                .child(m.sender.clone()),
+                                            div().text_xs().text_color(dim).child(m.sender.clone()),
                                         )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(dim)
-                                                .child(hhmm(m.date)),
-                                        ),
+                                        .child(div().text_xs().text_color(dim).child(hhmm(m.date))),
                                 )
                                 .child(div().text_color(text).child(m.text.clone()))
                         }

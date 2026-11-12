@@ -5,7 +5,9 @@
 //! - [`store`]: SQLite brain — bot records, memory, thread state
 //! - [`harness`]: provider seam; agents run behind `Harness`
 //! - [`bridge`]: the quiet-bot loop routing topic messages to bots
+//! - [`api`]: bearer-gated JSON API for the mobile app (`api_bind`/`api_token`)
 
+pub mod api;
 pub mod backup;
 pub mod botapi;
 pub mod bridge;
