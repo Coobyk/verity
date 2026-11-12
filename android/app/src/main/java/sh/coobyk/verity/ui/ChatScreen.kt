@@ -24,7 +24,6 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -44,7 +43,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.material3.LocalTextStyle
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.withStyle
+import org.drinkless.tdlib.TdApi
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -104,9 +111,6 @@ fun ChatScreen(vm: AppViewModel, conv: Conversation) {
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
-                IconButton(onClick = { vm.openSettings() }) {
-                    Icon(Icons.Filled.Settings, contentDescription = "Settings", tint = DimText)
-                }
             }
             HorizontalDivider(color = Hairline, thickness = 0.5.dp)
 
@@ -155,7 +159,7 @@ private fun MessageRow(m: ChatMessage, mine: Boolean) {
                     .background(BubbleFill)
                     .padding(horizontal = 14.dp, vertical = 9.dp),
             ) {
-                Text(m.text, color = MainText, fontSize = 15.sp, lineHeight = 20.sp)
+                Text(styled(m.text), color = MainText, fontSize = 15.sp, lineHeight = 20.sp)
             }
         }
     } else {
@@ -173,7 +177,7 @@ private fun MessageRow(m: ChatMessage, mine: Boolean) {
                 Text(formatTime(m.date), color = DimText, fontSize = 12.sp)
             }
             Text(
-                m.text,
+                styled(m.text),
                 color = MainText,
                 fontSize = 15.sp,
                 lineHeight = 21.sp,
@@ -261,3 +265,40 @@ private fun formatTime(epochSec: Long): String = try {
 } catch (e: Exception) {
     ""
 }
+
+/** TDLib FormattedText -> AnnotatedString with real span styling. */
+private fun styled(ft: TdApi.FormattedText): AnnotatedString =
+    buildAnnotatedString {
+        append(ft.text)
+        ft.entities?.forEach { e ->
+            val style = when (e.type) {
+                is TdApi.TextEntityTypeBold ->
+                    SpanStyle(fontWeight = FontWeight.Bold)
+                is TdApi.TextEntityTypeItalic ->
+                    SpanStyle(fontStyle = FontStyle.Italic)
+                is TdApi.TextEntityTypeUnderline ->
+                    SpanStyle(textDecoration = TextDecoration.Underline)
+                is TdApi.TextEntityTypeStrikethrough ->
+                    SpanStyle(textDecoration = TextDecoration.LineThrough)
+                is TdApi.TextEntityTypeCode, is TdApi.TextEntityTypePre ->
+                    SpanStyle(
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 13.5.sp,
+                        background = Color(0xFF16181C),
+                    )
+                is TdApi.TextEntityTypeTextUrl ->
+                    SpanStyle(
+                        color = Color(0xFF1D9BF0),
+                        textDecoration = TextDecoration.Underline,
+                    )
+                is TdApi.TextEntityTypeSpoiler ->
+                    SpanStyle(background = BubbleFill)
+                else -> null
+            }
+            if (style != null) {
+                val s = e.offset.coerceIn(0, ft.text.length)
+                val end = (e.offset + e.length).coerceIn(0, ft.text.length)
+                if (end > s) addStyle(style, s, end)
+            }
+        }
+    }

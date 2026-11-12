@@ -40,7 +40,7 @@ data class ChatMessage(
     val date: Long, // epoch seconds
     val sender: String,
     val senderId: Long?,
-    val text: String,
+    val text: TdApi.FormattedText,
 )
 
 enum class ConversationKind { TOPIC, DM }
@@ -187,9 +187,13 @@ class TdRepository(context: Context) {
                 val u = obj as TdApi.UpdateMessageContent
                 val open = openConv
                 if (open != null && u.chatId == open.chatId) {
-                    val newText = contentText(u.newContent)
-                    messages.update { list ->
-                        list.map { if (it.id == u.messageId) it.copy(text = newText) else it }
+                    scope.launch {
+                        val newText = contentFormatted(u.chatId, u.messageId, u.newContent)
+                        messages.update { list ->
+                            list.map {
+                                if (it.id == u.messageId) it.copy(text = newText) else it
+                            }
+                        }
                     }
                 }
             }
@@ -531,22 +535,238 @@ class TdRepository(context: Context) {
             date = m.date.toLong(),
             sender = sender,
             senderId = senderId,
-            text = contentText(m.content),
+            text = contentFormatted(m.chatId, m.id, m.content),
         )
     }
 
-    private fun contentText(c: TdApi.MessageContent): String = when (c) {
-        is TdApi.MessageText -> c.text.text
-        is TdApi.MessagePhoto -> c.caption.text.ifBlank { "[photo]" }
-        is TdApi.MessageVideo -> c.caption.text.ifBlank { "[video]" }
-        is TdApi.MessageDocument -> c.caption.text.ifBlank {
-            c.document.fileName.ifBlank { "[file]" }
+    private suspend fun contentFormatted(
+        chatId: Long,
+        messageId: Long,
+        content: TdApi.MessageContent,
+    ): TdApi.FormattedText =
+        when (val c = content) {
+            is TdApi.MessageText -> c.text
+            is TdApi.MessageRichMessage -> {
+                var rm = c.message
+                if (!rm.isFull) {
+                    rm = runCatching {
+                        exec(TdApi.GetFullRichMessage(chatId, messageId))
+                    }.getOrNull() ?: rm
+                }
+                richToFormatted(rm)
+            }
+            is TdApi.MessagePhoto -> orCaption(c.caption, "[photo]")
+            is TdApi.MessageVideo -> orCaption(c.caption, "[video]")
+            is TdApi.MessageDocument -> orCaption(
+                c.caption, c.document.fileName.ifBlank { "[file]" },
+            )
+            is TdApi.MessageVoiceNote -> orCaption(c.caption, "[voice]")
+            else -> plain(
+                when (c) {
+                    is TdApi.MessageSticker -> "[sticker ${c.sticker.emoji}]"
+                    is TdApi.MessageAnimatedEmoji -> c.emoji
+                    is TdApi.MessagePoll -> "[poll]"
+                    else -> "[${c.javaClass.simpleName.removePrefix("Message")}]"
+                },
+            )
         }
-        is TdApi.MessageVoiceNote -> c.caption.text.ifBlank { "[voice]" }
-        is TdApi.MessageSticker -> "[sticker ${c.sticker.emoji}]"
-        is TdApi.MessageAnimatedEmoji -> c.emoji
-        is TdApi.MessagePoll -> "[poll]"
-        else -> "[${c.javaClass.simpleName.removePrefix("Message")}]"
+
+    private fun orCaption(ft: TdApi.FormattedText, fallback: String): TdApi.FormattedText =
+        if (ft.text.isBlank()) plain(fallback) else ft
+
+    private fun plain(s: String) = TdApi.FormattedText(s, null)
+
+    /* ---- RichMessage (PageBlock[]) -> FormattedText ------------------------ */
+
+    private class Flatten {
+        val sb = StringBuilder()
+        val entities = mutableListOf<TdApi.TextEntity>()
+
+        fun span(type: TdApi.TextEntityType, body: () -> Unit) {
+            val start = sb.length
+            body()
+            if (sb.length > start) {
+                entities += TdApi.TextEntity(start, sb.length - start, type)
+            }
+        }
+
+        fun rich(rt: TdApi.RichText?) {
+            when (rt) {
+                null -> Unit
+                is TdApi.RichTextPlain -> sb.append(rt.text)
+                is TdApi.RichTexts -> rt.texts.forEach { rich(it) }
+                is TdApi.RichTextBold -> span(TdApi.TextEntityTypeBold()) { rich(rt.text) }
+                is TdApi.RichTextItalic -> span(TdApi.TextEntityTypeItalic()) { rich(rt.text) }
+                is TdApi.RichTextUnderline ->
+                    span(TdApi.TextEntityTypeUnderline()) { rich(rt.text) }
+                is TdApi.RichTextStrikethrough ->
+                    span(TdApi.TextEntityTypeStrikethrough()) { rich(rt.text) }
+                is TdApi.RichTextFixed -> span(TdApi.TextEntityTypeCode()) { rich(rt.text) }
+                is TdApi.RichTextSpoiler ->
+                    span(TdApi.TextEntityTypeSpoiler()) { rich(rt.text) }
+                is TdApi.RichTextUrl ->
+                    span(TdApi.TextEntityTypeTextUrl(rt.url)) { rich(rt.text) }
+                is TdApi.RichTextEmailAddress ->
+                    span(TdApi.TextEntityTypeTextUrl("mailto:${rt.emailAddress}")) {
+                        rich(rt.text)
+                    }
+                is TdApi.RichTextPhoneNumber ->
+                    span(TdApi.TextEntityTypeTextUrl("tel:${rt.phoneNumber}")) {
+                        rich(rt.text)
+                    }
+                is TdApi.RichTextAnchorLink ->
+                    if (rt.url.isNotBlank()) {
+                        span(TdApi.TextEntityTypeTextUrl(rt.url)) { rich(rt.text) }
+                    } else {
+                        rich(rt.text)
+                    }
+                is TdApi.RichTextCustomEmoji -> sb.append(rt.alternativeText)
+                is TdApi.RichTextMathematicalExpression -> sb.append(rt.expression)
+                is TdApi.RichTextIcon -> Unit
+                is TdApi.RichTextAnchor -> Unit
+                is TdApi.RichTextButton -> rich(rt.button.text)
+                is TdApi.RichTextDateTime -> rich(rt.text)
+                // mention / hashtag / cashtag / botcommand / card / ton /
+                // sub / super / marked / diff / reference / mentionname —
+                // children carry the visible text; styling is cosmetic.
+                else -> richField(rt)
+            }
+        }
+
+        /** Recurses into a wrapper's `text` child without extra styling. */
+        private fun richField(rt: TdApi.RichText) {
+            val t = try {
+                rt.javaClass.getField("text").get(rt) as? TdApi.RichText
+            } catch (_: Exception) {
+                null
+            }
+            if (t != null) rich(t)
+        }
+
+        fun block(b: TdApi.PageBlock, depth: Int = 0) {
+            val nl = if (depth == 0) "\n\n" else "\n"
+            when (b) {
+                is TdApi.PageBlockTitle ->
+                    span(TdApi.TextEntityTypeBold()) { rich(b.title) }.also { br(nl) }
+                is TdApi.PageBlockHeader ->
+                    span(TdApi.TextEntityTypeBold()) { rich(b.header) }.also { br(nl) }
+                is TdApi.PageBlockSubheader -> rich(b.subheader).also { br(nl) }
+                is TdApi.PageBlockKicker -> rich(b.kicker).also { br(nl) }
+                is TdApi.PageBlockFooter ->
+                    span(TdApi.TextEntityTypeItalic()) { rich(b.footer) }
+                        .also { br(nl) }
+                is TdApi.PageBlockSectionHeading ->
+                    span(TdApi.TextEntityTypeBold()) { rich(b.text) }.also { br(nl) }
+                is TdApi.PageBlockParagraph -> rich(b.text).also { br(nl) }
+                is TdApi.PageBlockThinking ->
+                    span(TdApi.TextEntityTypeItalic()) { rich(b.text) }
+                        .also { br(nl) }
+                is TdApi.PageBlockPreformatted ->
+                    span(TdApi.TextEntityTypePre()) { rich(b.text) }.also { br(nl) }
+                is TdApi.PageBlockMathematicalExpression ->
+                    span(TdApi.TextEntityTypeCode()) {
+                        sb.append(b.expression)
+                    }.also { br(nl) }
+                is TdApi.PageBlockBlockQuote -> {
+                    b.blocks.forEach { block(it, depth + 1) }
+                    b.credit?.let {
+                        span(TdApi.TextEntityTypeItalic()) {
+                            sb.append("— ")
+                            rich(it)
+                        }
+                        br("\n")
+                    }
+                    br("\n")
+                }
+                is TdApi.PageBlockPullQuote -> pullQuote(b.text, b.credit, nl)
+                is TdApi.PageBlockExpandableBlockQuote ->
+                    pullQuote(b.text, b.credit, nl)
+                is TdApi.PageBlockList -> {
+                    b.items.forEach { item ->
+                        sb.append(
+                            if (item.label.isBlank()) "• " else "${item.label} ",
+                        )
+                        item.blocks.forEach { block(it, depth + 1) }
+                        br("\n")
+                    }
+                    br("\n")
+                }
+                is TdApi.PageBlockDetails -> {
+                    span(TdApi.TextEntityTypeBold()) { rich(b.header) }
+                    br("\n")
+                    b.blocks.forEach { block(it, depth + 1) }
+                    br("\n")
+                }
+                is TdApi.PageBlockTable -> {
+                    b.cells.forEach { row ->
+                        row.forEachIndexed { i, cell ->
+                            if (i > 0) sb.append("  |  ")
+                            rich(cell.text)
+                        }
+                        br("\n")
+                    }
+                    b.caption?.let { rich(it); br("\n") }
+                    br("\n")
+                }
+                is TdApi.PageBlockDivider -> sb.append("———").also { br(nl) }
+                is TdApi.PageBlockCover -> {
+                    block(b.cover, depth + 1)
+                    br(nl)
+                }
+                is TdApi.PageBlockCollage, is TdApi.PageBlockSlideshow -> {
+                    val blocks = when (b) {
+                        is TdApi.PageBlockCollage -> b.blocks
+                        else -> (b as TdApi.PageBlockSlideshow).blocks
+                    }
+                    blocks.forEach { block(it, depth + 1) }
+                    br("\n")
+                }
+                is TdApi.PageBlockRelatedArticles -> {
+                    rich(b.header).also { br("\n") }
+                }
+                else -> sb.append(mediaLabel(b)).also { br(nl) }
+            }
+        }
+
+        private fun pullQuote(
+            text: TdApi.RichText?, credit: TdApi.RichText?, nl: String,
+        ) {
+            rich(text)
+            credit?.let {
+                br("\n")
+                span(TdApi.TextEntityTypeItalic()) {
+                    sb.append("— ")
+                    rich(it)
+                }
+            }
+            br(nl)
+        }
+
+        private fun mediaLabel(b: TdApi.PageBlock): String =
+            "[${b.javaClass.simpleName.removePrefix("PageBlock").lowercase()}]"
+
+        private fun br(s: String) {
+            sb.append(s)
+        }
+
+        fun result(): TdApi.FormattedText {
+            var end = sb.length
+            while (end > 0 && sb[end - 1] == '\n') end--
+            val out = sb.substring(0, end).replace(Regex("\n{3,}"), "\n\n")
+            // Re-anchor entity offsets if the leading text was trimmed — we
+            // never trim the front, so offsets stay valid.
+            return TdApi.FormattedText(
+                out,
+                entities.toTypedArray().filter { it.offset + it.length <= out.length }
+                    .toTypedArray(),
+            )
+        }
+    }
+
+    private fun richToFormatted(rm: TdApi.RichMessage): TdApi.FormattedText {
+        val f = Flatten()
+        rm.blocks.forEach { f.block(it) }
+        return f.result()
     }
 
     private fun displayName(u: TdApi.User): String =

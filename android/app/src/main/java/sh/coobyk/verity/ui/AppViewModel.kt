@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import org.drinkless.tdlib.TdApi
 import sh.coobyk.verity.data.ChatMessage
 import sh.coobyk.verity.data.Conversation
 import sh.coobyk.verity.data.DirectChat
@@ -117,7 +118,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             date = System.currentTimeMillis() / 1000,
             sender = "You",
             senderId = ui.value.me,
-            text = trimmed,
+            text = TdApi.FormattedText(trimmed, null),
         )
 
         viewModelScope.launch {
