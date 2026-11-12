@@ -143,7 +143,7 @@ class Repository {
 
     private fun execute(req: Request): JSONObject {
         client.newCall(req).execute().use { resp ->
-            val text = resp.body.string()
+            val text = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) {
                 val err = runCatching { JSONObject(text).optString("error") }
                     .getOrNull()
