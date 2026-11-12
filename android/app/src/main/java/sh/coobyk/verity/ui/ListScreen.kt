@@ -36,6 +36,11 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.vector.addPathNodes
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -226,6 +231,33 @@ internal fun UserAvatar(
     }
 }
 
+/** Material Symbols push_pin, viewport-normalized to 0..960. */
+private val PinIcon: ImageVector by lazy {
+    ImageVector.Builder(
+        name = "PushPin",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 960f,
+        viewportHeight = 960f,
+    ).addPath(
+        pathData = addPathNodes(
+            "M640 200 v280 l68 68 q6 6 9 13.5 t3 15.5 v23" +
+                " q0 17-11.5 28.5 T680 640 H520 v234" +
+                " q0 17-11.5 28.5 T480 914" +
+                " q-17 0-28.5-11.5 T440 874 v-234 H280" +
+                " q-17 0-28.5-11.5 T240 600 v-23" +
+                " q0-8 3-15.5 t9-13.5 l68-68 v-280" +
+                " q-17 0-28.5-11.5 T280 160" +
+                " q0-17 11.5-28.5 T320 120 h320" +
+                " q17 0 28.5 11.5 T680 160" +
+                " q0 17-11.5 28.5 T640 200 Z" +
+                " M354 560 h252 l-46-46 v-314 H400 v314 l-46 46 Z" +
+                " m126 0 Z",
+        ),
+        fill = SolidColor(Color.Black),
+    ).build()
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun PinMenu(
@@ -294,11 +326,11 @@ private fun ConversationRow(
             }
         }
         if (pinned) {
-            Text(
-                "PINNED",
-                color = DimText,
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Medium,
+            Icon(
+                PinIcon,
+                contentDescription = "Pinned",
+                tint = DimText,
+                modifier = Modifier.size(15.dp).graphicsLayer { rotationZ = 45f },
             )
         }
     }
