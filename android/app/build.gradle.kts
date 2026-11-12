@@ -1,8 +1,25 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
+
+// Telegram API credentials (from https://my.telegram.org).
+// Put the REAL values in android/local.properties (gitignored) or
+// ~/.gradle/gradle.properties — never commit them. Placeholders in the
+// checked-in gradle.properties stay commented out.
+val localProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+val tdlibApiId = localProps.getProperty("tdlib.apiId")
+    ?: (findProperty("tdlib.apiId") as String?)
+    ?: "0"
+val tdlibApiHash = localProps.getProperty("tdlib.apiHash")
+    ?: (findProperty("tdlib.apiHash") as String?)
+    ?: ""
 
 android {
     namespace = "sh.coobyk.verity"
@@ -14,6 +31,9 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0.0"
+
+        buildConfigField("int", "TDLIB_API_ID", tdlibApiId)
+        buildConfigField("String", "TDLIB_API_HASH", "\"$tdlibApiHash\"")
     }
 
     buildTypes {
@@ -37,6 +57,16 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
+    }
+
+    // TDLib is vendored — there is no trustworthy maven artifact:
+    //   Java sources:  app/src/main/java/org/drinkless/tdlib/Client.java
+    //                  app/src/main/java/org/drinkless/td/libcore/telegram/TdApi.java
+    //   native libs:   app/src/main/jniLibs/<abi>/libtdjni.so
+    // (copy both from a build of the td repo's example/android.)
+    packaging {
+        jniLibs.excludes += "META-INF/**"
     }
 }
 
@@ -45,9 +75,7 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.4")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.4")
-    implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     implementation(platform("androidx.compose:compose-bom:2024.06.00"))
     implementation("androidx.compose.ui:ui")

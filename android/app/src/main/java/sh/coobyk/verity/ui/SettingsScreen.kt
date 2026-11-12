@@ -9,7 +9,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Button
@@ -17,31 +16,25 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import sh.coobyk.verity.BuildConfig
 
+/**
+ * Account screen. The app signs into Telegram directly via TDLib, so there's
+ * nothing to configure here — the API credentials are baked into BuildConfig
+ * from `tdlib.apiId`/`tdlib.apiHash` at build time.
+ */
 @Composable
 fun SettingsScreen(vm: AppViewModel) {
     val ui by vm.ui.collectAsStateWithLifecycle()
-    var url by remember(ui.baseUrl) { mutableStateOf(ui.baseUrl) }
-    var token by remember(ui.token) { mutableStateOf(ui.token) }
-    var showToken by remember { mutableStateOf(false) }
 
     BackHandler { vm.closeSettings() }
 
@@ -70,7 +63,7 @@ fun SettingsScreen(vm: AppViewModel) {
 
         Column(Modifier.padding(horizontal = 20.dp, vertical = 16.dp)) {
             Text(
-                "BRIDGE",
+                "TELEGRAM",
                 color = DimText,
                 fontSize = 12.sp,
                 fontWeight = FontWeight.SemiBold,
@@ -78,38 +71,21 @@ fun SettingsScreen(vm: AppViewModel) {
             )
             Spacer(Modifier.height(12.dp))
 
-            OutlinedTextField(
-                value = url,
-                onValueChange = { url = it },
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("Base URL") },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-                colors = fieldColors(),
-            )
-            Spacer(Modifier.height(12.dp))
-
-            OutlinedTextField(
-                value = token,
-                onValueChange = { token = it },
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("API token") },
-                singleLine = true,
-                visualTransformation =
-                    if (showToken) VisualTransformation.None
-                    else PasswordVisualTransformation(),
-                trailingIcon = {
-                    TextButton(onClick = { showToken = !showToken }) {
-                        Text(if (showToken) "Hide" else "Show", color = DimText)
-                    }
+            InfoRow("Account", ui.me?.let { "user #$it" } ?: "—")
+            Spacer(Modifier.height(8.dp))
+            InfoRow(
+                "API ID",
+                if (BuildConfig.TDLIB_API_ID != 0) {
+                    BuildConfig.TDLIB_API_ID.toString()
+                } else {
+                    "not set — add tdlib.apiId to local.properties"
                 },
-                colors = fieldColors(),
             )
             Spacer(Modifier.height(10.dp))
 
             Text(
-                "URL and bearer token of `verity serve` on your LAN — " +
-                    "see api_bind / api_token in config.toml on the desktop.",
+                "Signed in to Telegram directly via TDLib. The session lives " +
+                    "in the TDLib database on this device — no bridge needed.",
                 color = DimText,
                 fontSize = 13.sp,
                 lineHeight = 18.sp,
@@ -117,8 +93,7 @@ fun SettingsScreen(vm: AppViewModel) {
             Spacer(Modifier.height(24.dp))
 
             Button(
-                onClick = { vm.saveSettings(url, token) },
-                enabled = url.isNotBlank(),
+                onClick = { vm.logout() },
                 shape = RoundedCornerShape(24.dp),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MainText,
@@ -126,19 +101,26 @@ fun SettingsScreen(vm: AppViewModel) {
                 ),
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text("Save", fontWeight = FontWeight.SemiBold)
+                Text("Log out", fontWeight = FontWeight.SemiBold)
             }
         }
     }
 }
 
 @Composable
-private fun fieldColors() = OutlinedTextFieldDefaults.colors(
-    focusedTextColor = MainText,
-    unfocusedTextColor = MainText,
-    cursorColor = MainText,
-    focusedBorderColor = DimText,
-    unfocusedBorderColor = Hairline,
-    focusedLabelColor = DimText,
-    unfocusedLabelColor = DimText,
-)
+private fun InfoRow(label: String, value: String) {
+    Row(Modifier.fillMaxWidth()) {
+        Text(
+            label,
+            color = DimText,
+            fontSize = 14.sp,
+            modifier = Modifier.weight(0.35f),
+        )
+        Text(
+            value,
+            color = MainText,
+            fontSize = 14.sp,
+            modifier = Modifier.weight(0.65f),
+        )
+    }
+}

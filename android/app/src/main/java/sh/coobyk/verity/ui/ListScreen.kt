@@ -60,7 +60,7 @@ fun ListScreen(vm: AppViewModel) {
         LazyColumn(Modifier.fillMaxSize()) {
             item { SectionHeader("Topics") }
             if (ui.topics.isEmpty()) {
-                item { EmptyHint(if (ui.connected) "No topics yet" else "Waiting for bridge…") }
+                item { EmptyHint(if (ui.connected) "No topics yet" else "Connecting to Telegram…") }
             }
             items(ui.topics, key = { "topic-${it.id}" }) { t ->
                 ConversationRow(

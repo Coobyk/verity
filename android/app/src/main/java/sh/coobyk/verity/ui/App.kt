@@ -15,15 +15,17 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import sh.coobyk.verity.data.TdRepository
 
 @Composable
 fun VerityApp(vm: AppViewModel) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val conv by vm.conversation.collectAsStateWithLifecycle()
     val settingsOpen by vm.showSettings.collectAsStateWithLifecycle()
+    val auth by vm.authState.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
 
-    // Polling only runs while the app is resumed.
+    // Refresh chat lists when the app is resumed.
     LifecycleResumeEffect(Unit) {
         vm.setForeground(true)
         onPauseOrDispose { vm.setForeground(false) }
@@ -46,6 +48,7 @@ fun VerityApp(vm: AppViewModel) {
     ) {
         val c = conv
         when {
+            auth !is TdRepository.AuthState.Ready -> LoginScreen(vm)
             settingsOpen -> SettingsScreen(vm)
             c != null -> ChatScreen(vm, c)
             else -> ListScreen(vm)
