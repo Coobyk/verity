@@ -14,6 +14,7 @@ pub mod bridge;
 pub mod config;
 pub mod error;
 pub mod harness;
+pub mod liveness;
 pub mod mtproto;
 pub mod rich;
 pub mod store;
