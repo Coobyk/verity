@@ -24,7 +24,8 @@
 //! - `:::restart:::` — exit(0) once the turn's paperwork is done; the
 //!   supervisor (`Restart=always`) comes back on the new binary
 //! - `:::shutdown:::` — ask systemd to stop our own unit so it stays
-//!   down; a bare exit would just be restarted
+//!   down; a bare exit would just be restarted, and the watchdog honors
+//!   the asleep flag `stop_self` leaves behind
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -38,6 +39,7 @@ use tracing::{debug, info, warn};
 
 use crate::botapi::{BotApi, InputRichMessage};
 use crate::harness::{Activity, Harness, TurnContext};
+use crate::liveness::{self, Heartbeat};
 use crate::mtproto::Tg;
 use crate::rich::{split_markdown, RICH_LIMIT, TEXT_LIMIT};
 use crate::store::{Bot, Store};
@@ -100,6 +102,8 @@ struct Env {
     /// bot lives in. Resolved lazily on the first DM need (the dialog
     /// exists by definition then), cached per bot name.
     dm_peers: Arc<std::sync::Mutex<std::collections::HashMap<String, PeerRef>>>,
+    /// Sign-of-life registry the watchdog timer reads.
+    hb: Heartbeat,
 }
 
 /// Supervisor sweep interval: how often the bridge looks for newly
@@ -130,7 +134,9 @@ impl Bridge {
             peer: self.tg_peer,
             owner_id: self.owner_id,
             dm_peers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            hb: Heartbeat::default(),
         };
+        env.hb.spawn_flusher();
         // Periodic backup of ~/verity into General — the off-machine
         // copy that survives a dead laptop or a move to a VM. First one
         // lands a full interval in; `/backup` or `:::backup:::` for now.
@@ -203,6 +209,7 @@ impl Bridge {
             LoopEntry,
         >::new()));
         loop {
+            env.hb.beat("_supervisor");
             let bots = db_call(&env.db, |s| s.list_bots())
                 .await
                 .unwrap_or_default();
@@ -334,6 +341,7 @@ async fn run_bot(bot: &Bot, env: &Env, beat: &std::sync::atomic::AtomicU64) -> R
         // Prove liveness to the supervisor's watchdog — a stale beat
         // (hung HTTP, deadlocked task) gets us aborted and respawned.
         beat.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
+        env.hb.beat(&bot.name);
         // Self-terminate if this bot was removed from the store (e.g.
         // by a confirmed reset) — otherwise the supervisor keeps us
         // alive. The fresh record also catches a recreated topic: reset deletes
@@ -375,7 +383,15 @@ async fn run_bot(bot: &Bot, env: &Env, beat: &std::sync::atomic::AtomicU64) -> R
                     let wait =
                         Duration::from_secs(30 << conflicts.min(4)).min(CONFLICT_BACKOFF_MAX);
                     warn!(bot = %bot.name, backoff = ?wait, "getUpdates conflict — another poller owns this token");
-                    tokio::time::sleep(wait).await;
+                    // Chunked so a long standby backoff still proves the
+                    // loop is alive to the watchdog.
+                    let mut left = wait;
+                    while !left.is_zero() {
+                        let step = left.min(Duration::from_secs(60));
+                        tokio::time::sleep(step).await;
+                        env.hb.beat(&bot.name);
+                        left -= step;
+                    }
                 } else {
                     warn!(bot = %bot.name, error = %e, "getUpdates failed, retrying");
                     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1546,9 +1562,15 @@ async fn do_turn(
 /// under `Restart=always` the supervisor resurrects the process seconds
 /// later, so the bridge asks systemd to stop its own unit instead — the
 /// unit name is the last component of our own cgroup, and the stop
-/// request survives the SIGTERM it provokes. Without systemd, exiting
-/// is the stop anyway.
+/// request survives the SIGTERM it provokes. The asleep flag goes down
+/// first: without it the watchdog timer would resurrect the stopped
+/// unit within a minute. Without systemd, exiting is the stop anyway.
 async fn stop_self() {
+    let flag = liveness::asleep_path();
+    if let Some(d) = flag.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(&flag, b"shutdown");
     let unit = std::fs::read_to_string("/proc/self/cgroup")
         .ok()
         .and_then(|cg| cg.trim().rsplit('/').next().map(String::from))

@@ -108,6 +108,10 @@ enum Cmd {
         #[arg(long)]
         group: Option<String>,
     },
+    /// Liveness check: start the bridge if it's down, restart it if its
+    /// heartbeat went stale. Run by verity-watchdog.timer once a minute
+    /// — honors `~/.local/state/verity-asleep` and a disabled unit
+    Watchdog,
     /// Run the bridge: bots listen, work quietly, reply when done
     Serve {
         /// Use the echo harness (no agent provider needed)
@@ -823,6 +827,10 @@ async fn run() -> Result<()> {
                     println!("{note}");
                 }
             }
+        }
+
+        Cmd::Watchdog => {
+            verity_core::liveness::check().await?;
         }
 
         Cmd::Serve { echo, no_context } => {
