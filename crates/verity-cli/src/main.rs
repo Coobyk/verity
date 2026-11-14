@@ -332,9 +332,11 @@ async fn set_pfp(bot: &Bot, seed: u64, hue: Option<f64>) -> Result<()> {
 
 /// Entropy for `verity pfp random` — /dev/urandom, time as fallback.
 fn rand_u64() -> u64 {
-    if let Ok(b) = std::fs::read("/dev/urandom") {
-        if b.len() >= 8 {
-            return u64::from_le_bytes(b[..8].try_into().unwrap());
+    use std::io::Read;
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let mut b = [0u8; 8];
+        if f.read_exact(&mut b).is_ok() {
+            return u64::from_le_bytes(b);
         }
     }
     let n = std::time::SystemTime::now()
