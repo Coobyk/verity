@@ -10,7 +10,7 @@
 //! A worker thread owns a tokio runtime + the grammers client; the view
 //! swaps commands and snapshots with it over std mpsc channels.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ use gpui::*;
 use grammers_session::defs::PeerRef;
 use verity_core::botapi::BotApi;
 use verity_core::config::Config;
-use verity_core::mtproto::{Tg, TgEvent, TopicInfo, TopicMessage};
+use verity_core::mtproto::{FmtKind, Tg, TgEvent, TopicInfo, TopicMessage};
 use verity_core::store::{Bot, Store};
 use verity_core::{Error, Result};
 
@@ -269,9 +269,7 @@ async fn worker(group: String, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Ev>) {
         match rx.try_recv() {
             Ok(cmd) => {
                 match cmd {
-                    Cmd::Refresh => {
-                        refresh_all(&tg, peer, &mut dms, &mut selected, &tx).await
-                    }
+                    Cmd::Refresh => refresh_all(&tg, peer, &mut dms, &mut selected, &tx).await,
                     Cmd::Poll => {
                         if let Some(s) = selected {
                             match fetch_view(&tg, peer, &mut dms, s).await {
@@ -300,15 +298,9 @@ async fn worker(group: String, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Ev>) {
                         let sent = match s {
                             Sel::Topic(t) => tg.send_message(peer, Some(t), &text).await,
                             Sel::Dm(uid) => {
-                                match dms
-                                    .iter()
-                                    .find(|d| d.user_id == uid)
-                                    .and_then(|d| d.peer)
-                                {
+                                match dms.iter().find(|d| d.user_id == uid).and_then(|d| d.peer) {
                                     Some(p) => tg.send_message(p, None, &text).await,
-                                    None => {
-                                        Err(Error::Mtproto("no 1:1 chat to send into".into()))
-                                    }
+                                    None => Err(Error::Mtproto("no 1:1 chat to send into".into())),
                                 }
                             }
                         };
@@ -334,10 +326,9 @@ async fn worker(group: String, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Ev>) {
                         };
                         let target = match s {
                             Sel::Topic(_) => Some(peer),
-                            Sel::Dm(uid) => dms
-                                .iter()
-                                .find(|d| d.user_id == uid)
-                                .and_then(|d| d.peer),
+                            Sel::Dm(uid) => {
+                                dms.iter().find(|d| d.user_id == uid).and_then(|d| d.peer)
+                            }
                         };
                         match target {
                             Some(p) => {
@@ -383,9 +374,7 @@ async fn worker(group: String, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Ev>) {
                     } = ev
                     {
                         hit |= match selected {
-                            Some(Sel::Topic(t)) => {
-                                chat_hint == group_hint && topic == Some(t)
-                            }
+                            Some(Sel::Topic(t)) => chat_hint == group_hint && topic == Some(t),
                             Some(Sel::Dm(u)) => chat_hint == u && topic.is_none(),
                             None => false,
                         };
@@ -484,6 +473,11 @@ struct Root {
     awaiting: bool,
     focus_handle: FocusHandle,
     scroll: ScrollHandle,
+    /// A real monospace family resolved at startup, when one exists.
+    mono_font: Option<SharedString>,
+    /// `(message id, span index)` of spoilers the user tapped open;
+    /// cleared when the view changes.
+    revealed: HashSet<(i32, usize)>,
 }
 
 impl Root {
@@ -502,6 +496,30 @@ impl Root {
             awaiting: false,
             focus_handle: cx.focus_handle(),
             scroll: ScrollHandle::new(),
+            // gpui matches family names literally — pick the first
+            // well-known mono face the system actually has.
+            mono_font: {
+                let names = cx.text_system().all_font_names();
+                [
+                    "JetBrainsMono Nerd Font",
+                    "JetBrains Mono",
+                    "FiraCode Nerd Font",
+                    "Fira Code",
+                    "DejaVu Sans Mono",
+                    "Lilex",
+                    "Courier New",
+                ]
+                .iter()
+                .find(|c| names.iter().any(|n| n.as_str() == **c))
+                .map(|s| SharedString::from(*s))
+                .or_else(|| {
+                    names
+                        .iter()
+                        .find(|n| n.contains("Mono") || n.contains("mono"))
+                        .map(|n| SharedString::from(n.clone()))
+                })
+            },
+            revealed: HashSet::new(),
         };
         // Pump worker events into view state; live-tick the selected
         // view every ~3s, re-list topics + DMs every ~30s.
@@ -576,11 +594,136 @@ impl Root {
         }
     }
 
+    /// `TopicMessage` → styled text: formatting entities merged into
+    /// disjoint runs, links open in the browser, spoilers conceal
+    /// until tapped, code runs get the resolved mono face.
+    fn rich_text(
+        &self,
+        m: &TopicMessage,
+        base: &TextStyle,
+        text: Rgba,
+        accent: Rgba,
+        code_bg: Rgba,
+        dim: Rgba,
+        spoiler_bg: Rgba,
+        view: Entity<Root>,
+    ) -> InteractiveText {
+        enum Act {
+            Url(String),
+            Spoiler(i32, usize),
+        }
+
+        let len = m.text.len();
+        let mut cuts = BTreeSet::from([0, len]);
+        for s in &m.spans {
+            cuts.insert(s.start.min(len));
+            cuts.insert(s.start.saturating_add(s.len).min(len));
+        }
+        let cuts: Vec<usize> = cuts.into_iter().collect();
+
+        let underline = |color: Hsla| UnderlineStyle {
+            thickness: px(1.0),
+            color: Some(color),
+            wavy: false,
+        };
+        // Runs are baked eagerly — the ambient style's default color
+        // is black, so the caller's body color goes in explicitly.
+        let mut base = base.clone();
+        base.color = text.into();
+
+        // Entities nest/cross — merge into disjoint runs carrying the
+        // union of every covering span's style.
+        let mut runs = Vec::new();
+        for w in cuts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            if a >= b {
+                continue;
+            }
+            let mut style = base.clone();
+            let mut code = false;
+            let mut hidden = false;
+            for (ix, s) in m.spans.iter().enumerate() {
+                if s.start > a || s.start + s.len < b {
+                    continue;
+                }
+                match s.kind {
+                    FmtKind::Bold => style.font_weight = FontWeight::BOLD,
+                    FmtKind::Italic => style.font_style = FontStyle::Italic,
+                    FmtKind::Underline => style.underline = Some(underline(text.into())),
+                    FmtKind::Strike => {
+                        style.strikethrough = Some(StrikethroughStyle {
+                            thickness: px(1.0),
+                            color: None,
+                        })
+                    }
+                    FmtKind::Code | FmtKind::Pre => {
+                        code = true;
+                        style.background_color = Some(code_bg.into());
+                    }
+                    FmtKind::Spoiler => hidden = !self.revealed.contains(&(m.id, ix)),
+                    FmtKind::Blockquote => style.color = dim.into(),
+                    FmtKind::Link => {
+                        style.color = accent.into();
+                        style.underline = Some(underline(accent.into()));
+                    }
+                    FmtKind::Accent | FmtKind::CustomEmoji => style.color = accent.into(),
+                }
+            }
+            if code {
+                if let Some(mono) = &self.mono_font {
+                    style.font_family = mono.clone();
+                }
+            }
+            if hidden {
+                style.color = spoiler_bg.into();
+                style.background_color = Some(spoiler_bg.into());
+            }
+            runs.push(style.to_run(b - a));
+        }
+
+        let mut clickables = Vec::new();
+        let mut acts = Vec::new();
+        for (ix, s) in m.spans.iter().enumerate() {
+            let range = s.start..(s.start + s.len).min(len);
+            match s.kind {
+                FmtKind::Link => {
+                    if let Some(url) = &s.url {
+                        clickables.push(range);
+                        acts.push(Act::Url(url.clone()));
+                    }
+                }
+                FmtKind::Spoiler => {
+                    clickables.push(range);
+                    acts.push(Act::Spoiler(m.id, ix));
+                }
+                _ => {}
+            }
+        }
+
+        let text = InteractiveText::new(
+            ElementId::named_usize("fmt", m.id.max(0) as usize),
+            StyledText::new(m.text.clone()).with_runs(runs),
+        );
+        if clickables.is_empty() {
+            return text;
+        }
+        text.on_click(clickables, move |ix, _window, cx| match &acts[ix] {
+            Act::Url(url) => cx.open_url(url),
+            Act::Spoiler(msg, span) => {
+                let _ = view.update(cx, |this, cx| {
+                    this.revealed.insert((*msg, *span));
+                    cx.notify();
+                });
+            }
+        })
+    }
+
     fn select(&mut self, sel: Sel, cx: &mut Context<Self>) {
         if self.selected != Some(sel) {
             self.selected = Some(sel);
             self.messages.clear();
             self.last_msg = None;
+            self.revealed.clear();
             let _ = self.cmd_tx.send(Cmd::Select(sel));
             cx.notify();
         }
@@ -670,7 +813,7 @@ impl Focusable for Root {
 }
 
 impl Render for Root {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected;
         let me = self.me;
         // Grok's palette: pure-black canvas, near-invisible hairlines,
@@ -682,6 +825,13 @@ impl Render for Root {
         let selected_bg = rgb(0x1e1f22);
         let bubble = rgb(0x2f3336);
         let composer_bg = rgb(0x16181c);
+        // Rich text accents: Grok's link blue, code chips a step above
+        // the canvas, concealed spoilers a hair darker.
+        let accent = rgb(0x1d9bf0);
+        let code_bg = rgb(0x1e1f22);
+        let spoiler_bg = rgb(0x21262b);
+        let text_style = window.text_style();
+        let view = cx.entity();
         let chip_chosen = rgb(0x20304a);
 
         let section = |label: &'static str| {
@@ -801,7 +951,16 @@ impl Render for Root {
                                             .px_4()
                                             .py_2()
                                             .text_color(text)
-                                            .child(m.text.clone()),
+                                            .child(self.rich_text(
+                                                m,
+                                                &text_style,
+                                                text,
+                                                accent,
+                                                code_bg,
+                                                dim,
+                                                spoiler_bg,
+                                                view.clone(),
+                                            )),
                                     ),
                                 )
                                 .children(chips)
@@ -821,7 +980,16 @@ impl Render for Root {
                                         )
                                         .child(div().text_xs().text_color(dim).child(hhmm(m.date))),
                                 )
-                                .child(div().text_color(text).child(m.text.clone()))
+                                .child(div().text_color(text).child(self.rich_text(
+                                    m,
+                                    &text_style,
+                                    text,
+                                    accent,
+                                    code_bg,
+                                    dim,
+                                    spoiler_bg,
+                                    view.clone(),
+                                )))
                                 .children(chips)
                         }
                     }))

@@ -121,7 +121,42 @@ pub struct TopicMessage {
     /// GUI uses it to tell "my" messages from everyone else's.
     pub sender_id: Option<i64>,
     pub text: String,
+    /// Formatting spans over `text` — Telegram message entities with
+    /// UTF-16 offsets already converted to byte offsets.
+    pub spans: Vec<FmtSpan>,
     pub reactions: Vec<ReactionInfo>,
+}
+
+/// The styling one entity applies to a slice of message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FmtKind {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    /// Inline monospace.
+    Code,
+    /// Multiline code block.
+    Pre,
+    Spoiler,
+    Blockquote,
+    /// Clickable link — `url` carries the target.
+    Link,
+    /// Colored but unactionable: mentions, hashtags, commands.
+    Accent,
+    CustomEmoji,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FmtSpan {
+    pub kind: FmtKind,
+    /// Byte offset into `TopicMessage.text`.
+    pub start: usize,
+    /// Byte length of the span.
+    pub len: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// One row of the account's chat list — the GUI's sidebar. Unlike
@@ -171,6 +206,72 @@ pub struct WipeReport {
     pub bots_kicked: usize,
     pub topics_deleted: usize,
     pub general_messages: usize,
+}
+
+/// `MessageEntity` offsets are UTF-16 code units — walk the UTF-8
+/// text counting UTF-16 length per char to find the byte position.
+fn utf16_to_byte(text: &str, utf16_pos: i32) -> usize {
+    let mut acc = 0i32;
+    for (byte_ix, ch) in text.char_indices() {
+        if acc >= utf16_pos {
+            return byte_ix;
+        }
+        acc += ch.len_utf16() as i32;
+    }
+    text.len()
+}
+
+/// `Message.entities` → byte-offset formatting spans for the GUI.
+/// Bare URL/email entities link to their own text; unactionable
+/// entities (mentions, hashtags, commands) collapse to `Accent`.
+fn fmt_spans(entities: Option<&Vec<tl::enums::MessageEntity>>, text: &str) -> Vec<FmtSpan> {
+    use tl::enums::MessageEntity as E;
+    let Some(entities) = entities else {
+        return Vec::new();
+    };
+    entities
+        .iter()
+        .filter_map(|e| {
+            let kind = match e {
+                E::Bold(_) => FmtKind::Bold,
+                E::Italic(_) => FmtKind::Italic,
+                E::Underline(_) => FmtKind::Underline,
+                E::Strike(_) => FmtKind::Strike,
+                E::Code(_) => FmtKind::Code,
+                E::Pre(_) => FmtKind::Pre,
+                E::Spoiler(_) => FmtKind::Spoiler,
+                E::Blockquote(_) => FmtKind::Blockquote,
+                E::CustomEmoji(_) => FmtKind::CustomEmoji,
+                E::TextUrl(_) | E::Url(_) | E::Email(_) => FmtKind::Link,
+                E::Mention(_)
+                | E::Hashtag(_)
+                | E::Cashtag(_)
+                | E::BotCommand(_)
+                | E::Phone(_)
+                | E::BankCard(_)
+                | E::MentionName(_)
+                | E::InputMessageEntityMentionName(_) => FmtKind::Accent,
+                E::Unknown(_) => return None,
+            };
+            let start = utf16_to_byte(text, e.offset());
+            let end = utf16_to_byte(text, e.offset() + e.length());
+            if end <= start {
+                return None;
+            }
+            let url = match e {
+                E::TextUrl(t) => Some(t.url.clone()),
+                E::Url(_) => Some(text[start..end].to_string()),
+                E::Email(_) => Some(format!("mailto:{}", &text[start..end])),
+                _ => None,
+            };
+            Some(FmtSpan {
+                kind,
+                start,
+                len: end - start,
+                url,
+            })
+        })
+        .collect()
 }
 
 /// `grammers` Message → the `reactions` field of the underlying TL
@@ -669,12 +770,14 @@ impl Tg {
                     } else {
                         m.message
                     };
+                    let spans = fmt_spans(m.entities.as_ref(), &text);
                     Some(TopicMessage {
                         id: m.id,
                         date: m.date as i64,
                         sender,
                         sender_id,
                         text,
+                        spans,
                         reactions: Self::reaction_list(m.reactions.as_ref()),
                     })
                 }
@@ -720,12 +823,14 @@ impl Tg {
             } else {
                 m.text().to_string()
             };
+            let spans = fmt_spans(m.fmt_entities(), &text);
             out.push(TopicMessage {
                 id: m.id(),
                 date: m.date().timestamp(),
                 sender,
                 sender_id,
                 text,
+                spans,
                 reactions: Self::reaction_list(raw_reactions(&m.raw)),
             });
         }
@@ -1616,12 +1721,14 @@ impl Tg {
         } else {
             m.text().to_string()
         };
+        let spans = fmt_spans(m.fmt_entities(), &text);
         TopicMessage {
             id: m.id(),
             date: m.date().timestamp(),
             sender,
             sender_id,
             text,
+            spans,
             reactions: Self::reaction_list(raw_reactions(&m.raw)),
         }
     }
@@ -1746,5 +1853,51 @@ mod tests {
     #[test]
     fn passes_positive_ids() {
         assert_eq!(chat_id_to_bare(1234567890), 1234567890);
+    }
+
+    #[test]
+    fn utf16_offsets_convert_to_bytes() {
+        // Emoji cost 2 UTF-16 units; ä costs 1. Entities point at
+        // UTF-16 positions — byte offsets must count wide chars double.
+        let text = "ab👀cd äf";
+        assert_eq!(utf16_to_byte(text, 4), 6); // after 👀
+        assert_eq!(utf16_to_byte(text, 0), 0);
+        assert_eq!(utf16_to_byte(text, 2), 2);
+        assert_eq!(utf16_to_byte(text, 7), "ab👀cd ".len());
+    }
+
+    #[test]
+    fn fmt_spans_maps_entities() {
+        use tl::enums::MessageEntity as E;
+        use tl::types as tt;
+        let text = "bold link rest";
+        let entities = vec![
+            E::Bold(tt::MessageEntityBold { offset: 0, length: 4 }),
+            E::TextUrl(tt::MessageEntityTextUrl {
+                offset: 5,
+                length: 4,
+                url: "https://example.com".into(),
+            }),
+        ];
+        let spans = fmt_spans(Some(&entities), text);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].kind, FmtKind::Bold);
+        assert_eq!(&text[spans[0].start..spans[0].start + spans[0].len], "bold");
+        assert_eq!(spans[1].kind, FmtKind::Link);
+        assert_eq!(spans[1].url.as_deref(), Some("https://example.com"));
+    }
+
+    #[test]
+    fn fmt_spans_bare_url_links_itself() {
+        use tl::enums::MessageEntity as E;
+        use tl::types as tt;
+        let text = "see https://x.y now";
+        let entities = vec![E::Url(tt::MessageEntityUrl {
+            offset: 4,
+            length: 11,
+        })];
+        let spans = fmt_spans(Some(&entities), text);
+        assert_eq!(spans[0].kind, FmtKind::Link);
+        assert_eq!(spans[0].url.as_deref(), Some("https://x.y"));
     }
 }
