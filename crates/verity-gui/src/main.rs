@@ -19,7 +19,7 @@ use gpui::*;
 use grammers_session::defs::PeerRef;
 use verity_core::botapi::BotApi;
 use verity_core::config::Config;
-use verity_core::mtproto::{Tg, TopicInfo, TopicMessage};
+use verity_core::mtproto::{Tg, TgEvent, TopicInfo, TopicMessage};
 use verity_core::store::{Bot, Store};
 use verity_core::{Error, Result};
 
@@ -42,6 +42,12 @@ enum Cmd {
     Select(Sel),
     /// Post `text` into the selected view as the user, then re-fetch it.
     Send(String),
+    /// Toggle your `emoji` reaction on `msg_id` in the selected view.
+    React {
+        msg_id: i32,
+        emoji: String,
+        chosen: bool,
+    },
 }
 
 /// One row of the DIRECT sidebar section.
@@ -251,59 +257,154 @@ async fn worker(group: String, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Ev>) {
     };
     status!("");
 
+    // Bot-API style id of the group — matches TgEvent::chat_hint so a
+    // pushed update can be mapped onto the selected view.
+    let group_hint = peer.id.bot_api_dialog_id();
+
     let mut dms: Vec<Dm> = Vec::new();
     let mut selected: Option<Sel> = None;
     refresh_all(&tg, peer, &mut dms, &mut selected, &tx).await;
 
-    while let Ok(cmd) = rx.recv() {
-        match cmd {
-            Cmd::Refresh => refresh_all(&tg, peer, &mut dms, &mut selected, &tx).await,
-            Cmd::Poll => {
-                if let Some(s) = selected {
-                    match fetch_view(&tg, peer, &mut dms, s).await {
-                        Ok(messages) => {
-                            let _ = tx.send(Ev::Messages { sel: s, messages });
-                        }
-                        Err(e) => status!("poll: {e}"),
+    loop {
+        match rx.try_recv() {
+            Ok(cmd) => {
+                match cmd {
+                    Cmd::Refresh => {
+                        refresh_all(&tg, peer, &mut dms, &mut selected, &tx).await
                     }
-                }
-            }
-            Cmd::Select(s) => {
-                selected = Some(s);
-                match fetch_view(&tg, peer, &mut dms, s).await {
-                    Ok(messages) => {
-                        let _ = tx.send(Ev::Messages { sel: s, messages });
-                    }
-                    Err(e) => status!("history: {e}"),
-                }
-            }
-            Cmd::Send(text) => {
-                let Some(s) = selected else {
-                    status!("nothing selected");
-                    continue;
-                };
-                // Topics get a threaded reply; DMs go straight to the bot.
-                let sent = match s {
-                    Sel::Topic(t) => tg.send_message(peer, Some(t), &text).await,
-                    Sel::Dm(uid) => {
-                        match dms.iter().find(|d| d.user_id == uid).and_then(|d| d.peer) {
-                            Some(p) => tg.send_message(p, None, &text).await,
-                            None => Err(Error::Mtproto("no 1:1 chat to send into".into())),
+                    Cmd::Poll => {
+                        if let Some(s) = selected {
+                            match fetch_view(&tg, peer, &mut dms, s).await {
+                                Ok(messages) => {
+                                    let _ = tx.send(Ev::Messages { sel: s, messages });
+                                }
+                                Err(e) => status!("poll: {e}"),
+                            }
                         }
                     }
-                };
-                if let Err(e) = sent {
-                    status!("send: {e}");
-                    continue;
-                }
-                match fetch_view(&tg, peer, &mut dms, s).await {
-                    Ok(messages) => {
-                        let _ = tx.send(Ev::Messages { sel: s, messages });
+                    Cmd::Select(s) => {
+                        selected = Some(s);
+                        match fetch_view(&tg, peer, &mut dms, s).await {
+                            Ok(messages) => {
+                                let _ = tx.send(Ev::Messages { sel: s, messages });
+                            }
+                            Err(e) => status!("history: {e}"),
+                        }
                     }
-                    Err(e) => status!("history: {e}"),
+                    Cmd::Send(text) => {
+                        let Some(s) = selected else {
+                            status!("nothing selected");
+                            continue;
+                        };
+                        // Topics get a threaded reply; DMs go straight to the bot.
+                        let sent = match s {
+                            Sel::Topic(t) => tg.send_message(peer, Some(t), &text).await,
+                            Sel::Dm(uid) => {
+                                match dms
+                                    .iter()
+                                    .find(|d| d.user_id == uid)
+                                    .and_then(|d| d.peer)
+                                {
+                                    Some(p) => tg.send_message(p, None, &text).await,
+                                    None => {
+                                        Err(Error::Mtproto("no 1:1 chat to send into".into()))
+                                    }
+                                }
+                            }
+                        };
+                        if let Err(e) = sent {
+                            status!("send: {e}");
+                            continue;
+                        }
+                        match fetch_view(&tg, peer, &mut dms, s).await {
+                            Ok(messages) => {
+                                let _ = tx.send(Ev::Messages { sel: s, messages });
+                            }
+                            Err(e) => status!("history: {e}"),
+                        }
+                    }
+                    Cmd::React {
+                        msg_id,
+                        emoji,
+                        chosen,
+                    } => {
+                        let Some(s) = selected else {
+                            status!("nothing selected");
+                            continue;
+                        };
+                        let target = match s {
+                            Sel::Topic(_) => Some(peer),
+                            Sel::Dm(uid) => dms
+                                .iter()
+                                .find(|d| d.user_id == uid)
+                                .and_then(|d| d.peer),
+                        };
+                        match target {
+                            Some(p) => {
+                                let r = tg
+                                    .send_reaction(
+                                        p,
+                                        msg_id,
+                                        if chosen { None } else { Some(&emoji) },
+                                    )
+                                    .await;
+                                if let Err(e) = r {
+                                    status!("reaction: {e}");
+                                    continue;
+                                }
+                                match fetch_view(&tg, peer, &mut dms, s).await {
+                                    Ok(messages) => {
+                                        let _ = tx.send(Ev::Messages { sel: s, messages });
+                                    }
+                                    Err(e) => status!("history: {e}"),
+                                }
+                            }
+                            None => status!("no 1:1 chat to react in"),
+                        }
+                    }
                 }
+                // Keep draining queued commands before the next tick.
+                continue;
             }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => return,
         }
+
+        // Live push: grammers buffers socket updates — drain them and
+        // refetch when one lands in the open view (a message arriving
+        // anywhere else doesn't need a refetch — the 3s Poll covers
+        // reaction edits, which Telegram doesn't push as messages).
+        match tg.updates().await {
+            Ok(events) => {
+                let mut hit = false;
+                for ev in events {
+                    if let TgEvent::Message {
+                        chat_hint, topic, ..
+                    } = ev
+                    {
+                        hit |= match selected {
+                            Some(Sel::Topic(t)) => {
+                                chat_hint == group_hint && topic == Some(t)
+                            }
+                            Some(Sel::Dm(u)) => chat_hint == u && topic.is_none(),
+                            None => false,
+                        };
+                    }
+                }
+                if hit {
+                    if let Some(s) = selected {
+                        match fetch_view(&tg, peer, &mut dms, s).await {
+                            Ok(messages) => {
+                                let _ = tx.send(Ev::Messages { sel: s, messages });
+                            }
+                            Err(e) => status!("history: {e}"),
+                        }
+                    }
+                }
+            }
+            Err(e) => status!("updates: {e}"),
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
     }
 }
 
@@ -312,6 +413,58 @@ async fn worker(group: String, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Ev>) {
 fn hhmm(unix: i64) -> String {
     let t = unix.rem_euclid(86_400);
     format!("{:02}:{:02}", t / 3600, (t % 3600) / 60)
+}
+
+/// The row of reaction pills under a message — `None` when there are
+/// none. Clicking a pill toggles your own copy of that reaction.
+fn reaction_chips(
+    m: &TopicMessage,
+    align_end: bool,
+    idle_bg: Rgba,
+    chosen_bg: Rgba,
+    dim: Rgba,
+    cx: &mut Context<Root>,
+) -> Option<Div> {
+    if m.reactions.is_empty() {
+        return None;
+    }
+    let msg_id = m.id;
+    let chips = m.reactions.iter().map(|r| {
+        let emoji = r.emoji.clone();
+        let chosen = r.chosen;
+        div()
+            .id(ElementId::Name(format!("rx-{msg_id}-{emoji}").into()))
+            .px_2()
+            .py(px(2.))
+            .rounded_md()
+            .cursor_pointer()
+            .bg(if chosen { chosen_bg } else { idle_bg })
+            .border_1()
+            .border_color(if chosen { chosen_bg } else { rgb(0x2f3336) })
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_xs()
+            .child(emoji.clone())
+            .when(r.count > 1, |d| {
+                d.child(div().text_color(dim).child(r.count.to_string()))
+            })
+            .on_click(cx.listener(move |this, _ev: &ClickEvent, _w, cx| {
+                let _ = this.cmd_tx.send(Cmd::React {
+                    msg_id,
+                    emoji: emoji.clone(),
+                    chosen,
+                });
+                cx.notify();
+            }))
+    });
+    Some(
+        div()
+            .flex()
+            .gap_1()
+            .when(align_end, |d| d.justify_end())
+            .children(chips),
+    )
 }
 
 struct Root {
@@ -529,6 +682,7 @@ impl Render for Root {
         let selected_bg = rgb(0x1e1f22);
         let bubble = rgb(0x2f3336);
         let composer_bg = rgb(0x16181c);
+        let chip_chosen = rgb(0x20304a);
 
         let section = |label: &'static str| {
             div()
@@ -629,19 +783,28 @@ impl Render for Root {
                     .gap_4()
                     .children(self.messages.iter().map(|m| {
                         let mine = me.is_some() && m.sender_id == me;
+                        let chips = reaction_chips(m, mine, composer_bg, chip_chosen, dim, cx);
                         if mine {
                             // Your message: dark pill, right edge, no
                             // name tag — Grok trusts you know you.
-                            div().flex().justify_end().child(
-                                div()
-                                    .max_w(px(520.0))
-                                    .bg(bubble)
-                                    .rounded_2xl()
-                                    .px_4()
-                                    .py_2()
-                                    .text_color(text)
-                                    .child(m.text.clone()),
-                            )
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_end()
+                                .gap_1()
+                                .child(
+                                    div().flex().justify_end().child(
+                                        div()
+                                            .max_w(px(520.0))
+                                            .bg(bubble)
+                                            .rounded_2xl()
+                                            .px_4()
+                                            .py_2()
+                                            .text_color(text)
+                                            .child(m.text.clone()),
+                                    ),
+                                )
+                                .children(chips)
                         } else {
                             // Theirs: bare text with a whispered name,
                             // like Grok's own replies.
@@ -659,6 +822,7 @@ impl Render for Root {
                                         .child(div().text_xs().text_color(dim).child(hhmm(m.date))),
                                 )
                                 .child(div().text_color(text).child(m.text.clone()))
+                                .children(chips)
                         }
                     }))
                     .when(self.messages.is_empty(), |d| {

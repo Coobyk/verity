@@ -1838,6 +1838,7 @@ mod tests {
             peer: None,
             owner_id: None,
             dm_peers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            hb: Heartbeat::default(),
         };
         let bot = Bot {
             name: "scout".into(),
