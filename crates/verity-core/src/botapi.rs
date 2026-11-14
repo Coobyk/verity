@@ -190,7 +190,35 @@ impl BotApi {
         thread_id: Option<i64>,
         reply_to: Option<i64>,
     ) -> Result<Message> {
+        self.send_message_ex(chat_id, text, thread_id, reply_to, false)
+            .await
+    }
+
+    /// Same send, but `disable_notification` — arrives with no sound
+    /// or badge. For chatter that shouldn't ping (progress notes).
+    pub async fn send_message_silent(
+        &self,
+        chat_id: i64,
+        text: &str,
+        thread_id: Option<i64>,
+        reply_to: Option<i64>,
+    ) -> Result<Message> {
+        self.send_message_ex(chat_id, text, thread_id, reply_to, true)
+            .await
+    }
+
+    async fn send_message_ex(
+        &self,
+        chat_id: i64,
+        text: &str,
+        thread_id: Option<i64>,
+        reply_to: Option<i64>,
+        silent: bool,
+    ) -> Result<Message> {
         let mut body = json!({ "chat_id": chat_id, "text": text });
+        if silent {
+            body["disable_notification"] = true.into();
+        }
         if let Some(t) = thread_id {
             body["message_thread_id"] = t.into();
         }

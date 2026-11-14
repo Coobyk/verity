@@ -990,7 +990,7 @@ fn progress_task(
             }
         };
         let Ok(m) = api
-            .send_message(chat_id, &format!("⏳ {}…", what()), thread, reply_to)
+            .send_message_silent(chat_id, &format!("⏳ {}…", what()), thread, reply_to)
             .await
         else {
             return;
