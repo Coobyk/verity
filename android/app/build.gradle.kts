@@ -36,6 +36,17 @@ android {
         buildConfigField("String", "TDLIB_API_HASH", "\"$tdlibApiHash\"")
     }
 
+    signingConfigs {
+        // Repo-owned debug key so every machine (local, instabox, CI)
+        // signs identical APKs — updates install without wiping app data.
+        named("debug") {
+            storeFile = rootProject.file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
