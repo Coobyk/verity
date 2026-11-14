@@ -80,6 +80,7 @@ import sh.coobyk.verity.data.ChatMessage
 import sh.coobyk.verity.data.Conversation
 import sh.coobyk.verity.data.ConversationKind
 import sh.coobyk.verity.data.MsgBlock
+import sh.coobyk.verity.data.Reaction
 import sh.coobyk.verity.math.TypstBridge
 import java.time.Instant
 import java.time.ZoneId
@@ -192,6 +193,7 @@ fun ChatScreen(vm: AppViewModel, conv: Conversation) {
                             m,
                             mine = me != null && m.senderId == me,
                             avatarPath = m.senderId?.let { ui.avatars[it] },
+                            onReaction = { vm.toggleReaction(m.id, it) },
                         )
                     }
                     if (enter) {
@@ -234,9 +236,14 @@ fun ChatScreen(vm: AppViewModel, conv: Conversation) {
 }
 
 @Composable
-private fun MessageRow(m: ChatMessage, mine: Boolean, avatarPath: String?) {
+private fun MessageRow(
+    m: ChatMessage,
+    mine: Boolean,
+    avatarPath: String?,
+    onReaction: (Reaction) -> Unit,
+) {
     if (mine) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+        Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End) {
             Box(
                 Modifier
                     .padding(start = 56.dp, top = 2.dp, bottom = 2.dp)
@@ -246,6 +253,7 @@ private fun MessageRow(m: ChatMessage, mine: Boolean, avatarPath: String?) {
             ) {
                 Column { m.blocks.forEach { MessageBlock(it, 20.sp) } }
             }
+            ReactionChips(m.reactions, onReaction)
         }
     } else {
         Row(Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 6.dp)) {
@@ -266,6 +274,43 @@ private fun MessageRow(m: ChatMessage, mine: Boolean, avatarPath: String?) {
             m.blocks.forEach {
                 MessageBlock(it, 21.sp, Modifier.padding(top = 2.dp))
             }
+            ReactionChips(m.reactions, onReaction)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReactionChips(
+    reactions: List<Reaction>,
+    onToggle: (Reaction) -> Unit,
+) {
+    if (reactions.isEmpty()) return
+    Row(
+        Modifier.padding(top = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        reactions.forEach { r ->
+            Surface(
+                onClick = { onToggle(r) },
+                shape = RoundedCornerShape(10.dp),
+                color = if (r.chosen) ChosenChip else ComposerFill,
+                border = BorderStroke(0.5.dp, Hairline),
+            ) {
+                Row(
+                    Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(r.emoji, fontSize = 12.sp)
+                    if (r.count > 1) {
+                        Spacer(Modifier.width(3.dp))
+                        Text(
+                            "${r.count}",
+                            color = if (r.chosen) MainText else DimText,
+                            fontSize = 11.sp,
+                        )
+                    }
+                }
             }
         }
     }

@@ -40,12 +40,19 @@ sealed interface MsgBlock {
     data class Math(val tex: String, val display: Boolean) : MsgBlock
 }
 
+data class Reaction(
+    val emoji: String,
+    val count: Int,
+    val chosen: Boolean,
+)
+
 data class ChatMessage(
     val id: Long,
     val date: Long, // epoch seconds
     val sender: String,
     val senderId: Long?,
     val blocks: List<MsgBlock>,
+    val reactions: List<Reaction> = emptyList(),
 )
 
 enum class ConversationKind { TOPIC, DM }
@@ -235,6 +242,20 @@ class TdRepository(context: Context) {
                             list.map {
                                 if (it.id == u.messageId) it.copy(blocks = newBlocks) else it
                             }
+                        }
+                    }
+                }
+            }
+
+            TdApi.UpdateMessageInteractionInfo.CONSTRUCTOR -> {
+                val u = obj as TdApi.UpdateMessageInteractionInfo
+                val open = openConv
+                if (open != null && u.chatId == open.chatId) {
+                    val reactions = toReactions(u.interactionInfo)
+                    messages.update { list ->
+                        list.map {
+                            if (it.id == u.messageId) it.copy(reactions = reactions)
+                            else it
                         }
                     }
                 }
@@ -601,7 +622,46 @@ class TdRepository(context: Context) {
             sender = sender,
             senderId = senderId,
             blocks = contentBlocks(m.chatId, m.id, m.content),
+            reactions = toReactions(m.interactionInfo),
         )
+    }
+
+    private fun toReactions(info: TdApi.MessageInteractionInfo?): List<Reaction> =
+        info?.reactions?.reactions.orEmpty().mapNotNull { r ->
+            if (r.totalCount <= 0) {
+                null
+            } else {
+                Reaction(
+                    when (val t = r.type) {
+                        is TdApi.ReactionTypeEmoji -> t.emoji
+                        is TdApi.ReactionTypeCustomEmoji -> "✨"
+                        else -> "⭐" // paid
+                    },
+                    r.totalCount,
+                    r.isChosen,
+                )
+            }
+        }
+
+    /** Adds/removes a standard-emoji reaction on a message in the open chat. */
+    fun toggleReaction(messageId: Long, r: Reaction) {
+        val open = openConv ?: return
+        scope.launch {
+            runCatching {
+                val type = TdApi.ReactionTypeEmoji(r.emoji)
+                if (r.chosen) {
+                    exec<TdApi.Ok>(
+                        TdApi.RemoveMessageReaction(open.chatId, messageId, type),
+                    )
+                } else {
+                    exec<TdApi.Ok>(
+                        TdApi.AddMessageReaction(
+                            open.chatId, messageId, type, false, true,
+                        ),
+                    )
+                }
+            }.onFailure { status.value = it.message ?: "Reaction failed" }
+        }
     }
 
     private suspend fun contentBlocks(

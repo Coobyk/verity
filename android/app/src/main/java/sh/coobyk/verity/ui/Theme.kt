@@ -12,6 +12,7 @@ val DimText = Color(0xFF71767B)
 val MainText = Color(0xFFE7E9EA)
 val BubbleFill = Color(0xFF2F3336)
 val ComposerFill = Color(0xFF16181C)
+val ChosenChip = Color(0xFF20304A)
 val ErrorRed = Color(0xFFF4212E)
 
 private val scheme = darkColorScheme(
