@@ -124,7 +124,7 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>) -> Result<Vec<u8>> {
     let mut rng = Rng(seed.max(1));
     let s = size as f64;
     let c = s * 0.5;
-    let bgc = (0xf9, 0xf9, 0xf9);
+    let bgc = (0xff, 0xff, 0xff);
 
     // seeded extent ~52–70% of the canvas, and a small tilt so even
     // symmetric shapes feel less rigid
