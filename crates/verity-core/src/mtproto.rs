@@ -1489,6 +1489,21 @@ impl Tg {
         Ok(ids)
     }
 
+    /// Delete messages in any dialog by id, 100 per call — user-side
+    /// revoke, so any message goes, not just ones we sent. Works for
+    /// private chats (DMs) and channels alike.
+    pub async fn delete_any_messages(&self, peer: PeerRef, ids: &[i32]) -> Result<usize> {
+        let mut n = 0;
+        for chunk in ids.chunks(100) {
+            n += self
+                .client
+                .delete_messages(peer, chunk)
+                .await
+                .map_err(|e| Error::Mtproto(format!("deleteMessages: {e}")))?;
+        }
+        Ok(n)
+    }
+
     /// Delete channel messages by id, 100 per call — user-side, so any
     /// message goes, not just ones we sent.
     pub async fn delete_messages(&self, peer: PeerRef, ids: &[i32]) -> Result<usize> {
