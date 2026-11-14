@@ -569,6 +569,7 @@ async fn recover_pending(
     bot_name: &str,
 ) -> Vec<(i64, Option<i64>, Option<i64>, String)> {
     let pfx = pending_prefix(bot_name);
+    let gpfx = format!("progress:{bot_name}:");
     let legacy = format!("pending:{bot_name}");
     db_call(db, move |s| {
         let mut out = Vec::new();
@@ -590,6 +591,12 @@ async fn recover_pending(
                 _ => (None, None),
             };
             out.push((mid, chat, thread, v));
+        }
+        // ⏳ ids whose turn already ended — nothing will reuse them.
+        for (k, _) in s.kv_prefix(&gpfx)? {
+            if s.kv_get(&k.replacen("progress:", "pending:", 1))?.is_none() {
+                let _ = s.kv_del(&k);
+            }
         }
         Ok(out)
     })
@@ -685,7 +692,8 @@ async fn run_command(
         s.clear_memory(&n)?;
         s.kv_del(&format!("greeted:{n}"))?;
         s.kv_del(&format!("pending:{n}"))?;
-        s.kv_del_prefix(&format!("pending:{n}:"))
+        s.kv_del_prefix(&format!("pending:{n}:"))?;
+        s.kv_del_prefix(&format!("progress:{n}:"))
     };
     match cmd {
         "clear" => {
@@ -984,14 +992,20 @@ fn typing_keepalive(api: BotApi, chat_id: i64, thread: Option<i64>) -> tokio::ta
 /// After [`PROGRESS_AFTER`], post one progress message — a reply to the
 /// triggering message so it's traceable — and edit it every
 /// [`PROGRESS_TICK`] with the current activity label ("editing
-/// bridge.rs") and the elapsed count. Returns the task handle and the
+/// bridge.rs") and the elapsed count. `existing` is the ⏳ a crashed
+/// attempt at this same turn left behind: edit it in place rather than
+/// stacking a fresh message per restart, and keep its id in `prog_key`
+/// so the next resume finds it again. Returns the task handle and the
 /// shared slot holding the message id (for later deletion).
 fn progress_task(
     api: BotApi,
+    db: PathBuf,
     chat_id: i64,
     thread: Option<i64>,
     reply_to: Option<i64>,
     activity: Activity,
+    prog_key: String,
+    existing: Option<i64>,
 ) -> (tokio::task::JoinHandle<()>, Arc<Mutex<Option<i64>>>) {
     let msg_id = Arc::new(Mutex::new(None));
     let slot = msg_id.clone();
@@ -1005,22 +1019,35 @@ fn progress_task(
                 a
             }
         };
-        let Ok(m) = api
-            .send_message_silent(chat_id, &format!("⏳ {}…", what()), thread, reply_to)
-            .await
-        else {
-            return;
+        // Reuse the orphan a dead run left if it still exists; only a
+        // missing/deleted one earns a fresh send.
+        let id = match existing {
+            Some(id)
+                if api
+                    .edit_message(chat_id, id, &format!("⏳ {}…", what()))
+                    .await
+                    .is_ok() =>
+            {
+                id
+            }
+            _ => {
+                let Ok(m) = api
+                    .send_message_silent(chat_id, &format!("⏳ {}…", what()), thread, reply_to)
+                    .await
+                else {
+                    return;
+                };
+                let key = prog_key.clone();
+                let _ = db_call(&db, move |s| s.kv_set(&key, &m.message_id.to_string())).await;
+                m.message_id
+            }
         };
-        *slot.lock().unwrap() = Some(m.message_id);
+        *slot.lock().unwrap() = Some(id);
         let start = Instant::now();
         loop {
             tokio::time::sleep(PROGRESS_TICK).await;
             let text = format!("⏳ {}… {}s elapsed", what(), start.elapsed().as_secs());
-            if api
-                .edit_message(chat_id, m.message_id, &text)
-                .await
-                .is_err()
-            {
+            if api.edit_message(chat_id, id, &text).await.is_err() {
                 return;
             }
         }
@@ -1210,12 +1237,25 @@ async fn handle_turn(
     let _ = api.send_chat_action(chat_id, "typing", thread).await;
     let keepalive = typing_keepalive(api.clone(), chat_id, thread);
     let activity = Activity::default();
+    // A crashed attempt at this turn may have left a ⏳ behind — hand
+    // its id to the progress task so it edits in place instead of
+    // stacking a fresh message on every restart.
+    let gkey = progress_key(&bot.name, message_id, chat_id, thread);
+    let gkey2 = gkey.clone();
+    let existing = db_call(&env.db, move |s| s.kv_get(&gkey2))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<i64>().ok());
     let (progress, progress_msg) = progress_task(
         api.clone(),
+        env.db.clone(),
         chat_id,
         thread,
         Some(message_id),
         activity.clone(),
+        gkey.clone(),
+        existing,
     );
 
     let result = do_turn(
@@ -1236,10 +1276,15 @@ async fn handle_turn(
     if let Some(id) = progress_id {
         let _ = api.delete_message(chat_id, id).await;
     }
-    // Turn over — clear the pending record, then resolve the 👀:
-    // ✅ only when the turn spawned helpers; a plain reply leaves no mark.
+    // Turn over — clear the pending record and the ⏳ id that rode
+    // beside it, then resolve the 👀: ✅ only when the turn spawned
+    // helpers; a plain reply leaves no mark.
     let pkey = pending_key(&bot.name, message_id, chat_id, thread);
-    let _ = db_call(&env.db, move |s| s.kv_del(&pkey)).await;
+    let _ = db_call(&env.db, move |s| {
+        s.kv_del(&pkey)?;
+        s.kv_del(&gkey)
+    })
+    .await;
     match &result {
         Ok(o) if o.helpers => {
             let _ = api.set_reaction(chat_id, message_id, "✅").await;
@@ -1272,6 +1317,16 @@ async fn handle_turn(
 fn pending_key(bot_name: &str, message_id: i64, chat_id: i64, thread: Option<i64>) -> String {
     format!(
         "pending:{bot_name}:{message_id}:{chat_id}:{}",
+        thread.unwrap_or(0)
+    )
+}
+
+/// A turn's ⏳ id, keyed by the same coordinates as its pending record.
+/// Written when the progress message is sent so a crashed-and-resumed
+/// turn edits it instead of posting another.
+fn progress_key(bot_name: &str, message_id: i64, chat_id: i64, thread: Option<i64>) -> String {
+    format!(
+        "progress:{bot_name}:{message_id}:{chat_id}:{}",
         thread.unwrap_or(0)
     )
 }
