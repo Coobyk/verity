@@ -167,3 +167,18 @@ pub extern "system" fn Java_sh_coobyk_verity_math_TypstBridge_lastError(
     let s = LAST_ERR.lock().unwrap().clone();
     env.new_string(s).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn renders_display_formula() {
+        let png = super::render_latex("\\frac{a}{b} + \\sqrt{x}", true, 1.0, true).unwrap();
+        assert!(png.starts_with(b"\x89PNG"));
+        assert!(png.len() > 500);
+    }
+
+    #[test]
+    fn bad_tex_errors_not_panics() {
+        assert!(super::render_latex("\\nonexistent{", true, 1.0, true).is_err());
+    }
+}
