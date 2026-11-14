@@ -157,6 +157,9 @@ pub struct FmtSpan {
     pub len: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// `Pre` fence language ("math", "rust", …) when Telegram sent one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
 }
 
 /// One row of the account's chat list — the GUI's sidebar. Unlike
@@ -206,6 +209,153 @@ pub struct WipeReport {
     pub bots_kicked: usize,
     pub topics_deleted: usize,
     pub general_messages: usize,
+}
+
+/// A message's renderable chunks — styled text or a formula image.
+pub enum Blk {
+    /// `text` is the message slice; spans are rebased to it and
+    /// paired with their original start (the spoiler reveal key).
+    Text {
+        text: String,
+        spans: Vec<(usize, FmtSpan)>,
+    },
+    Math {
+        tex: String,
+        display: bool,
+    },
+}
+
+/// Split message text into text/latex blocks. Delimiters: `$$…$$` and
+/// `\[…\]` (display), `\(…\)` and `$…$` (inline, pandoc-style — the
+/// closing `$` needs a non-space left neighbour and no digit right
+/// neighbour). Spans marked code/pre are off-limits; a `Pre` fence
+/// with `lang` in {math, latex, tex} becomes a formula directly.
+pub fn split_math(m: &TopicMessage) -> Vec<Blk> {
+    let text = &m.text;
+    let b = text.as_bytes();
+    let n = b.len();
+
+    // (block_start, block_end, tex_start, tex_end, display)
+    let mut maths: Vec<(usize, usize, usize, usize, bool)> = Vec::new();
+    let mut code_ranges: Vec<(usize, usize)> = Vec::new();
+    for s in &m.spans {
+        match s.kind {
+            FmtKind::Pre
+                if s.lang.as_deref().is_some_and(|l| {
+                    matches!(l.to_ascii_lowercase().as_str(), "math" | "latex" | "tex")
+                }) =>
+            {
+                maths.push((s.start, s.start + s.len, s.start, s.start + s.len, true));
+            }
+            FmtKind::Code | FmtKind::Pre => code_ranges.push((s.start, s.start + s.len)),
+            _ => {}
+        }
+    }
+    let covered = |pos: usize, maths: &[(usize, usize, usize, usize, bool)]| -> bool {
+        code_ranges.iter().any(|(a, e)| pos >= *a && pos < *e)
+            || maths.iter().any(|(a, e, ..)| pos >= *a && pos < *e)
+    };
+
+    let is_space = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r');
+    // Pandoc's inline rule: non-space inside both delimiters, and the
+    // char after the close must not be a digit (kills "$5 and $10").
+    let tight = |from: usize, to: usize| -> bool {
+        from < to && !is_space(b[from]) && !is_space(b[to - 1])
+    };
+    let close_ok =
+        |j: usize, clen: usize| -> bool { j + clen >= n || !b[j + clen].is_ascii_digit() };
+    // First occurrence of `close` at/after `from`, skipping
+    // backslash-escaped candidates. Byte-wise: the walk position is
+    // not necessarily a char boundary.
+    let find_close = |close: &[u8], mut from: usize| -> Option<usize> {
+        loop {
+            let pos = from + b[from..].windows(close.len()).position(|w| w == close)?;
+            if pos > 0 && b[pos - 1] == b'\\' {
+                from = pos + close.len();
+            } else {
+                return Some(pos);
+            }
+        }
+    };
+
+    let mut i = 0;
+    while i < n {
+        if covered(i, &maths) {
+            i += 1;
+            continue;
+        }
+        let two = &b[i..(i + 2).min(n)];
+        let (clen, disp, close): (usize, bool, &[u8]) = match two {
+            b"$$" => (2, true, b"$$"),
+            b"\\[" => (2, true, b"\\]"),
+            b"\\(" => (2, false, b"\\)"),
+            _ if b[i] == b'$' => (1, false, b"$"),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let body_start = i + clen;
+        let Some(j) = find_close(close, body_start) else {
+            i += 1;
+            continue;
+        };
+        if !tight(body_start, j) || !close_ok(j, close.len()) {
+            i += 1;
+            continue;
+        }
+        maths.push((i, j + close.len(), body_start, j, disp));
+        i = j + close.len();
+    }
+
+    maths.sort_by_key(|m| m.0);
+    let mut out = Vec::new();
+    let mut cur = 0;
+    let emit_text = |a: usize, e: usize, out: &mut Vec<Blk>| {
+        if a >= e || m.text[a..e].is_empty() {
+            return;
+        }
+        let spans: Vec<(usize, FmtSpan)> = m
+            .spans
+            .iter()
+            .filter_map(|s| {
+                let start = s.start.max(a);
+                let end = (s.start + s.len).min(e);
+                (end > start).then(|| {
+                    (
+                        s.start,
+                        FmtSpan {
+                            kind: s.kind,
+                            start: start - a,
+                            len: end - start,
+                            url: s.url.clone(),
+                            lang: s.lang.clone(),
+                        },
+                    )
+                })
+            })
+            .collect();
+        out.push(Blk::Text {
+            text: m.text[a..e].to_string(),
+            spans,
+        });
+    };
+    for (bs, be, ts, te, disp) in maths {
+        if bs < cur {
+            continue; // nested inside an earlier region
+        }
+        emit_text(cur, bs, &mut out);
+        let tex = m.text[ts..te].trim();
+        if !tex.is_empty() {
+            out.push(Blk::Math {
+                tex: tex.to_string(),
+                display: disp,
+            });
+        }
+        cur = be;
+    }
+    emit_text(cur, n, &mut out);
+    out
 }
 
 /// `MessageEntity` offsets are UTF-16 code units — walk the UTF-8
@@ -264,11 +414,16 @@ fn fmt_spans(entities: Option<&Vec<tl::enums::MessageEntity>>, text: &str) -> Ve
                 E::Email(_) => Some(format!("mailto:{}", &text[start..end])),
                 _ => None,
             };
+            let lang = match e {
+                E::Pre(p) if !p.language.is_empty() => Some(p.language.clone()),
+                _ => None,
+            };
             Some(FmtSpan {
                 kind,
                 start,
                 len: end - start,
                 url,
+                lang,
             })
         })
         .collect()
@@ -1872,7 +2027,10 @@ mod tests {
         use tl::types as tt;
         let text = "bold link rest";
         let entities = vec![
-            E::Bold(tt::MessageEntityBold { offset: 0, length: 4 }),
+            E::Bold(tt::MessageEntityBold {
+                offset: 0,
+                length: 4,
+            }),
             E::TextUrl(tt::MessageEntityTextUrl {
                 offset: 5,
                 length: 4,
@@ -1899,5 +2057,94 @@ mod tests {
         let spans = fmt_spans(Some(&entities), text);
         assert_eq!(spans[0].kind, FmtKind::Link);
         assert_eq!(spans[0].url.as_deref(), Some("https://x.y"));
+    }
+
+    fn msg(text: &str, spans: Vec<FmtSpan>) -> TopicMessage {
+        TopicMessage {
+            id: 1,
+            date: 0,
+            sender: "t".into(),
+            sender_id: None,
+            text: text.into(),
+            spans,
+            reactions: vec![],
+        }
+    }
+
+    #[test]
+    fn splits_display_math() {
+        let m = msg("before $$\\frac{a}{b}$$ after", vec![]);
+        let blocks = split_math(&m);
+        assert_eq!(blocks.len(), 3);
+        match &blocks[1] {
+            Blk::Math { tex, display } => {
+                assert_eq!(tex, "\\frac{a}{b}");
+                assert!(display);
+            }
+            _ => panic!("expected math"),
+        }
+        match &blocks[0] {
+            Blk::Text { text, .. } => assert_eq!(text, "before "),
+            _ => panic!(),
+        }
+        match &blocks[2] {
+            Blk::Text { text, .. } => assert_eq!(text, " after"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn ignores_currency_dollars() {
+        let m = msg("it costs $5 and $10 total", vec![]);
+        assert_eq!(split_math(&m).len(), 1);
+    }
+
+    #[test]
+    fn skips_dollars_inside_code() {
+        let m = msg(
+            "echo $x$ done",
+            vec![FmtSpan {
+                kind: FmtKind::Code,
+                start: 5,
+                len: 4,
+                url: None,
+                lang: None,
+            }],
+        );
+        assert_eq!(split_math(&m).len(), 1);
+    }
+
+    #[test]
+    fn pre_math_fence_becomes_formula() {
+        let m = msg(
+            "x^2 + y^2",
+            vec![FmtSpan {
+                kind: FmtKind::Pre,
+                start: 0,
+                len: 9,
+                url: None,
+                lang: Some("latex".into()),
+            }],
+        );
+        let blocks = split_math(&m);
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(blocks[0], Blk::Math { display: true, .. }));
+    }
+
+    #[test]
+    fn inline_math() {
+        let m = msg("so $x^2$ works", vec![]);
+        let blocks = split_math(&m);
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(blocks[1], Blk::Math { display: false, .. }));
+    }
+
+    #[test]
+    fn emoji_text_does_not_panic() {
+        // ⏳ is 3 UTF-8 bytes — the byte-walk must not slice mid-char.
+        let m = msg("⏳ $x^2$ done", vec![]);
+        let blocks = split_math(&m);
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(blocks[1], Blk::Math { .. }));
     }
 }

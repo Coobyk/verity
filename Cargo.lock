@@ -8470,6 +8470,7 @@ dependencies = [
  "tokio",
  "tracing",
  "verity-core",
+ "verity-math",
 ]
 
 [[package]]

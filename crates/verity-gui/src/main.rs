@@ -11,7 +11,7 @@
 //! swaps commands and snapshots with it over std mpsc channels.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
@@ -19,7 +19,7 @@ use gpui::*;
 use grammers_session::defs::PeerRef;
 use verity_core::botapi::BotApi;
 use verity_core::config::Config;
-use verity_core::mtproto::{FmtKind, Tg, TgEvent, TopicInfo, TopicMessage};
+use verity_core::mtproto::{split_math, Blk, FmtKind, FmtSpan, Tg, TgEvent, TopicInfo, TopicMessage};
 use verity_core::store::{Bot, Store};
 use verity_core::{Error, Result};
 
@@ -475,9 +475,12 @@ struct Root {
     scroll: ScrollHandle,
     /// A real monospace family resolved at startup, when one exists.
     mono_font: Option<SharedString>,
-    /// `(message id, span index)` of spoilers the user tapped open;
-    /// cleared when the view changes.
+    /// `(message id, span's original start)` of spoilers the user
+    /// tapped open; cleared when the view changes.
     revealed: HashSet<(i32, usize)>,
+    /// Rendered formula bitmaps, keyed `(tex, display)` — `None`
+    /// caches failures too, so broken input isn't recompiled per frame.
+    math_cache: HashMap<(String, bool), Option<Arc<Image>>>,
 }
 
 impl Root {
@@ -520,6 +523,7 @@ impl Root {
                 })
             },
             revealed: HashSet::new(),
+            math_cache: HashMap::new(),
         };
         // Pump worker events into view state; live-tick the selected
         // view every ~3s, re-list topics + DMs every ~30s.
@@ -594,14 +598,19 @@ impl Root {
         }
     }
 
-    /// `TopicMessage` → styled text: formatting entities merged into
+    /// One text block → styled text: formatting entities merged into
     /// disjoint runs, links open in the browser, spoilers conceal
-    /// until tapped, code runs get the resolved mono face.
+    /// until tapped, code runs get the resolved mono face. `spans`
+    /// are rebased to `text` and paired with their original start —
+    /// the spoiler reveal key.
     fn rich_text(
         &self,
-        m: &TopicMessage,
+        msg_id: i32,
+        elkey: String,
+        text: &str,
+        spans: &[(usize, FmtSpan)],
         base: &TextStyle,
-        text: Rgba,
+        fg: Rgba,
         accent: Rgba,
         code_bg: Rgba,
         dim: Rgba,
@@ -613,9 +622,9 @@ impl Root {
             Spoiler(i32, usize),
         }
 
-        let len = m.text.len();
+        let len = text.len();
         let mut cuts = BTreeSet::from([0, len]);
-        for s in &m.spans {
+        for (_, s) in spans {
             cuts.insert(s.start.min(len));
             cuts.insert(s.start.saturating_add(s.len).min(len));
         }
@@ -629,7 +638,7 @@ impl Root {
         // Runs are baked eagerly — the ambient style's default color
         // is black, so the caller's body color goes in explicitly.
         let mut base = base.clone();
-        base.color = text.into();
+        base.color = fg.into();
 
         // Entities nest/cross — merge into disjoint runs carrying the
         // union of every covering span's style.
@@ -642,14 +651,14 @@ impl Root {
             let mut style = base.clone();
             let mut code = false;
             let mut hidden = false;
-            for (ix, s) in m.spans.iter().enumerate() {
+            for &(orig, ref s) in spans {
                 if s.start > a || s.start + s.len < b {
                     continue;
                 }
                 match s.kind {
                     FmtKind::Bold => style.font_weight = FontWeight::BOLD,
                     FmtKind::Italic => style.font_style = FontStyle::Italic,
-                    FmtKind::Underline => style.underline = Some(underline(text.into())),
+                    FmtKind::Underline => style.underline = Some(underline(fg.into())),
                     FmtKind::Strike => {
                         style.strikethrough = Some(StrikethroughStyle {
                             thickness: px(1.0),
@@ -660,7 +669,7 @@ impl Root {
                         code = true;
                         style.background_color = Some(code_bg.into());
                     }
-                    FmtKind::Spoiler => hidden = !self.revealed.contains(&(m.id, ix)),
+                    FmtKind::Spoiler => hidden = !self.revealed.contains(&(msg_id, orig)),
                     FmtKind::Blockquote => style.color = dim.into(),
                     FmtKind::Link => {
                         style.color = accent.into();
@@ -683,7 +692,7 @@ impl Root {
 
         let mut clickables = Vec::new();
         let mut acts = Vec::new();
-        for (ix, s) in m.spans.iter().enumerate() {
+        for &(orig, ref s) in spans {
             let range = s.start..(s.start + s.len).min(len);
             match s.kind {
                 FmtKind::Link => {
@@ -694,15 +703,15 @@ impl Root {
                 }
                 FmtKind::Spoiler => {
                     clickables.push(range);
-                    acts.push(Act::Spoiler(m.id, ix));
+                    acts.push(Act::Spoiler(msg_id, orig));
                 }
                 _ => {}
             }
         }
 
         let text = InteractiveText::new(
-            ElementId::named_usize("fmt", m.id.max(0) as usize),
-            StyledText::new(m.text.clone()).with_runs(runs),
+            ElementId::Name(elkey.into()),
+            StyledText::new(SharedString::from(text.to_string())).with_runs(runs),
         );
         if clickables.is_empty() {
             return text;
@@ -716,6 +725,58 @@ impl Root {
                 });
             }
         })
+    }
+
+    /// A math block → the rasterized formula (pre-warmed into
+    /// `math_cache` before render), or the raw source dimmed when
+    /// mitex/typst couldn't compile it.
+    fn math_el(&self, tex: &str, display: bool, dim: Rgba) -> AnyElement {
+        match self.math_cache.get(&(tex.to_string(), display)) {
+            Some(Some(image)) => div()
+                .when(display, |d| d.flex().justify_center().py_1())
+                .child(img(image.clone()))
+                .into_any_element(),
+            _ => div()
+                .text_color(dim)
+                .child(tex.to_string())
+                .into_any_element(),
+        }
+    }
+
+    /// `split_math` output → renderable elements for one message.
+    fn msg_blocks(
+        &self,
+        m: &TopicMessage,
+        base: &TextStyle,
+        fg: Rgba,
+        accent: Rgba,
+        code_bg: Rgba,
+        dim: Rgba,
+        spoiler_bg: Rgba,
+        view: &Entity<Root>,
+    ) -> Vec<AnyElement> {
+        split_math(m)
+            .iter()
+            .enumerate()
+            .map(|(bi, b)| match b {
+                Blk::Text { text, spans } => self
+                    .rich_text(
+                        m.id,
+                        format!("fmt-{}-{}", m.id, bi),
+                        text,
+                        spans,
+                        base,
+                        fg,
+                        accent,
+                        code_bg,
+                        dim,
+                        spoiler_bg,
+                        view.clone(),
+                    )
+                    .into_any_element(),
+                Blk::Math { tex, display } => self.math_el(tex, *display, dim),
+            })
+            .collect()
     }
 
     fn select(&mut self, sel: Sel, cx: &mut Context<Self>) {
@@ -834,6 +895,22 @@ impl Render for Root {
         let view = cx.entity();
         let chip_chosen = rgb(0x20304a);
 
+        // Compile any new formulas once — render() runs on every
+        // notify, so typst work must not happen inside the tree walk.
+        for m in &self.messages {
+            for b in split_math(m) {
+                if let Blk::Math { tex, display } = b {
+                    self.math_cache
+                        .entry((tex.clone(), display))
+                        .or_insert_with(|| {
+                            verity_math::render_latex(&tex, display, 1.0, true)
+                                .ok()
+                                .map(|png| Arc::new(Image::from_bytes(ImageFormat::Png, png)))
+                        });
+                }
+            }
+        }
+
         let section = |label: &'static str| {
             div()
                 .px_4()
@@ -951,7 +1028,7 @@ impl Render for Root {
                                             .px_4()
                                             .py_2()
                                             .text_color(text)
-                                            .child(self.rich_text(
+                                            .children(self.msg_blocks(
                                                 m,
                                                 &text_style,
                                                 text,
@@ -959,7 +1036,7 @@ impl Render for Root {
                                                 code_bg,
                                                 dim,
                                                 spoiler_bg,
-                                                view.clone(),
+                                                &view,
                                             )),
                                     ),
                                 )
@@ -980,16 +1057,21 @@ impl Render for Root {
                                         )
                                         .child(div().text_xs().text_color(dim).child(hhmm(m.date))),
                                 )
-                                .child(div().text_color(text).child(self.rich_text(
-                                    m,
-                                    &text_style,
-                                    text,
-                                    accent,
-                                    code_bg,
-                                    dim,
-                                    spoiler_bg,
-                                    view.clone(),
-                                )))
+                                .children(
+                                    self.msg_blocks(
+                                        m,
+                                        &text_style,
+                                        text,
+                                        accent,
+                                        code_bg,
+                                        dim,
+                                        spoiler_bg,
+                                        &view,
+                                    )
+                                    .into_iter()
+                                    .map(|el| div().text_color(text).child(el).into_any_element())
+                                    .collect::<Vec<_>>(),
+                                )
                                 .children(chips)
                         }
                     }))
@@ -1102,3 +1184,4 @@ fn main() {
         cx.activate(true);
     });
 }
+
