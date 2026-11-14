@@ -103,6 +103,15 @@ pub struct GroupInfo {
     pub kind: &'static str,
 }
 
+/// One reaction pill on a message — the emoji, how many people set
+/// it, and whether the logged-in user is one of them.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReactionInfo {
+    pub emoji: String,
+    pub count: i32,
+    pub chosen: bool,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TopicMessage {
     pub id: i32,
@@ -112,6 +121,7 @@ pub struct TopicMessage {
     /// GUI uses it to tell "my" messages from everyone else's.
     pub sender_id: Option<i64>,
     pub text: String,
+    pub reactions: Vec<ReactionInfo>,
 }
 
 /// One row of the account's chat list — the GUI's sidebar. Unlike
@@ -161,6 +171,15 @@ pub struct WipeReport {
     pub bots_kicked: usize,
     pub topics_deleted: usize,
     pub general_messages: usize,
+}
+
+/// `grammers` Message → the `reactions` field of the underlying TL
+/// object; service/empty variants carry none.
+fn raw_reactions(m: &tl::enums::Message) -> Option<&tl::enums::MessageReactions> {
+    match m {
+        tl::enums::Message::Message(m) => m.reactions.as_ref(),
+        _ => None,
+    }
 }
 
 /// Normalize a Bot-API-style chat id to the bare peer id grammers uses.
@@ -656,6 +675,7 @@ impl Tg {
                         sender,
                         sender_id,
                         text,
+                        reactions: Self::reaction_list(m.reactions.as_ref()),
                     })
                 }
                 _ => None,
@@ -706,6 +726,7 @@ impl Tg {
                 sender,
                 sender_id,
                 text,
+                reactions: Self::reaction_list(raw_reactions(&m.raw)),
             });
         }
         out.reverse(); // iter_messages is newest-first
@@ -1601,7 +1622,62 @@ impl Tg {
             sender,
             sender_id,
             text,
+            reactions: Self::reaction_list(raw_reactions(&m.raw)),
         }
+    }
+
+    /// `Message.reactions` → flat pills. Custom emoji get a neutral
+    /// glyph (the sticker itself needs a document fetch we don't do);
+    /// paid reactions collapse to a star.
+    fn reaction_list(r: Option<&tl::enums::MessageReactions>) -> Vec<ReactionInfo> {
+        let Some(tl::enums::MessageReactions::Reactions(r)) = r else {
+            return Vec::new();
+        };
+        r.results
+            .iter()
+            .filter_map(|rc| {
+                let tl::enums::ReactionCount::Count(rc) = rc;
+                if rc.count <= 0 {
+                    return None;
+                }
+                let emoji = match &rc.reaction {
+                    tl::enums::Reaction::Emoji(e) => e.emoticon.clone(),
+                    tl::enums::Reaction::CustomEmoji(_) => "✨".into(),
+                    tl::enums::Reaction::Paid => "⭐".into(),
+                    _ => return None,
+                };
+                Some(ReactionInfo {
+                    emoji,
+                    count: rc.count,
+                    chosen: rc.chosen_order.is_some(),
+                })
+            })
+            .collect()
+    }
+
+    /// Set (or with `None`, clear) the caller's reaction on a message.
+    /// Telegram keeps one reaction set per user — the last send wins.
+    pub async fn send_reaction(
+        &self,
+        peer: PeerRef,
+        msg_id: i32,
+        emoji: Option<&str>,
+    ) -> Result<()> {
+        self.client
+            .invoke(&tl::functions::messages::SendReaction {
+                big: false,
+                add_to_recent: true,
+                peer: peer.into(),
+                msg_id,
+                reaction: emoji.map(|e| {
+                    vec![tl::enums::Reaction::Emoji(tl::types::ReactionEmoji {
+                        emoticon: e.to_string(),
+                    })]
+                }),
+            })
+            .await
+            .map_err(|e| Error::Mtproto(format!("sendReaction: {e}")))?;
+        Ok(())
     }
 
     /// Drain the update queue — every event received since the last
