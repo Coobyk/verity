@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tracing::info;
 
@@ -144,25 +144,38 @@ impl PiHarness {
             timeout: turn_timeout(),
         }
     }
-}
 
-#[async_trait]
-impl Harness for PiHarness {
-    async fn run_turn(&self, ctx: &TurnContext, prompt: &str) -> Result<TurnOutput> {
+    async fn run_turn_inner(&self, ctx: &TurnContext, prompt: &str) -> Result<TurnOutput> {
         let mut cmd = Command::new(&self.bin);
         cmd.arg("--mode")
             .arg("print")
             .arg("-p")
             .arg(full_prompt(ctx, prompt))
             .current_dir(&ctx.cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         if let Some(m) = &ctx.model {
             cmd.arg("--model").arg(m);
         }
-        let out = cmd
-            .output()
-            .await
+        let mut child = ChildGroup::spawn(&mut cmd)
             .map_err(|e| Error::Harness(format!("failed to spawn {}: {e}", self.bin)))?;
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut stderr = child.stderr.take().expect("piped stderr");
+        let mut stdout_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
+        let (status, _, _) = tokio::try_join!(
+            child.wait(),
+            stdout.read_to_end(&mut stdout_buf),
+            stderr.read_to_end(&mut stderr_buf),
+        )
+        .map_err(|e| Error::Harness(format!("failed to run {}: {e}", self.bin)))?;
+        let out = std::process::Output {
+            status,
+            stdout: stdout_buf,
+            stderr: stderr_buf,
+        };
         if !out.status.success() {
             return Err(Error::Harness(format!(
                 "{} exited {}: {}",
@@ -177,6 +190,20 @@ impl Harness for PiHarness {
         Ok(TurnOutput {
             reply: strip_thinking(String::from_utf8_lossy(&out.stdout).trim()),
         })
+    }
+}
+
+#[async_trait]
+impl Harness for PiHarness {
+    async fn run_turn(&self, ctx: &TurnContext, prompt: &str) -> Result<TurnOutput> {
+        match tokio::time::timeout(self.timeout, self.run_turn_inner(ctx, prompt)).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::Harness(format!(
+                "{}: turn exceeded {}s",
+                self.bin,
+                self.timeout.as_secs()
+            ))),
+        }
     }
 }
 
@@ -650,6 +677,7 @@ fn permission_response(id: serde_json::Value, msg: &serde_json::Value) -> serde_
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[cfg(unix)]
     async fn run_pi_script(script: &str) -> Result<TurnOutput> {
         use std::os::unix::fs::PermissionsExt;
@@ -748,7 +776,6 @@ mod tests {
             "{err}"
         );
     }
-
 
     #[cfg(unix)]
     #[tokio::test]
