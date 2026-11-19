@@ -322,10 +322,9 @@ impl AcpHarness {
                 let mut line =
                     serde_json::to_string(&req).map_err(|e| Error::Harness(e.to_string()))?;
                 line.push('\n');
-                stdin
-                    .write_all(line.as_bytes())
-                    .await
-                    .map_err(|e| Error::Harness(format!("acp write: {e}")))?;
+                if stdin.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
                 let t = line.trim_end();
                 info!("acp -> {}", &t[..t.floor_char_boundary(t.len().min(300))]);
                 sent += 1;
@@ -355,10 +354,9 @@ impl AcpHarness {
                     let mut l =
                         serde_json::to_string(&resp).map_err(|e| Error::Harness(e.to_string()))?;
                     l.push('\n');
-                    stdin
-                        .write_all(l.as_bytes())
-                        .await
-                        .map_err(|e| Error::Harness(format!("acp write: {e}")))?;
+                    if stdin.write_all(l.as_bytes()).await.is_err() {
+                        break;
+                    }
                 } else if method == "session/update" {
                     let u = &msg["params"]["update"];
                     if let Some(label) = activity_label(u) {
@@ -408,9 +406,24 @@ impl AcpHarness {
 
         drop(stdin); // close the pipe so the server can exit
                      // Per-turn agent: don't wait indefinitely — kill if it lingers.
-        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .ok()
+            .transpose()
+            .map_err(|e| Error::Harness(format!("acp wait: {e}")))?;
         let _ = child.kill().await;
         let stderr = stderr_buf.await.unwrap_or_default();
+        if status.is_some_and(|status| !status.success()) || pending < requests.len() {
+            let reason = match status {
+                Some(status) => format!("{bin} exited {status}"),
+                None => format!("{bin} closed stdout without completing the ACP turn"),
+            };
+            let tail: String = stderr.chars().rev().take(500).collect();
+            return Err(Error::Harness(format!(
+                "{reason}: {}",
+                tail.chars().rev().collect::<String>()
+            )));
+        }
         let reply = strip_thinking(acc.finish().trim());
         if reply.is_empty() && !stderr.is_empty() {
             tracing::debug!(stderr = %stderr.chars().take(500).collect::<String>(), "acp: empty reply");
@@ -610,6 +623,17 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn acp_crash_reports_exit_status_and_stderr() {
+        let err = run_acp_script("read -r request; echo 'agent crashed' >&2; exit 42")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Harness(_)), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("exit status: 42"), "{message}");
+        assert!(message.contains("agent crashed"), "{message}");
+    }
+
+    #[cfg(unix)]
+    async fn run_acp_script(script: &str) -> Result<TurnOutput> {
         let ctx = TurnContext {
             bot_name: "test".into(),
             instructions: String::new(),
@@ -622,17 +646,41 @@ mod tests {
             activity: Activity::default(),
         };
         let harness = AcpHarness {
-            argv: vec![
-                "sh".into(),
-                "-c".into(),
-                "read -r request; echo 'agent crashed' >&2; exit 42".into(),
-            ],
+            argv: vec!["sh".into(), "-c".into(), script.into()],
         };
-        let err = harness.run_turn(&ctx, "hello").await.unwrap_err();
-        assert!(matches!(err, Error::Harness(_)), "{err}");
-        let message = err.to_string();
-        assert!(message.contains("exit status: 42"), "{message}");
-        assert!(message.contains("agent crashed"), "{message}");
+        harness.run_turn(&ctx, "hello").await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_incomplete_clean_exit_is_error() {
+        let err = run_acp_script("read -r request; exit 0").await.unwrap_err();
+        assert!(err.to_string().contains("exit status: 0"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_immediate_crash_reports_exit_status() {
+        let err = run_acp_script("exit 42").await.unwrap_err();
+        assert!(err.to_string().contains("exit status: 42"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_completed_turn_allows_reply_or_empty_reply() {
+        for reply in ["hello", ""] {
+            let script = format!(
+                r#"read -r request
+echo '{{"jsonrpc":"2.0","id":0,"result":{{}}}}'
+read -r request
+echo '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"test"}}}}'
+read -r request
+echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"text":"{reply}"}}}}}}}}'
+echo '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
+"#
+            );
+            assert_eq!(run_acp_script(&script).await.unwrap().reply, reply);
+        }
     }
 
     #[test]
