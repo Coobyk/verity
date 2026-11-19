@@ -219,14 +219,17 @@ impl ChildGroup {
         })
     }
 
-    fn kill_group(&self) {
+    fn kill_group(&mut self) {
         #[cfg(unix)]
         if let Some(pid) = self.pid {
-            let _ = std::process::Command::new("kill")
+            let killed = std::process::Command::new("kill")
                 .args(["-KILL", "--", &format!("-{pid}")])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
+            if killed.is_ok_and(|status| status.success()) {
+                self.pid = None;
+            }
         }
     }
 }
