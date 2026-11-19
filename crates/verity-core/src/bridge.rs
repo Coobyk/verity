@@ -1898,6 +1898,56 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_message_survives_restart() {
+        let mock = mock_api().await;
+        let dir = std::env::temp_dir().join(format!("verity-queued-test-{}", std::process::id()));
+        let env = Env {
+            group_id: -100123,
+            db: dir.join("state.sqlite"),
+            make: Arc::new(|_: &str| -> Arc<dyn Harness> { Arc::new(crate::harness::EchoHarness) }),
+            tg: None,
+            peer: None,
+            owner_id: None,
+            dm_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            hb: Heartbeat::default(),
+        };
+        let bot = Bot {
+            name: "scout".into(),
+            token: "TESTTOKEN".into(),
+            username: Some("scoutbot".into()),
+            topic_id: Some(7),
+            instructions: String::new(),
+            provider: "echo".into(),
+            model: None,
+            greeting: None,
+        };
+        let api = BotApi::new("TESTTOKEN").with_base(&mock.base);
+        let db = env.db.clone();
+        let task = tokio::spawn(async move {
+            let msg = serde_json::from_value(serde_json::json!({
+                "message_id": 42, "chat": {"id": -100123, "type": "supergroup"},
+                "date": 0, "text": "queued hello", "message_thread_id": 7
+            }))
+            .unwrap();
+            handle_message(&api, &bot, &env, -100123, Some(7), Arc::new(Semaphore::new(0)), msg).await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if mock.calls.lock().unwrap().iter().any(|(m, _)| m == "setMessageReaction") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert!(!task.is_finished());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let pending = recover_pending(&db, "scout").await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(pending, vec![(42, Some(-100123), Some(7), "queued hello".into())]);
+    }
+
     /// Full quiet-bot turn against the mock: 👀 (🕒 is set earlier, at
     /// dispatch) → typing → work → rich
     /// reply → ✅. Exercises `handle_turn` end to end, DB included.
