@@ -283,6 +283,92 @@ fn read_bot(stmt: &sqlite::Statement) -> Result<Bot> {
 mod tests {
     use super::*;
 
+    fn add_test_bot(store: &Store) {
+        store
+            .add_bot(&Bot {
+                name: "scout".into(),
+                token: "mock".into(),
+                username: None,
+                topic_id: None,
+                instructions: String::new(),
+                provider: "echo".into(),
+                model: None,
+                greeting: None,
+            })
+            .unwrap();
+    }
+
+    fn assert_current_timestamp(store: &Store, table: &str, column: &str) {
+        let mut stmt = store
+            .conn
+            .prepare(format!(
+                "SELECT typeof({column}), abs({column} - strftime('%s', 'now')) <= 60 FROM {table}"
+            ))
+            .unwrap();
+        assert_eq!(stmt.next().unwrap(), State::Row);
+        assert_eq!(stmt.read::<String, _>(0).unwrap(), "integer");
+        assert_eq!(stmt.read::<i64, _>(1).unwrap(), 1);
+    }
+
+    #[test]
+    fn timestamp_defaults_work_on_older_sqlite() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO bots (name, token) VALUES ('scout', 'mock');
+                 INSERT INTO memory (bot, key, value) VALUES ('scout', 'note', 'first');",
+            )
+            .unwrap();
+        for (table, column) in [("bots", "created_at"), ("memory", "updated")] {
+            assert_current_timestamp(&store, table, column);
+            let mut stmt = store
+                .conn
+                .prepare(format!(
+                    "SELECT lower(dflt_value) FROM pragma_table_info('{table}') WHERE name = '{column}'"
+                ))
+                .unwrap();
+            assert_eq!(stmt.next().unwrap(), State::Row);
+            let default = stmt.read::<String, _>(0).unwrap();
+            assert!(!default.contains("unixepoch"), "{table}.{column}: {default}");
+        }
+    }
+
+    #[test]
+    fn bot_and_memory_writes_store_integer_epoch_seconds() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        add_test_bot(&store);
+        assert_current_timestamp(&store, "bots", "created_at");
+
+        store.remember("scout", "note", "first").unwrap();
+        assert_current_timestamp(&store, "memory", "updated");
+        store.conn.execute("UPDATE memory SET updated = 0").unwrap();
+        store.remember("scout", "note", "changed").unwrap();
+        assert_current_timestamp(&store, "memory", "updated");
+        assert_eq!(
+            store.recall("scout").unwrap(),
+            vec![("note".into(), "changed".into())]
+        );
+    }
+
+    #[test]
+    fn add_bot_works_with_legacy_timestamp_default() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        store
+            .conn
+            .execute(
+                "DROP TABLE bots;
+                 CREATE TABLE bots (
+                     name TEXT PRIMARY KEY, token TEXT NOT NULL, username TEXT, topic_id INTEGER,
+                     instructions TEXT, provider TEXT, model TEXT, greeting TEXT,
+                     created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );",
+            )
+            .unwrap();
+        add_test_bot(&store);
+        assert_current_timestamp(&store, "bots", "created_at");
+    }
+
     fn prefix_store() -> Store {
         let store = Store::open(Path::new(":memory:")).unwrap();
         for prefix in ["pending:scout:", "pending:Ünïcödé🤖:", "pending:a%_:"] {
