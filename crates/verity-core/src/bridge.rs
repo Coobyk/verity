@@ -1093,41 +1093,57 @@ struct TurnOutcome {
     exit: Option<Exit>,
 }
 
+/// CommonMark fenced code blocks (§4.5): up to three spaces of indent,
+/// at least three backticks or tildes, and a matching, no-shorter closer.
+struct Fence {
+    ch: u8,
+    len: usize,
+}
+
+impl Fence {
+    fn open(line: &str) -> Option<Self> {
+        let content = line.trim_start_matches(' ');
+        if line.len() - content.len() > 3 {
+            return None;
+        }
+        let ch = *content.as_bytes().first()?;
+        if !matches!(ch, b'`' | b'~') {
+            return None;
+        }
+        let len = content.bytes().take_while(|&b| b == ch).count();
+        if len < 3 || (ch == b'`' && content[len..].contains('`')) {
+            return None;
+        }
+        Some(Self { ch, len })
+    }
+
+    fn closes(&self, line: &str) -> bool {
+        let content = line.trim_start_matches(' ');
+        let len = content.bytes().take_while(|&b| b == self.ch).count();
+        line.len() - content.len() <= 3 && len >= self.len && content[len..].trim().is_empty()
+    }
+}
+
 /// Pull `:::verb …:::` lines out of a reply. Returns the cleaned reply
 /// plus the parsed markers. Malformed markers never reach Telegram.
 fn extract_markers(reply: &str) -> (String, Markers) {
     let mut kept = Vec::new();
     let mut markers = Markers::default();
-    let mut fence = None;
+    let mut fence: Option<Fence> = None;
     for line in reply.lines() {
-        let t = line.trim();
-        let fence_line = line.trim_start_matches(' ');
-        let indent = line.len() - fence_line.len();
-        let delimiter = fence_line.as_bytes().first().copied();
-        let run = fence_line
-            .bytes()
-            .take_while(|b| Some(*b) == delimiter)
-            .count();
-        if let Some((ch, len)) = fence {
-            if indent <= 3
-                && delimiter == Some(ch)
-                && run >= len
-                && fence_line[run..].trim().is_empty()
-            {
+        if let Some(f) = &fence {
+            if f.closes(line) {
                 fence = None;
             }
             kept.push(line);
             continue;
         }
-        if indent <= 3
-            && matches!(delimiter, Some(b'`' | b'~'))
-            && run >= 3
-            && (delimiter != Some(b'`') || !fence_line[run..].contains('`'))
-        {
-            fence = Some((delimiter.unwrap(), run));
+        if let Some(f) = Fence::open(line) {
+            fence = Some(f);
             kept.push(line);
             continue;
         }
+        let t = line.trim();
         if t.starts_with(":::") && t.ends_with(":::") && t.len() > 6 {
             let inner = t[3..t.len() - 3].trim();
             let (verb, rest) = inner
