@@ -19,6 +19,32 @@ use crate::{Error, Result};
 /// How many recent channel messages a document search scans.
 const RESTORE_SCAN_LIMIT: usize = 500;
 
+pub(crate) async fn clear_topic_pages<F, D, Fetch, Delete>(
+    mut fetch: F,
+    mut delete: D,
+) -> Result<()>
+where
+    F: FnMut(i32, i32) -> Fetch,
+    D: FnMut(Vec<i32>) -> Delete,
+    Fetch: std::future::Future<Output = Result<Vec<i32>>>,
+    Delete: std::future::Future<Output = Result<()>>,
+{
+    let mut offset = 0;
+    loop {
+        let ids = fetch(offset, 100).await?;
+        let Some(&next) = ids.iter().min() else {
+            return Ok(());
+        };
+        if next <= 0 || (offset != 0 && ids.iter().any(|id| *id >= offset)) {
+            return Err(Error::Mtproto(
+                "getReplies: pagination did not advance".into(),
+            ));
+        }
+        delete(ids).await?;
+        offset = next;
+    }
+}
+
 /// General is forum topic 1; pre-forum messages carry no reply_to at
 /// all, which is the same stream.
 fn in_general(m: &Message) -> bool {
@@ -855,6 +881,41 @@ impl Tg {
                 tl::enums::ForumTopic::Deleted(_) => None,
             })
             .collect())
+    }
+
+    /// Read one page of topic ids, including service messages, newest-first.
+    pub(crate) async fn topic_message_ids(
+        &self,
+        peer: PeerRef,
+        topic_id: i64,
+        offset_id: i32,
+        limit: i32,
+    ) -> Result<Vec<i32>> {
+        let res = self
+            .client
+            .invoke(&tl::functions::messages::GetReplies {
+                peer: peer.into(),
+                msg_id: topic_id as i32,
+                offset_id,
+                offset_date: 0,
+                add_offset: 0,
+                limit,
+                max_id: 0,
+                min_id: 0,
+                hash: 0,
+            })
+            .await
+            .map_err(|e| Error::Mtproto(format!("getReplies: {e}")))?;
+        use tl::enums::messages::Messages as M;
+        let messages = match res {
+            M::Messages(m) => m.messages,
+            M::Slice(m) => m.messages,
+            M::ChannelMessages(m) => m.messages,
+            M::NotModified(_) => {
+                return Err(Error::Mtproto("getReplies: unexpected NotModified".into()));
+            }
+        };
+        Ok(messages.into_iter().map(|m| m.id()).collect())
     }
 
     /// Read recent messages of one topic via `messages.getReplies`.
@@ -1994,6 +2055,89 @@ impl Tg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn clear_topic_walks_all_pages_in_bounded_batches() {
+        use std::cell::RefCell;
+        let remaining = RefCell::new((1..=650).collect::<Vec<i32>>());
+        let offsets = RefCell::new(Vec::new());
+        let largest_batch = std::cell::Cell::new(0);
+        clear_topic_pages(
+            |offset, limit| {
+                offsets.borrow_mut().push(offset);
+                let page = remaining
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .copied()
+                    .filter(|id| offset == 0 || *id < offset)
+                    .take(limit as usize)
+                    .collect();
+                std::future::ready(Ok(page))
+            },
+            |ids| {
+                largest_batch.set(largest_batch.get().max(ids.len()));
+                remaining.borrow_mut().retain(|id| !ids.contains(id));
+                std::future::ready(Ok(()))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            remaining.borrow().len(),
+            0,
+            "messages remaining after clearchat"
+        );
+        assert!(largest_batch.get() <= 100);
+        assert_eq!(*offsets.borrow(), vec![0, 551, 451, 351, 251, 151, 51, 1]);
+    }
+
+    #[tokio::test]
+    async fn clear_topic_empty_does_not_delete() {
+        clear_topic_pages(
+            |_, _| std::future::ready(Ok(Vec::new())),
+            |_| async { panic!("empty history must not be deleted") },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_topic_stops_on_partial_fetch_or_delete_failure() {
+        for fail_fetch in [true, false] {
+            let calls = std::cell::Cell::new(0);
+            let result = clear_topic_pages(
+                |offset, _| {
+                    std::future::ready(if offset == 0 {
+                        Ok(vec![3, 2])
+                    } else {
+                        Err(Error::Mtproto("fetch failed".into()))
+                    })
+                },
+                |_| {
+                    calls.set(calls.get() + 1);
+                    std::future::ready(if fail_fetch {
+                        Ok(())
+                    } else {
+                        Err(Error::Mtproto("delete failed".into()))
+                    })
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(calls.get(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_topic_rejects_nonadvancing_pages() {
+        let result = clear_topic_pages(
+            |_, _| std::future::ready(Ok(vec![5])),
+            |_| std::future::ready(Ok(())),
+        )
+        .await;
+        assert!(result.is_err());
+    }
 
     #[test]
     fn strips_supergroup_prefix() {
