@@ -6,6 +6,9 @@ use std::path::Path;
 
 use crate::Result;
 
+const SELECT_BOT: &str =
+    "SELECT name, token, username, topic_id, instructions, provider, model, greeting FROM bots";
+
 #[derive(Debug, Clone)]
 pub struct Bot {
     pub name: String,
@@ -115,10 +118,7 @@ impl Store {
     }
 
     pub fn list_bots(&self) -> Result<Vec<Bot>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT name, token, username, topic_id, instructions, provider, model, greeting
-             FROM bots ORDER BY name",
-        )?;
+        let mut stmt = self.conn.prepare(format!("{SELECT_BOT} ORDER BY name"))?;
         let mut out = Vec::new();
         while let State::Row = stmt.next()? {
             out.push(read_bot(&stmt)?);
@@ -226,7 +226,12 @@ impl Store {
     }
 
     pub fn get_bot(&self, name: &str) -> Result<Option<Bot>> {
-        Ok(self.list_bots()?.into_iter().find(|b| b.name == name))
+        let mut stmt = self.conn.prepare(format!("{SELECT_BOT} WHERE name = ?"))?;
+        stmt.bind((1, name))?;
+        match stmt.next()? {
+            State::Row => Ok(Some(read_bot(&stmt)?)),
+            State::Done => Ok(None),
+        }
     }
 
     pub fn set_bot_topic(&self, name: &str, topic_id: i64) -> Result<()> {
@@ -301,6 +306,51 @@ fn read_bot(stmt: &sqlite::Statement) -> Result<Bot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_bot_finds_only_the_named_bot() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        assert!(store.get_bot("missing").unwrap().is_none());
+        for i in 0..100 {
+            store
+                .add_bot(&Bot {
+                    name: format!("bot-{i}"),
+                    token: format!("token-{i}"),
+                    username: Some(format!("username-{i}")),
+                    topic_id: Some(i),
+                    instructions: format!("instructions-{i}"),
+                    provider: "echo".into(),
+                    model: Some(format!("model-{i}")),
+                    greeting: Some(format!("greeting-{i}")),
+                })
+                .unwrap();
+        }
+        let bot = store.get_bot("bot-73").unwrap().unwrap();
+        assert_eq!(bot.name, "bot-73");
+        assert_eq!(bot.token, "token-73");
+        assert_eq!(bot.username.as_deref(), Some("username-73"));
+        assert_eq!(bot.topic_id, Some(73));
+        assert_eq!(bot.instructions, "instructions-73");
+        assert_eq!(bot.provider, "echo");
+        assert_eq!(bot.model.as_deref(), Some("model-73"));
+        assert_eq!(bot.greeting.as_deref(), Some("greeting-73"));
+        assert!(store.get_bot("missing").unwrap().is_none());
+        assert!(store.get_bot("' OR 1=1 --").unwrap().is_none());
+
+        add_test_bot(&store);
+        let bot = store.get_bot("scout").unwrap().unwrap();
+        assert!(bot.username.is_none());
+        assert!(bot.topic_id.is_none());
+        assert!(bot.model.is_none());
+        assert!(bot.greeting.is_none());
+    }
+
+    #[test]
+    fn get_bot_propagates_database_errors() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        store.conn.execute("DROP TABLE bots").unwrap();
+        assert!(store.get_bot("missing").is_err());
+    }
 
     fn rename_store() -> Store {
         let store = Store::open(Path::new(":memory:")).unwrap();
