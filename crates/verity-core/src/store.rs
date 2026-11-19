@@ -43,13 +43,13 @@ impl Store {
                  provider     TEXT NOT NULL DEFAULT 'pi',
                  model        TEXT,
                  greeting     TEXT,
-                 created_at   INTEGER NOT NULL DEFAULT (unixepoch())
+                 created_at   INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER))
              );
              CREATE TABLE IF NOT EXISTS memory (
                  bot     TEXT NOT NULL REFERENCES bots(name),
                  key     TEXT NOT NULL,
                  value   TEXT NOT NULL,
-                 updated INTEGER NOT NULL DEFAULT (unixepoch()),
+                 updated INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER)),
                  PRIMARY KEY (bot, key)
              );
              CREATE TABLE IF NOT EXISTS kv (
@@ -64,8 +64,8 @@ impl Store {
 
     pub fn add_bot(&self, bot: &Bot) -> Result<()> {
         let mut stmt = self.conn.prepare(
-            "INSERT INTO bots (name, token, username, topic_id, instructions, provider, model, greeting)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO bots (name, token, username, topic_id, instructions, provider, model, greeting, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, CAST(strftime('%s', 'now') AS INTEGER))",
         )?;
         stmt.bind((1, bot.name.as_str()))?;
         stmt.bind((2, bot.token.as_str()))?;
@@ -241,8 +241,9 @@ impl Store {
 
     pub fn remember(&self, bot: &str, key: &str, value: &str) -> Result<()> {
         let mut stmt = self.conn.prepare(
-            "INSERT INTO memory (bot, key, value, updated) VALUES (?, ?, ?, unixepoch())
-             ON CONFLICT (bot, key) DO UPDATE SET value = excluded.value, updated = unixepoch()",
+            "INSERT INTO memory (bot, key, value, updated)
+             VALUES (?, ?, ?, CAST(strftime('%s', 'now') AS INTEGER))
+             ON CONFLICT (bot, key) DO UPDATE SET value = excluded.value, updated = excluded.updated",
         )?;
         stmt.bind((1, bot))?;
         stmt.bind((2, key))?;
@@ -341,6 +342,92 @@ mod tests {
         assert!(store.get_bot("new").unwrap().is_none());
         assert!(store.recall("new").unwrap().is_empty());
         assert!(store.rename_bot("old", "new").unwrap());
+    }
+
+    fn add_test_bot(store: &Store) {
+        store
+            .add_bot(&Bot {
+                name: "scout".into(),
+                token: "mock".into(),
+                username: None,
+                topic_id: None,
+                instructions: String::new(),
+                provider: "echo".into(),
+                model: None,
+                greeting: None,
+            })
+            .unwrap();
+    }
+
+    fn assert_current_timestamp(store: &Store, table: &str, column: &str) {
+        let mut stmt = store
+            .conn
+            .prepare(format!(
+                "SELECT typeof({column}), abs({column} - strftime('%s', 'now')) <= 60 FROM {table}"
+            ))
+            .unwrap();
+        assert_eq!(stmt.next().unwrap(), State::Row);
+        assert_eq!(stmt.read::<String, _>(0).unwrap(), "integer");
+        assert_eq!(stmt.read::<i64, _>(1).unwrap(), 1);
+    }
+
+    #[test]
+    fn timestamp_defaults_work_on_older_sqlite() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO bots (name, token) VALUES ('scout', 'mock');
+                 INSERT INTO memory (bot, key, value) VALUES ('scout', 'note', 'first');",
+            )
+            .unwrap();
+        for (table, column) in [("bots", "created_at"), ("memory", "updated")] {
+            assert_current_timestamp(&store, table, column);
+            let mut stmt = store
+                .conn
+                .prepare(format!(
+                    "SELECT lower(dflt_value) FROM pragma_table_info('{table}') WHERE name = '{column}'"
+                ))
+                .unwrap();
+            assert_eq!(stmt.next().unwrap(), State::Row);
+            let default = stmt.read::<String, _>(0).unwrap();
+            assert!(!default.contains("unixepoch"), "{table}.{column}: {default}");
+        }
+    }
+
+    #[test]
+    fn bot_and_memory_writes_store_integer_epoch_seconds() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        add_test_bot(&store);
+        assert_current_timestamp(&store, "bots", "created_at");
+
+        store.remember("scout", "note", "first").unwrap();
+        assert_current_timestamp(&store, "memory", "updated");
+        store.conn.execute("UPDATE memory SET updated = 0").unwrap();
+        store.remember("scout", "note", "changed").unwrap();
+        assert_current_timestamp(&store, "memory", "updated");
+        assert_eq!(
+            store.recall("scout").unwrap(),
+            vec![("note".into(), "changed".into())]
+        );
+    }
+
+    #[test]
+    fn add_bot_works_with_legacy_timestamp_default() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        store
+            .conn
+            .execute(
+                "DROP TABLE bots;
+                 CREATE TABLE bots (
+                     name TEXT PRIMARY KEY, token TEXT NOT NULL, username TEXT, topic_id INTEGER,
+                     instructions TEXT, provider TEXT, model TEXT, greeting TEXT,
+                     created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );",
+            )
+            .unwrap();
+        add_test_bot(&store);
+        assert_current_timestamp(&store, "bots", "created_at");
     }
 
     fn prefix_store() -> Store {

@@ -25,6 +25,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
 sevenz-rust2 = "0.24"
+tempfile = "3"
 tiny-skia.workspace = true
 verity-pfp = { path = "../verity-pfp" }
 
