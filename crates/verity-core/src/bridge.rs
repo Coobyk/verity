@@ -539,8 +539,13 @@ async fn handle_message(
         }
     }
     debug!(bot = %bot.name, %text, "turn request");
+    let pkey = pending_key(&bot.name, msg.message_id, chat_id, thread);
+    let pval = text.clone();
+    if let Err(e) = db_call(&env.db, move |s| s.kv_set(&pkey, &pval)).await {
+        warn!(bot = %bot.name, error = %e, "pending turn write failed");
+    }
     // Acknowledge immediately — queued behind other turns, the 🕒 says
-    // "seen, will get to it". `handle_turn` swaps it to 👀 on start.
+    // "recorded, will get to it". `handle_turn` swaps it to 👀 on start.
     let _ = api.set_reaction(chat_id, msg.message_id, "🕒").await;
     let _permit = sem.acquire().await.ok();
     if let Err(e) = handle_turn(api, bot, env, chat_id, thread, msg.message_id, &text).await {
@@ -1271,13 +1276,8 @@ async fn handle_turn(
     text: &str,
 ) -> Result<()> {
     let _ = api.set_reaction(chat_id, message_id, "👀").await;
-    // Mark the turn pending — if we die mid-turn, the leftover record
-    // (and the lingering 👀) lets a restart re-run it. One key per
-    // message so concurrent turns don't clobber each other; the chat
-    // fields in the key say where the replay goes.
-    let pkey = pending_key(&bot.name, message_id, chat_id, thread);
-    let pval = text.to_string();
-    let _ = db_call(&env.db, move |s| s.kv_set(&pkey, &pval)).await;
+    // The pending record was written before queuing (or survived a
+    // restart); keep it until this turn finishes so recovery can replay it.
     let _ = api.send_chat_action(chat_id, "typing", thread).await;
     let keepalive = typing_keepalive(api.clone(), chat_id, thread);
     let activity = Activity::default();
@@ -1930,7 +1930,10 @@ mod tests {
                 "date": 0, "text": "queued hello", "message_thread_id": 7
             }))
             .unwrap();
-            handle_message(&api, &bot, &env, -100123, Some(7), Arc::new(Semaphore::new(0)), msg).await;
+            handle_message(
+                &api, &bot, &env, -100123, Some(7), Arc::new(Semaphore::new(0)), msg,
+            )
+            .await;
         });
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -1939,13 +1942,18 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert!(!task.is_finished());
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         let pending = recover_pending(&db, "scout").await;
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(pending, vec![(42, Some(-100123), Some(7), "queued hello".into())]);
+        assert_eq!(
+            pending,
+            vec![(42, Some(-100123), Some(7), "queued hello".into())]
+        );
     }
 
     /// Full quiet-bot turn against the mock: 👀 (🕒 is set earlier, at
