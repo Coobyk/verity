@@ -41,7 +41,7 @@ use crate::botapi::{BotApi, InputRichMessage};
 use crate::harness::{Activity, Harness, TurnContext};
 use crate::liveness::{self, Heartbeat};
 use crate::mtproto::Tg;
-use crate::rich::{split_markdown, RICH_LIMIT, TEXT_LIMIT};
+use crate::rich::{split_markdown, split_markdown_utf16, RICH_LIMIT, TEXT_LIMIT};
 use crate::store::{Bot, Store};
 use crate::{Error, Result};
 
@@ -1231,7 +1231,7 @@ async fn send_reply(
             Ok(_) => continue,
             Err(e) => {
                 warn!(error = %e, "rich send failed, falling back to text");
-                for chunk in split_markdown(&part, TEXT_LIMIT) {
+                for chunk in split_markdown_utf16(&part, TEXT_LIMIT) {
                     // Legacy markdown render first; raw text last resort.
                     if let Err(e) = api
                         .send_markdown_message(chat_id, &chunk, thread, reply_to)
