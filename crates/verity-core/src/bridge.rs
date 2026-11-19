@@ -1093,12 +1093,56 @@ struct TurnOutcome {
     exit: Option<Exit>,
 }
 
+/// CommonMark fenced code blocks (§4.5): up to three spaces of indent,
+/// at least three backticks or tildes, and a matching, no-shorter closer.
+struct Fence {
+    ch: u8,
+    len: usize,
+}
+
+impl Fence {
+    fn open(line: &str) -> Option<Self> {
+        let content = line.trim_start_matches(' ');
+        if line.len() - content.len() > 3 {
+            return None;
+        }
+        let ch = *content.as_bytes().first()?;
+        if !matches!(ch, b'`' | b'~') {
+            return None;
+        }
+        let len = content.bytes().take_while(|&b| b == ch).count();
+        if len < 3 || (ch == b'`' && content[len..].contains('`')) {
+            return None;
+        }
+        Some(Self { ch, len })
+    }
+
+    fn closes(&self, line: &str) -> bool {
+        let content = line.trim_start_matches(' ');
+        let len = content.bytes().take_while(|&b| b == self.ch).count();
+        line.len() - content.len() <= 3 && len >= self.len && content[len..].trim().is_empty()
+    }
+}
+
 /// Pull `:::verb …:::` lines out of a reply. Returns the cleaned reply
 /// plus the parsed markers. Malformed markers never reach Telegram.
 fn extract_markers(reply: &str) -> (String, Markers) {
     let mut kept = Vec::new();
     let mut markers = Markers::default();
+    let mut fence: Option<Fence> = None;
     for line in reply.lines() {
+        if let Some(f) = &fence {
+            if f.closes(line) {
+                fence = None;
+            }
+            kept.push(line);
+            continue;
+        }
+        if let Some(f) = Fence::open(line) {
+            fence = Some(f);
+            kept.push(line);
+            continue;
+        }
         let t = line.trim();
         if t.starts_with(":::") && t.ends_with(":::") && t.len() > 6 {
             let inner = t[3..t.len() - 3].trim();
@@ -1719,6 +1763,40 @@ mod tests {
         let (clean, m) = extract_markers(reply);
         assert_eq!(clean, "ok");
         assert!(m.remember.is_empty() && m.tell.is_empty() && m.spawn.is_empty());
+    }
+
+    #[test]
+    fn restart_markers_respect_code_fences() {
+        for reply in [
+            "```\n:::restart:::\n```",
+            "~~~rust\n:::restart:::\n~~~",
+            "````text\n```\n:::restart:::\n````",
+            "~~~\n```\n:::restart:::\n~~~",
+            "```\n```not a closer\n:::restart:::\n```",
+            "```\n:::restart:::",
+            "   ```rust\n:::restart:::\n   ```",
+            "`:::restart:::`",
+            "Example: `:::restart:::`",
+            "",
+        ] {
+            let (clean, m) = extract_markers(reply);
+            assert!(m.exit.is_none(), "unexpected restart for {reply:?}");
+            assert_eq!(clean, reply.trim());
+        }
+    }
+
+    #[test]
+    fn restart_markers_outside_code_fences() {
+        for reply in [
+            ":::restart:::",
+            "```rust\nexample\n```\n:::restart:::",
+            "~~~\nexample\n~~~~\n:::restart:::",
+            ":::restart:::\n```\n:::shutdown:::\n```",
+            "text with ``` inline\n:::restart:::",
+        ] {
+            let (_, m) = extract_markers(reply);
+            assert!(matches!(m.exit, Some(Exit::Restart)), "{reply:?}");
+        }
     }
 
     #[test]
