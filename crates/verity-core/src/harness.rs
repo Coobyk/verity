@@ -738,23 +738,35 @@ mod tests {
             eprintln!("skipping: setsid unavailable");
             return;
         }
-        let result = tokio::time::timeout(
-            Duration::from_secs(3),
-            run_acp_script(
-                "read -r request; echo 'agent crashed' >&2; setsid sleep 60 >/dev/null & echo helper:$! >&2; exit 42",
-            ),
-        )
-        .await
-        .expect("detached helper must not delay crash reporting");
-        let err = result.unwrap_err().to_string();
-        let pid = err
-            .split_once("helper:")
-            .and_then(|(_, tail)| tail.split_whitespace().next())
-            .and_then(|pid| pid.parse::<u32>().ok())
-            .expect("helper pid in stderr");
+        let ready = std::env::temp_dir().join(format!(
+            "verity-acp-helper-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script = format!(
+            "read -r request; ready='{}'; setsid sh -c 'echo $$ > \"$1\"; exec sleep 60' sh \"$ready\" >/dev/null & while [ ! -s \"$ready\" ]; do sleep 0.01; done; echo 'agent crashed' >&2; exit 42",
+            ready.to_string_lossy().replace('\'', "'\\''")
+        );
+        let result = tokio::time::timeout(Duration::from_secs(3), run_acp_script(&script)).await;
+        let pid = std::fs::read_to_string(&ready).expect("detached helper ready marker");
+        let pid = pid.trim().parse::<u32>().unwrap().to_string();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .status()
+            .unwrap()
+            .success();
         let _ = std::process::Command::new("kill")
-            .args(["-KILL", &pid.to_string()])
+            .args(["-KILL", &pid])
             .status();
+        std::fs::remove_file(ready).unwrap();
+        assert!(alive, "detached helper must survive process-group cleanup");
+        let err = result
+            .expect("detached helper must not delay crash reporting")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("exit status: 42"), "{err}");
         assert!(err.contains("agent crashed"), "{err}");
     }
