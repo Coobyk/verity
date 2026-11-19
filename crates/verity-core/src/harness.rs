@@ -607,6 +607,34 @@ fn permission_response(id: serde_json::Value, msg: &serde_json::Value) -> serde_
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_crash_reports_exit_status_and_stderr() {
+        let ctx = TurnContext {
+            bot_name: "test".into(),
+            instructions: String::new(),
+            memory: Vec::new(),
+            history: Vec::new(),
+            peers: Vec::new(),
+            first_contact: false,
+            cwd: std::env::current_dir().unwrap(),
+            model: None,
+            activity: Activity::default(),
+        };
+        let harness = AcpHarness {
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                "read -r request; echo 'agent crashed' >&2; exit 42".into(),
+            ],
+        };
+        let err = harness.run_turn(&ctx, "hello").await.unwrap_err();
+        assert!(matches!(err, Error::Harness(_)), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("exit status: 42"), "{message}");
+        assert!(message.contains("agent crashed"), "{message}");
+    }
+
     #[test]
     fn reply_is_last_segment_only() {
         let mut acc = ReplyAccumulator::new();
