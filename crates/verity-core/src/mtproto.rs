@@ -29,10 +29,20 @@ where
     Fetch: std::future::Future<Output = Result<Vec<i32>>>,
     Delete: std::future::Future<Output = Result<()>>,
 {
-    if let Ok(ids) = fetch(0, 200).await {
-        let _ = delete(ids).await;
+    let mut offset = 0;
+    loop {
+        let ids = fetch(offset, 100).await?;
+        let Some(&next) = ids.iter().min() else {
+            return Ok(());
+        };
+        if next <= 0 || (offset != 0 && ids.iter().any(|id| *id >= offset)) {
+            return Err(Error::Mtproto(
+                "getReplies: pagination did not advance".into(),
+            ));
+        }
+        delete(ids).await?;
+        offset = next;
     }
-    Ok(())
 }
 
 /// General is forum topic 1; pre-forum messages carry no reply_to at
@@ -871,6 +881,41 @@ impl Tg {
                 tl::enums::ForumTopic::Deleted(_) => None,
             })
             .collect())
+    }
+
+    /// Read one page of topic ids, including service messages, newest-first.
+    pub(crate) async fn topic_message_ids(
+        &self,
+        peer: PeerRef,
+        topic_id: i64,
+        offset_id: i32,
+        limit: i32,
+    ) -> Result<Vec<i32>> {
+        let res = self
+            .client
+            .invoke(&tl::functions::messages::GetReplies {
+                peer: peer.into(),
+                msg_id: topic_id as i32,
+                offset_id,
+                offset_date: 0,
+                add_offset: 0,
+                limit,
+                max_id: 0,
+                min_id: 0,
+                hash: 0,
+            })
+            .await
+            .map_err(|e| Error::Mtproto(format!("getReplies: {e}")))?;
+        use tl::enums::messages::Messages as M;
+        let messages = match res {
+            M::Messages(m) => m.messages,
+            M::Slice(m) => m.messages,
+            M::ChannelMessages(m) => m.messages,
+            M::NotModified(_) => {
+                return Err(Error::Mtproto("getReplies: unexpected NotModified".into()));
+            }
+        };
+        Ok(messages.into_iter().map(|m| m.id()).collect())
     }
 
     /// Read recent messages of one topic via `messages.getReplies`.
