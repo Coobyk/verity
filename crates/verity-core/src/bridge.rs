@@ -276,29 +276,40 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+async fn ensure_topic(api: &BotApi, bot: &Bot, env: &Env) -> Result<i64> {
+    if let Some(tid) = bot.topic_id {
+        return Ok(tid);
+    }
+    let tid = api
+        .create_forum_topic(env.group_id, &bot.name)
+        .await?
+        .message_thread_id;
+    let name = bot.name.clone();
+    let saved = db_call(&env.db, move |s| s.set_bot_topic_if_empty(&name, tid)).await;
+    if !matches!(saved, Ok(true)) {
+        // A concurrent creation (e.g. from a teammate handoff) may have won.
+        let _ = api.delete_forum_topic(env.group_id, tid).await;
+        saved?;
+        let name = bot.name.clone();
+        return db_call(&env.db, move |s| s.get_bot(&name))
+            .await?
+            .and_then(|b| b.topic_id)
+            .ok_or_else(|| Error::Other("bot topic no longer exists".into()));
+    }
+    info!(bot = %bot.name, topic = tid, "created topic");
+    if let Some(g) = &bot.greeting {
+        let _ = send_reply(api, env.group_id, Some(tid), g, None).await;
+    }
+    Ok(tid)
+}
+
 async fn run_bot(bot: &Bot, env: &Env, beat: &std::sync::atomic::AtomicU64) -> Result<()> {
     let api = BotApi::new(&bot.token);
     let me = api.get_me().await?;
     info!(bot = %bot.name, username = ?me.username, "polling");
 
-    // Ensure the bot owns a forum topic named after it.
-    let mut topic_id = match bot.topic_id {
-        Some(t) => t,
-        None => {
-            let t = api.create_forum_topic(env.group_id, &bot.name).await?;
-            let (db, name, tid) = (env.db.clone(), bot.name.clone(), t.message_thread_id);
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                Store::open(&db)?.set_bot_topic(&name, tid)
-            })
-            .await
-            .map_err(|e| Error::Other(e.to_string()))??;
-            info!(bot = %bot.name, topic = tid, "created topic");
-            if let Some(g) = &bot.greeting {
-                let _ = send_reply(&api, env.group_id, Some(tid), g, None).await;
-            }
-            tid
-        }
-    };
+    let mut topic_id = Some(ensure_topic(&api, bot, env).await?);
+    let mut topic_retry_at = Instant::now();
 
     // Skip the offline backlog: confirm everything pending so a restart
     // doesn't re-answer stale messages. `offset = -1` returns only the
@@ -324,9 +335,9 @@ async fn run_bot(bot: &Bot, env: &Env, beat: &std::sync::atomic::AtomicU64) -> R
         warn!(bot = %bot.name, msg = mid, "resuming crashed turn");
         let chat_id = chat.unwrap_or(env.group_id);
         let thread = match thread {
-            Some(0) => None, // 0 = the record was a DM turn
+            Some(0) => None,  // 0 = the record was a DM turn
             Some(t) => Some(t),
-            None => Some(topic_id), // old record — pre-chat-key topic turn
+            None => topic_id, // old record — pre-chat-key topic turn
         };
         let (api, bot, env, sem) = (api.clone(), bot.clone(), env.clone(), sem.clone());
         inflight.spawn(async move {
@@ -342,20 +353,33 @@ async fn run_bot(bot: &Bot, env: &Env, beat: &std::sync::atomic::AtomicU64) -> R
         // (hung HTTP, deadlocked task) gets us aborted and respawned.
         beat.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
         env.hb.beat(&bot.name);
-        // Self-terminate if this bot was removed from the store (e.g.
-        // by a confirmed reset) — otherwise the supervisor keeps us
-        // alive. The fresh record also catches a recreated topic: reset deletes
-        // ours and makes a new one we should start listening to.
+        let updates = api.get_updates(offset, 30).await;
+        // Refresh after the long-poll: clear-chat can delete the topic
+        // while the request is in flight, before its updates are delivered.
         let n = bot.name.clone();
         match db_call(&env.db, move |s| s.get_bot(&n)).await {
-            Ok(Some(fresh)) => {
-                if let Some(t) = fresh.topic_id {
-                    if t != topic_id {
-                        info!(bot = %bot.name, old = topic_id, new = t, "topic swapped — following");
-                        topic_id = t;
+            Ok(Some(fresh)) => match fresh.topic_id {
+                Some(t) => {
+                    if Some(t) != topic_id {
+                        info!(bot = %bot.name, old = ?topic_id, new = t, "topic swapped — following");
+                        topic_id = Some(t);
                     }
                 }
-            }
+                None => {
+                    topic_id = None;
+                    // Retry a failed creation without disrupting owner DMs
+                    // or asking a standby poller to create a topic.
+                    if updates.is_ok() && Instant::now() >= topic_retry_at {
+                        match ensure_topic(&api, &fresh, env).await {
+                            Ok(t) => topic_id = Some(t),
+                            Err(e) => {
+                                warn!(bot = %bot.name, error = %e, "topic recreation failed");
+                                topic_retry_at = Instant::now() + BOT_SWEEP;
+                            }
+                        }
+                    }
+                }
+            },
             Ok(None) => {
                 info!(bot = %bot.name, "unregistered — stopping loop");
                 inflight.abort_all();
@@ -367,7 +391,7 @@ async fn run_bot(bot: &Bot, env: &Env, beat: &std::sync::atomic::AtomicU64) -> R
                 warn!(bot = %bot.name, error = %e, "store check failed — continuing");
             }
         }
-        let updates = match api.get_updates(offset, 30).await {
+        let updates = match updates {
             Ok(u) => {
                 conflicts = 0;
                 u
@@ -407,13 +431,15 @@ async fn run_bot(bot: &Bot, env: &Env, beat: &std::sync::atomic::AtomicU64) -> R
             if let Some(cb) = update.callback_query {
                 if let (Some(data), Some(m)) = (cb.data, cb.message) {
                     let dm = m.chat.id > 0 && env.owner_id == Some(m.chat.id);
-                    let ours =
-                        dm || (m.chat.id == env.group_id && m.message_thread_id == Some(topic_id));
+                    let ours = dm
+                        || (m.chat.id == env.group_id
+                            && topic_id.is_some()
+                            && m.message_thread_id == topic_id);
                     if ours {
                         let (chat_id, thread) = if dm {
                             (m.chat.id, None)
                         } else {
-                            (env.group_id, Some(topic_id))
+                            (env.group_id, topic_id)
                         };
                         match data.as_str() {
                             "v:cancel" => {
@@ -460,7 +486,10 @@ async fn run_bot(bot: &Bot, env: &Env, beat: &std::sync::atomic::AtomicU64) -> R
                 if !mine {
                     continue;
                 }
-            } else if msg.chat.id != env.group_id || msg.message_thread_id != Some(topic_id) {
+            } else if msg.chat.id != env.group_id
+                || topic_id.is_none()
+                || msg.message_thread_id != topic_id
+            {
                 continue;
             }
             if msg.from.as_ref().map(|u| u.is_bot).unwrap_or(true) {
@@ -469,7 +498,7 @@ async fn run_bot(bot: &Bot, env: &Env, beat: &std::sync::atomic::AtomicU64) -> R
             let (chat_id, thread) = if dm {
                 (msg.chat.id, None)
             } else {
-                (env.group_id, Some(topic_id))
+                (env.group_id, topic_id)
             };
             // Spawn and keep polling: each message gets its own task so a
             // long turn doesn't block the next one.
@@ -1565,39 +1594,11 @@ async fn do_turn(
                             None => {
                                 // Ensure the teammate has its own topic
                                 // to answer in.
-                                let ttopic = match target.topic_id {
-                                    Some(t) => t,
-                                    None => {
-                                        match tapi
-                                            .create_forum_topic(env2.group_id, &target.name)
-                                            .await
-                                        {
-                                            Ok(t) => {
-                                                let (db, n, tid) = (
-                                                    env2.db.clone(),
-                                                    target.name.clone(),
-                                                    t.message_thread_id,
-                                                );
-                                                let _ =
-                                                    db_call(&db, move |s| s.set_bot_topic(&n, tid))
-                                                        .await;
-                                                if let Some(g) = &target.greeting {
-                                                    let _ = send_reply(
-                                                        &tapi,
-                                                        env2.group_id,
-                                                        Some(tid),
-                                                        g,
-                                                        None,
-                                                    )
-                                                    .await;
-                                                }
-                                                tid
-                                            }
-                                            Err(e) => {
-                                                warn!(bot = %target.name, error = %e, "tell: topic create failed");
-                                                return;
-                                            }
-                                        }
+                                let ttopic = match ensure_topic(&tapi, &target, &env2).await {
+                                    Ok(t) => t,
+                                    Err(e) => {
+                                        warn!(bot = %target.name, error = %e, "tell: topic create failed");
+                                        return;
                                     }
                                 };
                                 (env2.group_id, Some(ttopic))
