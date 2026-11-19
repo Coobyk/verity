@@ -346,14 +346,12 @@ fn rand_u64() -> u64 {
     n ^ (std::process::id() as u64).wrapping_mul(0x2545F4914F6CDD1D)
 }
 
-fn pfp_style(what: Option<&str>, mut roll: impl FnMut() -> u64) -> Result<(u64, f64)> {
-    Ok(match what {
-        None | Some("random") => (roll().max(1), (roll() % 360) as f64),
-        Some(w) => {
-            let seed: u64 = w.parse().context("use `random` or a seed number")?;
-            (seed, (seed % 360) as f64)
-        }
-    })
+fn pfp_style(what: Option<&str>, roll: impl FnOnce() -> u64) -> Result<(u64, f64)> {
+    let seed = match what {
+        None | Some("random") => roll().max(1),
+        Some(w) => w.parse().context("use `random` or a seed number")?,
+    };
+    Ok((seed, (seed % 360) as f64))
 }
 
 /// Tokio worker threads default to a 2 MiB stack; deep synchronous
