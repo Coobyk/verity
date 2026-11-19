@@ -1722,6 +1722,40 @@ mod tests {
     }
 
     #[test]
+    fn restart_markers_respect_code_fences() {
+        for reply in [
+            "```\n:::restart:::\n```",
+            "~~~rust\n:::restart:::\n~~~",
+            "````text\n```\n:::restart:::\n````",
+            "~~~\n```\n:::restart:::\n~~~",
+            "```\n```not a closer\n:::restart:::\n```",
+            "```\n:::restart:::",
+            "   ```rust\n:::restart:::\n   ```",
+            "`:::restart:::`",
+            "Example: `:::restart:::`",
+            "",
+        ] {
+            let (clean, m) = extract_markers(reply);
+            assert!(m.exit.is_none(), "unexpected restart for {reply:?}");
+            assert_eq!(clean, reply.trim());
+        }
+    }
+
+    #[test]
+    fn restart_markers_outside_code_fences() {
+        for reply in [
+            ":::restart:::",
+            "```rust\nexample\n```\n:::restart:::",
+            "~~~\nexample\n~~~~\n:::restart:::",
+            ":::restart:::\n```\n:::shutdown:::\n```",
+            "text with ``` inline\n:::restart:::",
+        ] {
+            let (_, m) = extract_markers(reply);
+            assert!(matches!(m.exit, Some(Exit::Restart)), "{reply:?}");
+        }
+    }
+
+    #[test]
     fn parses_exit_markers() {
         let (clean, m) = extract_markers("bye\n:::shutdown:::");
         assert_eq!(clean, "bye");
