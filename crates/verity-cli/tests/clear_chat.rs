@@ -166,29 +166,48 @@ async fn clear_chat_replaces_the_topic_without_restarting_serve() {
     poll.reply(json!([update(42, NEW_TOPIC, "hello replacement")]))
         .await;
 
-    let reply = loop {
+    let mut pending_poll = None;
+    let mut replied = false;
+    loop {
         let request = next_request(&mut requests).await;
         match request.method.as_str() {
-            "getUpdates" => {} // This long-poll need not return before the turn finishes.
+            "getUpdates" => {
+                assert_eq!(request.body["offset"], 43);
+                assert!(pending_poll.replace(request).is_none());
+            }
             "sendChatAction" => request.reply(json!(true)).await,
             "setMessageReaction" => {
                 assert_eq!(
                     request.body["message_id"], 42,
                     "must ignore the stale message"
                 );
+                let finished = request.body["reaction"] == json!([]);
                 request.reply(json!(true)).await;
+                if finished {
+                    assert!(replied);
+                    break;
+                }
             }
-            "sendRichMessage" => break request,
+            "sendRichMessage" => {
+                assert_eq!(request.body["message_thread_id"], NEW_TOPIC);
+                assert_eq!(request.body["reply_parameters"]["message_id"], 42);
+                assert!(request.body["rich_message"]["markdown"]
+                    .as_str()
+                    .unwrap()
+                    .contains("heard: hello replacement"));
+                request
+                    .reply(json!({
+                        "message_id": 100,
+                        "chat": {"id": GROUP, "type": "supergroup"},
+                        "date": 0,
+                    }))
+                    .await;
+                replied = true;
+            }
             method => panic!("unexpected Bot API method: {method}"),
         }
-    };
-    assert_eq!(reply.body["message_thread_id"], NEW_TOPIC);
-    assert_eq!(reply.body["reply_parameters"]["message_id"], 42);
-    assert!(reply.body["rich_message"]["markdown"]
-        .as_str()
-        .unwrap()
-        .contains("heard: hello replacement"));
+    }
     assert!(serve.try_wait().unwrap().is_none());
-    println!("deleted topic {OLD_TOPIC}; echoed in topic {NEW_TOPIC} (offset 42, same serve)");
+    println!("deleted topic {OLD_TOPIC}; ignored stale update; echoed in topic {NEW_TOPIC} (same serve, offset 42)");
     serve.kill().await.unwrap();
 }
