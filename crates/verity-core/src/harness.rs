@@ -134,12 +134,14 @@ fn full_prompt(ctx: &TurnContext, prompt: &str) -> String {
 /// or subscription OAuth, per pi's provider config.
 pub struct PiHarness {
     pub bin: String,
+    timeout: Duration,
 }
 
 impl PiHarness {
     pub fn new(bin: Option<String>) -> Self {
         Self {
             bin: bin.unwrap_or_else(|| "pi".into()),
+            timeout: turn_timeout(),
         }
     }
 }
@@ -147,20 +149,49 @@ impl PiHarness {
 #[async_trait]
 impl Harness for PiHarness {
     async fn run_turn(&self, ctx: &TurnContext, prompt: &str) -> Result<TurnOutput> {
+        match tokio::time::timeout(self.timeout, self.run_turn_inner(ctx, prompt)).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::Harness(format!(
+                "{}: turn exceeded {}s",
+                self.bin,
+                self.timeout.as_secs()
+            ))),
+        }
+    }
+}
+
+impl PiHarness {
+    async fn run_turn_inner(&self, ctx: &TurnContext, prompt: &str) -> Result<TurnOutput> {
         let mut cmd = Command::new(&self.bin);
         cmd.arg("--mode")
             .arg("print")
             .arg("-p")
             .arg(full_prompt(ctx, prompt))
             .current_dir(&ctx.cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         if let Some(m) = &ctx.model {
             cmd.arg("--model").arg(m);
         }
-        let out = cmd
-            .output()
-            .await
+        let mut child = ChildGroup::spawn(&mut cmd)
             .map_err(|e| Error::Harness(format!("failed to spawn {}: {e}", self.bin)))?;
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut stderr = child.stderr.take().expect("piped stderr");
+        let mut stdout_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
+        let (status, _, _) = tokio::try_join!(
+            child.wait(),
+            tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut stdout_buf),
+            tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut stderr_buf),
+        )
+        .map_err(|e| Error::Harness(format!("failed to spawn {}: {e}", self.bin)))?;
+        let out = std::process::Output {
+            status,
+            stdout: stdout_buf,
+            stderr: stderr_buf,
+        };
         if !out.status.success() {
             return Err(Error::Harness(format!(
                 "{} exited {}: {}",
@@ -190,9 +221,9 @@ impl Harness for EchoHarness {
     }
 }
 
-/// How long a single ACP turn may run before the child is killed.
+/// How long a single Pi or ACP turn may run before the child is killed.
 /// `VERITY_TURN_TIMEOUT` (seconds) overrides; default 15m.
-fn acp_timeout() -> Duration {
+fn turn_timeout() -> Duration {
     std::env::var("VERITY_TURN_TIMEOUT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -279,7 +310,7 @@ impl AcpHarness {
 impl Harness for AcpHarness {
     async fn run_turn(&self, ctx: &TurnContext, prompt: &str) -> Result<TurnOutput> {
         let run = self.run_turn_inner(ctx, prompt);
-        let limit = acp_timeout();
+        let limit = turn_timeout();
         match tokio::time::timeout(limit, run).await {
             Ok(r) => r,
             Err(_) => Err(Error::Harness(format!(
@@ -334,7 +365,7 @@ impl AcpHarness {
 
         let mut pending = 0usize; // next request index to send
         let mut sent = 0usize; // requests fully written
-        // Phase 1: send initialize, then drive the read/write loop.
+                               // Phase 1: send initialize, then drive the read/write loop.
         loop {
             if sent < requests.len() && pending == sent {
                 let req = json!({"jsonrpc": "2.0", "id": sent, "method": methods[sent], "params": requests[sent]});
@@ -424,7 +455,7 @@ impl AcpHarness {
         }
 
         drop(stdin); // close the pipe so the server can exit
-        // Per-turn agent: don't wait indefinitely — kill if it lingers.
+                     // Per-turn agent: don't wait indefinitely — kill if it lingers.
         let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
             .await
             .ok()
