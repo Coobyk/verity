@@ -712,21 +712,21 @@ async fn run_command(
                     let result = match (&env.tg, &env.peer) {
                         (Some(tg), Some(peer)) => {
                             crate::mtproto::clear_topic_pages(
-                                |_, limit| async move {
-                                    tg.topic_history(*peer, topic_id, limit)
-                                        .await
-                                        .map(|msgs| msgs.into_iter().map(|m| m.id).collect())
+                                |offset, limit| async move {
+                                    tg.topic_message_ids(*peer, topic_id, offset, limit).await
                                 },
                                 |ids| async move {
                                     for id in ids {
-                                        let _ = api.delete_message(env.group_id, id as i64).await;
+                                        api.delete_message(env.group_id, id as i64).await?;
                                     }
                                     Ok(())
                                 },
                             )
                             .await
                         }
-                        _ => Ok(()),
+                        _ => Err(Error::Other(
+                            "topic clearing requires a user session".into(),
+                        )),
                     };
                     if let Err(e) = result {
                         warn!(bot = %bot.name, error = %e, "clearchat incomplete");
