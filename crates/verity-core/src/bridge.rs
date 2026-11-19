@@ -733,7 +733,7 @@ async fn run_command(
                         let _ = api
                             .send_message(
                                 chat_id,
-                                &format!("Chat deletion incomplete: {e}. Memory was not wiped. Retry clearchat."),
+                                "Chat deletion incomplete. Memory was not wiped. Retry clearchat.",
                                 thread,
                                 None,
                             )
