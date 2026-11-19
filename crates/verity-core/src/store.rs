@@ -215,7 +215,7 @@ impl Store {
         Ok(())
     }
 
-    /// Forget a bot's forum topic (next turn recreates it).
+    /// Forget a bot's forum topic so the bridge can recreate it.
     pub fn clear_bot_topic(&self, name: &str) -> Result<()> {
         let mut s = self
             .conn
@@ -237,6 +237,16 @@ impl Store {
         stmt.bind((2, name))?;
         stmt.next()?;
         Ok(())
+    }
+
+    pub(crate) fn set_bot_topic_if_empty(&self, name: &str, topic_id: i64) -> Result<bool> {
+        let mut stmt = self
+            .conn
+            .prepare("UPDATE bots SET topic_id = ? WHERE name = ? AND topic_id IS NULL")?;
+        stmt.bind((1, topic_id))?;
+        stmt.bind((2, name))?;
+        stmt.next()?;
+        Ok(self.conn.change_count() > 0)
     }
 
     pub fn remember(&self, bot: &str, key: &str, value: &str) -> Result<()> {
@@ -357,6 +367,16 @@ mod tests {
                 greeting: None,
             })
             .unwrap();
+    }
+
+    #[test]
+    fn topic_creation_preserves_an_already_saved_topic() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        add_test_bot(&store);
+        assert!(store.set_bot_topic_if_empty("scout", 7).unwrap());
+        assert!(!store.set_bot_topic_if_empty("scout", 8).unwrap());
+        assert_eq!(store.get_bot("scout").unwrap().unwrap().topic_id, Some(7));
+        assert!(!store.set_bot_topic_if_empty("missing", 8).unwrap());
     }
 
     fn assert_current_timestamp(store: &Store, table: &str, column: &str) {
