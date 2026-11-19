@@ -124,19 +124,25 @@ fn append_plain(parts: &mut Vec<String>, mut text: &str, limit: usize, units: fn
     if text.is_empty() {
         return;
     }
-    let mut remaining = text.chars().map(units).sum::<usize>();
+    let remaining = text.chars().map(units).sum::<usize>();
     if let Some(last) = parts.last_mut() {
-        let mut available = limit - last.chars().map(units).sum::<usize>();
-        while remaining > limit && available >= 2 {
-            let end = split_point(text, available, units);
-            let used = text[..end].chars().map(units).sum::<usize>();
-            last.push_str(&text[..end]);
-            text = &text[end..];
-            available -= used;
-            remaining -= used;
+        let available = limit - last.chars().map(units).sum::<usize>();
+        if remaining > limit && available >= 2 {
+            let end = text
+                .char_indices()
+                .scan(0, |used, (i, ch)| {
+                    *used += units(ch);
+                    (*used <= available).then_some((i, ch))
+                })
+                .filter_map(|(i, ch)| ch.is_whitespace().then_some(i + ch.len_utf8()))
+                .last();
+            if let Some(end) = end {
+                last.push_str(&text[..end]);
+                text = &text[end..];
+            }
         }
     }
-    if remaining <= limit {
+    if text.chars().map(units).sum::<usize>() <= limit {
         append_piece(parts, text.to_string(), limit, units);
     } else {
         parts.extend(split_plain(text, limit, units));
@@ -239,6 +245,22 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert_eq!(parts.concat(), text);
         assert!(parts.iter().all(|p| p.chars().count() <= RICH_LIMIT));
+    }
+
+    #[test]
+    fn filling_previous_part_never_cuts_a_word() {
+        let text = "hello world ".repeat(8);
+        for (previous, expected) in [
+            ("prefix:", "prefix:hello "),
+            ("almost full!!!", "almost full!!!"),
+        ] {
+            let mut parts = vec![previous.to_string()];
+            append_plain(&mut parts, &text, 16, |_| 1);
+            assert_eq!(parts[0], expected);
+            assert_eq!(parts.concat(), format!("{previous}{text}"));
+            assert!(parts.iter().all(|p| p.chars().count() <= 16));
+            assert!(parts[1..].iter().all(|p| p.ends_with(char::is_whitespace)));
+        }
     }
 
     #[test]
