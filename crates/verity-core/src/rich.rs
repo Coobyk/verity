@@ -1,38 +1,126 @@
 //! Helpers for Telegram Rich Messages (Bot API 10.1+): 32,768-char limit,
 //! GFM-compatible markdown, collapsible thinking blocks, LaTeX.
 
-/// Hard cap for one rich message.
+/// Hard cap for one rich message, in Unicode characters.
 pub const RICH_LIMIT: usize = 32_768;
-/// Hard cap for a plain text message.
+/// Hard cap for a plain text message, in UTF-16 code units.
 pub const TEXT_LIMIT: usize = 4_096;
 
-/// Split markdown so each part fits `limit`, breaking on paragraph
-/// boundaries when possible and never inside a fenced code block.
+/// Split rich markdown at paragraph, line, or word boundaries where possible.
+/// Fenced blocks are kept together or closed and reopened with their info string.
 pub fn split_markdown(text: &str, limit: usize) -> Vec<String> {
-    if text.len() <= limit {
+    split_with_units(text, limit, |_| 1)
+}
+
+/// Split legacy markdown within Telegram's UTF-16 plain-message limit.
+pub fn split_markdown_utf16(text: &str, limit: usize) -> Vec<String> {
+    split_with_units(text, limit, char::len_utf16)
+}
+
+fn split_with_units(text: &str, limit: usize, units: fn(char) -> usize) -> Vec<String> {
+    debug_assert!(limit >= 2);
+    let len = |s: &str| s.chars().map(units).sum::<usize>();
+    if len(text) <= limit {
         return vec![text.to_string()];
     }
     let mut parts = Vec::new();
-    let mut cur = String::new();
-    let mut in_fence = false;
-    for para in text.split_inclusive("\n\n") {
-        // crude fence tracking: a paragraph containing an odd number of ``` toggles state
-        if para.matches("```").count() % 2 == 1 {
-            in_fence = !in_fence;
-        }
-        if cur.len() + para.len() > limit && !cur.is_empty() {
-            if in_fence {
-                cur.push_str("```\n");
+    let mut fence: Option<(usize, usize, &str)> = None;
+    let mut plain_start = 0;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let end = offset + line.len();
+        if let Some((marker, info)) = fence_marker(line) {
+            if let Some((start, body_start, opening_marker)) = fence {
+                if marker.starts_with(opening_marker) && info.trim().is_empty() {
+                    if plain_start < start {
+                        parts.extend(split_plain(&text[plain_start..start], limit, units));
+                    }
+                    let block = &text[start..end];
+                    if len(block) <= limit {
+                        parts.push(block.to_string());
+                    } else {
+                        let body = &text[body_start..offset];
+                        let fence_char = opening_marker.chars().next().unwrap();
+                        let longest_run = body
+                            .split(|c| c != fence_char)
+                            .map(str::len)
+                            .max()
+                            .unwrap_or(0);
+                        let delimiter = fence_char
+                            .to_string()
+                            .repeat(opening_marker.len().max(longest_run + 1));
+                        let opening =
+                            text[start..body_start].replacen(opening_marker, &delimiter, 1);
+                        let closing = line.replacen(marker, &delimiter, 1);
+                        let overhead = len(&opening) + len(&closing) + 1;
+                        if overhead + 2 > limit {
+                            parts.extend(split_plain(body, limit, units));
+                        } else {
+                            for chunk in split_plain(body, limit - overhead, units) {
+                                let newline = if chunk.ends_with('\n') { "" } else { "\n" };
+                                parts.push(format!("{opening}{chunk}{newline}{closing}"));
+                            }
+                        }
+                    }
+                    plain_start = end;
+                    fence = None;
+                }
+            } else if !marker.starts_with('`') || !info.contains('`') {
+                fence = Some((offset, end, marker));
             }
-            parts.push(std::mem::take(&mut cur));
-            if in_fence {
-                cur.push_str("```\n");
-            }
         }
-        cur.push_str(para);
+        offset = end;
     }
-    if !cur.is_empty() {
-        parts.push(cur);
+    if plain_start < text.len() {
+        parts.extend(split_plain(&text[plain_start..], limit, units));
+    }
+    parts
+}
+
+fn fence_marker(line: &str) -> Option<(&str, &str)> {
+    let trimmed = line.trim_start_matches(' ');
+    if line.len() - trimmed.len() > 3 {
+        return None;
+    }
+    let marker = trimmed.chars().next()?;
+    if !matches!(marker, '`' | '~') {
+        return None;
+    }
+    let count = trimmed.chars().take_while(|&c| c == marker).count();
+    (count >= 3).then(|| trimmed.split_at(count))
+}
+
+fn split_plain(mut text: &str, limit: usize, units: fn(char) -> usize) -> Vec<String> {
+    let mut parts = Vec::new();
+    while !text.is_empty() {
+        let mut used = 0;
+        let mut end = 0;
+        let (mut paragraph, mut line, mut whitespace) = (None, None, None);
+        for (i, ch) in text.char_indices() {
+            if used + units(ch) > limit {
+                break;
+            }
+            used += units(ch);
+            end = i + ch.len_utf8();
+            if ch.is_whitespace() {
+                whitespace = Some(end);
+            }
+            if ch == '\n' {
+                line = Some(end);
+                if text[..end].ends_with("\n\n") {
+                    paragraph = Some(end);
+                }
+            }
+        }
+        if end < text.len() {
+            end = paragraph.or(line).or(whitespace).unwrap_or(end);
+        }
+        // The bridge's limits always fit a complete Unicode character.
+        if end == 0 {
+            end = text.chars().next().unwrap().len_utf8();
+        }
+        parts.push(text[..end].to_string());
+        text = &text[end..];
     }
     parts
 }
@@ -93,7 +181,7 @@ mod tests {
     #[test]
     fn plain_limit_counts_utf16_without_splitting_emoji() {
         let text = "x".repeat(TEXT_LIMIT - 1) + "😀z";
-        let parts = split_markdown(&text, TEXT_LIMIT);
+        let parts = split_markdown_utf16(&text, TEXT_LIMIT);
         assert_eq!(parts.concat(), text);
         assert!(parts.iter().all(|p| p.encode_utf16().count() <= TEXT_LIMIT));
         assert!(parts[1].starts_with('😀'));
@@ -139,5 +227,43 @@ mod tests {
             split_markdown("```rust\nhello", RICH_LIMIT),
             vec!["```rust\nhello"]
         );
+    }
+
+    #[test]
+    fn recognizes_fence_lines_not_inline_backticks() {
+        let text = "inline ``` text\nnext line here";
+        assert_eq!(split_markdown(text, 20).concat(), text);
+        for marker in ["~~~~", "````"] {
+            let text = format!("before\n{marker}rust\n{}\n{marker}\nafter", "😀".repeat(40));
+            let parts = split_markdown_utf16(&text, 40);
+            assert!(parts.iter().all(|p| p.encode_utf16().count() <= 40));
+            let code: Vec<_> = parts.iter().filter(|p| p.starts_with(marker)).collect();
+            assert!(code.len() > 1);
+            for part in code {
+                assert!(part.starts_with(&format!("{marker}rust\n")));
+                assert!(part.ends_with(&format!("\n{marker}\n")));
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_fence_wrappers_are_dropped() {
+        let text = format!("```{}\nhello world\n```", "r".repeat(40));
+        let parts = split_markdown(&text, 10);
+        assert_eq!(parts.concat(), "hello world\n");
+        assert!(parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().count() <= 10));
+    }
+
+    #[test]
+    fn cuts_cannot_turn_code_into_a_closing_fence() {
+        let text = format!("```md\n{}\n```", "```not_a_close\n".repeat(10));
+        let parts = split_markdown(&text, 30);
+        for part in parts {
+            assert!(part.chars().count() <= 30);
+            assert!(part.starts_with("````md\n"), "{part:?}");
+            assert!(part.ends_with("\n````"), "{part:?}");
+        }
     }
 }
