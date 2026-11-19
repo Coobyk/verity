@@ -81,22 +81,30 @@ impl Store {
 
     /// Rename a bot record and move its memory rows along.
     pub fn rename_bot(&self, name: &str, new_name: &str) -> Result<bool> {
-        let mut s = self
-            .conn
-            .prepare("UPDATE bots SET name = ? WHERE name = ?")?;
-        s.bind((1, new_name))?;
-        s.bind((2, name))?;
-        s.next()?;
-        let changed = self.conn.change_count() > 0;
-        if changed {
+        self.conn.execute("BEGIN IMMEDIATE")?;
+        let result = (|| {
             let mut s = self
                 .conn
-                .prepare("UPDATE memory SET bot = ? WHERE bot = ?")?;
+                .prepare("UPDATE bots SET name = ? WHERE name = ?")?;
             s.bind((1, new_name))?;
             s.bind((2, name))?;
             s.next()?;
+            let changed = self.conn.change_count() > 0;
+            if changed {
+                let mut s = self
+                    .conn
+                    .prepare("UPDATE memory SET bot = ? WHERE bot = ?")?;
+                s.bind((1, new_name))?;
+                s.bind((2, name))?;
+                s.next()?;
+            }
+            self.conn.execute("COMMIT")?;
+            Ok(changed)
+        })();
+        if result.is_err() {
+            self.conn.execute("ROLLBACK")?;
         }
-        Ok(changed)
+        result
     }
 
     pub fn remove_bot(&self, name: &str) -> Result<bool> {
@@ -283,6 +291,58 @@ fn read_bot(stmt: &sqlite::Statement) -> Result<Bot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rename_store() -> Store {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        store
+            .conn
+            .execute("INSERT INTO bots (name, token) VALUES ('old', 'token')")
+            .unwrap();
+        store.remember("old", "shared", "original").unwrap();
+        store.remember("old", "unique", "preserved").unwrap();
+        store
+    }
+
+    #[test]
+    fn rename_bot_rolls_back_on_memory_conflict() {
+        let store = rename_store();
+        store.remember("new", "shared", "orphan").unwrap();
+        let old_memory = store.recall("old").unwrap();
+        let new_memory = store.recall("new").unwrap();
+
+        let error = store.rename_bot("old", "new").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("UNIQUE constraint failed: memory.bot, memory.key"));
+        assert!(store.get_bot("old").unwrap().is_some());
+        assert!(store.get_bot("new").unwrap().is_none());
+        assert_eq!(store.recall("old").unwrap(), old_memory);
+        assert_eq!(store.recall("new").unwrap(), new_memory);
+        store.remember("new", "shared", "resolved").unwrap();
+        store.clear_memory("new").unwrap();
+        assert!(store.rename_bot("old", "new").unwrap());
+    }
+
+    #[test]
+    fn rename_bot_moves_memory() {
+        let store = rename_store();
+        let memory = store.recall("old").unwrap();
+        assert!(store.rename_bot("old", "new").unwrap());
+        assert!(store.get_bot("old").unwrap().is_none());
+        assert_eq!(store.get_bot("new").unwrap().unwrap().token, "token");
+        assert!(store.recall("old").unwrap().is_empty());
+        assert_eq!(store.recall("new").unwrap(), memory);
+    }
+
+    #[test]
+    fn rename_bot_missing_is_unchanged() {
+        let store = rename_store();
+        assert!(!store.rename_bot("missing", "new").unwrap());
+        assert!(store.get_bot("old").unwrap().is_some());
+        assert!(store.get_bot("new").unwrap().is_none());
+        assert!(store.recall("new").unwrap().is_empty());
+        assert!(store.rename_bot("old", "new").unwrap());
+    }
 
     fn add_test_bot(store: &Store) {
         store
