@@ -1276,8 +1276,14 @@ async fn handle_turn(
     text: &str,
 ) -> Result<()> {
     let _ = api.set_reaction(chat_id, message_id, "👀").await;
-    // The pending record was written before queuing (or survived a
-    // restart); keep it until this turn finishes so recovery can replay it.
+    // Re-mark the turn pending under the current key: `handle_message`
+    // already wrote it before queuing, but a recovered legacy record or a
+    // failed early write would otherwise leave a mid-turn crash unrecoverable.
+    let pkey = pending_key(&bot.name, message_id, chat_id, thread);
+    let pval = text.to_string();
+    if let Err(e) = db_call(&env.db, move |s| s.kv_set(&pkey, &pval)).await {
+        warn!(bot = %bot.name, error = %e, "pending turn write failed");
+    }
     let _ = api.send_chat_action(chat_id, "typing", thread).await;
     let keepalive = typing_keepalive(api.clone(), chat_id, thread);
     let activity = Activity::default();
