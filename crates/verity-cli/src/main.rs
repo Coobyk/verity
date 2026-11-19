@@ -346,6 +346,14 @@ fn rand_u64() -> u64 {
     n ^ (std::process::id() as u64).wrapping_mul(0x2545F4914F6CDD1D)
 }
 
+fn pfp_style(what: Option<&str>, roll: impl FnOnce() -> u64) -> Result<(u64, f64)> {
+    let seed = match what {
+        None | Some("random") => roll().max(1),
+        Some(w) => w.parse().context("use `random` or a seed number")?,
+    };
+    Ok((seed, (seed % 360) as f64))
+}
+
 /// Tokio worker threads default to a 2 MiB stack; deep synchronous
 /// chains (dependency parsers, drop glue unwinding a burst of failed
 /// futures) can exhaust it — that aborts the whole process, no unwind.
@@ -475,13 +483,7 @@ async fn run() -> Result<()> {
             let bot = Store::open(&Config::db_path()?)?
                 .primary_bot()?
                 .context("no bots registered — `verity bot new`")?;
-            let (seed, hue) = match what.as_deref() {
-                None | Some("random") => (rand_u64().max(1), (rand_u64() % 360) as f64),
-                Some(w) => {
-                    let seed: u64 = w.parse().context("use `random` or a seed number")?;
-                    (seed, (seed % 360) as f64)
-                }
-            };
+            let (seed, hue) = pfp_style(what.as_deref(), rand_u64)?;
             set_pfp(&bot, seed, Some(hue)).await?;
             println!("hue {hue:.0}° — `verity pfp {seed}` replays this face");
         }
@@ -927,4 +929,19 @@ async fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pfp_style;
+
+    #[test]
+    fn random_pfp_replays_with_the_same_hue() {
+        for what in [Some("random"), None] {
+            let mut entropy = [42, 180].into_iter();
+            let draw = pfp_style(what, || entropy.next().unwrap()).unwrap();
+            let replay = pfp_style(Some(&draw.0.to_string()), || unreachable!()).unwrap();
+            assert_eq!(draw, replay, "pfp {what:?}");
+        }
+    }
 }
