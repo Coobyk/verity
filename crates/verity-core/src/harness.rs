@@ -413,7 +413,7 @@ impl AcpHarness {
             .map_err(|e| Error::Harness(format!("acp wait: {e}")))?;
         let _ = child.kill().await;
         let stderr = stderr_buf.await.unwrap_or_default();
-        if status.is_some_and(|status| !status.success()) || pending < requests.len() {
+        if pending < requests.len() {
             let reason = match status {
                 Some(status) => format!("{bin} exited {status}"),
                 None => format!("{bin} closed stdout without completing the ACP turn"),
@@ -423,6 +423,9 @@ impl AcpHarness {
                 "{reason}: {}",
                 tail.chars().rev().collect::<String>()
             )));
+        }
+        if let Some(status) = status.filter(|status| !status.success()) {
+            tracing::warn!(%status, "acp: agent exited after completing the turn");
         }
         let reply = strip_thinking(acc.finish().trim());
         if reply.is_empty() && !stderr.is_empty() {
@@ -669,8 +672,27 @@ mod tests {
     #[tokio::test]
     async fn acp_completed_turn_allows_reply_or_empty_reply() {
         for reply in ["hello", ""] {
-            let script = format!(
-                r#"read -r request
+            assert_eq!(
+                run_acp_script(&completed_acp_script(reply))
+                    .await
+                    .unwrap()
+                    .reply,
+                reply
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_completed_turn_then_exit_one_preserves_reply() {
+        let script = format!("{}\nexit 1", completed_acp_script("hello"));
+        assert_eq!(run_acp_script(&script).await.unwrap().reply, "hello");
+    }
+
+    #[cfg(unix)]
+    fn completed_acp_script(reply: &str) -> String {
+        format!(
+            r#"read -r request
 echo '{{"jsonrpc":"2.0","id":0,"result":{{}}}}'
 read -r request
 echo '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"test"}}}}'
@@ -678,9 +700,7 @@ read -r request
 echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"text":"{reply}"}}}}}}}}'
 echo '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
 "#
-            );
-            assert_eq!(run_acp_script(&script).await.unwrap().reply, reply);
-        }
+        )
     }
 
     #[test]
