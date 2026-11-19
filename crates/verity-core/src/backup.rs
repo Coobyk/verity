@@ -535,6 +535,19 @@ fn chmod_exec(path: &Path) {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn snapshot_is_removed_after_use() {
+        let db = std::env::temp_dir().join(format!("verity-snapshot-test-{}.sqlite", std::process::id()));
+        Store::open(&db).unwrap().kv_set("test", "saved").unwrap();
+        let snap = snapshot(&db, "state.sqlite").await.unwrap();
+        let path = snap.to_path_buf();
+        assert_eq!(Store::open(&path).unwrap().kv_get("test").unwrap().as_deref(), Some("saved"));
+        drop(snap);
+        let removed = !path.exists() && !path.parent().unwrap().exists();
+        let _ = std::fs::remove_file(&db);
+        assert!(removed, "snapshot staging directory leaked: {}", path.display());
+    }
+
     /// pack + extract round-trip: target/-wal/.part skipped, _home
     /// entries land under $HOME, path traversal entries are refused.
     #[test]
