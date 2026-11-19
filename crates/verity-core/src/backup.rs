@@ -76,7 +76,7 @@ pub async fn upload(api: &BotApi, group_id: i64) -> Result<Vec<String>> {
     std::fs::create_dir_all(&stage)?;
     let out = async {
         // Consistent copies of the live dbs, staged beside the archive.
-        let mut snaps: Vec<(String, PathBuf)> = Vec::new();
+        let mut snaps = Vec::new();
         for name in SQLITE_FILES {
             let live = home.join(name);
             if live.exists() {
@@ -111,7 +111,7 @@ pub async fn upload(api: &BotApi, group_id: i64) -> Result<Vec<String>> {
 fn pack(
     home: &Path,
     user_home: Option<&Path>,
-    snaps: &[(String, PathBuf)],
+    snaps: &[(String, Snapshot)],
     archive: &Path,
 ) -> Result<()> {
     let mut sz = ArchiveWriter::create(archive).map_err(sz_err)?;
@@ -141,7 +141,7 @@ fn pack(
             let reader = snaps
                 .iter()
                 .find(|(n, _)| n == &rel)
-                .map(|(_, p)| p.as_path())
+                .map(|(_, p)| p.path.as_path())
                 .unwrap_or(&path);
             sz.push_archive_entry(
                 ArchiveEntry::new_file(&rel),
@@ -197,34 +197,42 @@ fn sz_err(e: sevenz_rust2::Error) -> Error {
 /// name clean and stops two backups racing on one temp file. The brain
 /// goes through [`Store`] (runs migrations); the MTProto session db is
 /// grammers' schema, opened raw.
-async fn snapshot(db: &Path, file_name: &str) -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!(
-        "verity-backup-{}-{}",
-        file_name,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&dir)?;
-    let snap = dir.join(file_name);
-    let (db, snap2) = (db.to_path_buf(), snap.clone());
+struct Snapshot {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for Snapshot {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+async fn snapshot(db: &Path, file_name: &str) -> Result<Snapshot> {
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("verity-backup-{file_name}-"))
+        .tempdir()?;
+    let snap = Snapshot {
+        path: dir.path().join(file_name),
+        _dir: dir,
+    };
+    let db = db.to_path_buf();
     let via_store = file_name == "state.sqlite";
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    tokio::task::spawn_blocking(move || -> Result<Snapshot> {
         if via_store {
-            Store::open(&db)?.vacuum_into(&snap2)
+            Store::open(&db)?.vacuum_into(&snap.path)?;
         } else {
             let conn = sqlite::Connection::open(&db)?;
             conn.execute("PRAGMA busy_timeout = 5000")?;
-            let _ = std::fs::remove_file(&snap2);
-            let esc = snap2.to_string_lossy().replace('\'', "''");
+            let esc = snap.path.to_string_lossy().replace('\'', "''");
             conn.execute(format!("VACUUM INTO '{esc}'"))?;
-            Ok(())
         }
+        Ok(snap)
     })
     .await
-    .map_err(|e| Error::Other(e.to_string()))??;
-    Ok(snap)
+    .map_err(|e| Error::Other(e.to_string()))?
 }
 
 /// Pull the newest backup out of General back into `~/verity`,
@@ -534,6 +542,47 @@ fn chmod_exec(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn snapshot_is_removed_after_use() {
+        let db = std::env::temp_dir().join(format!(
+            "verity-snapshot-test-{}.sqlite",
+            std::process::id()
+        ));
+        Store::open(&db).unwrap().kv_set("test", "saved").unwrap();
+        let snap = snapshot(&db, "state.sqlite").await.unwrap();
+        let path = snap.to_path_buf();
+        assert_eq!(
+            Store::open(&path)
+                .unwrap()
+                .kv_get("test")
+                .unwrap()
+                .as_deref(),
+            Some("saved")
+        );
+        drop(snap);
+        let removed = !path.exists() && !path.parent().unwrap().exists();
+        let _ = std::fs::remove_file(&db);
+        assert!(
+            removed,
+            "snapshot staging directory leaked: {}",
+            path.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_raw_empty_database_and_error_cleanup() {
+        let source = tempfile::tempdir().unwrap();
+        let db = source.path().join("tg.session");
+        sqlite::Connection::open(&db).unwrap();
+        let snap = snapshot(&db, "tg.session").await.unwrap();
+        let dir = snap.parent().unwrap().to_path_buf();
+        assert!(snap.is_file());
+        drop(snap);
+        assert!(!dir.exists());
+        std::fs::write(&db, "not sqlite").unwrap();
+        assert!(snapshot(&db, "tg.session").await.is_err());
+    }
 
     /// pack + extract round-trip: target/-wal/.part skipped, _home
     /// entries land under $HOME, path traversal entries are refused.
