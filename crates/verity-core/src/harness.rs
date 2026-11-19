@@ -311,10 +311,16 @@ impl AcpHarness {
         let mut lines = BufReader::new(child.stdout.take().expect("piped stdout")).lines();
         // Drain stderr so a chatty agent can't block on a full pipe.
         let mut stderr = child.stderr.take().expect("piped stderr");
-        let stderr_buf = tokio::spawn(async move {
-            let mut s = String::new();
-            let _ = tokio::io::AsyncReadExt::read_to_string(&mut stderr, &mut s).await;
-            s
+        let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+        let stderr_output = stderr_buf.clone();
+        let mut stderr_task = tokio::spawn(async move {
+            let mut chunk = [0; 4096];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut stderr, &mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => stderr_output.lock().unwrap().extend_from_slice(&chunk[..n]),
+                }
+            }
         });
 
         let mut acc = ReplyAccumulator::new();
@@ -426,14 +432,13 @@ impl AcpHarness {
             .map_err(|e| Error::Harness(format!("acp wait: {e}")))?;
         child.kill_group();
         let _ = child.kill().await;
-        let mut stderr_buf = stderr_buf;
-        let stderr = match tokio::time::timeout(Duration::from_secs(1), &mut stderr_buf).await {
-            Ok(result) => result.unwrap_or_default(),
-            Err(_) => {
-                stderr_buf.abort();
-                String::new()
-            }
-        };
+        if tokio::time::timeout(Duration::from_secs(1), &mut stderr_task)
+            .await
+            .is_err()
+        {
+            stderr_task.abort();
+        }
+        let stderr = String::from_utf8_lossy(&stderr_buf.lock().unwrap()).into_owned();
         if pending < requests.len() {
             let reason = match status {
                 Some(status) => format!("{bin} exited {status}"),
@@ -718,6 +723,40 @@ mod tests {
         assert!(err.contains("exit status: 42"), "{err}");
         assert!(err.ends_with("final diagnostic\n"), "{err}");
         assert_eq!(err.matches('x').count(), 185);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_crash_preserves_stderr_when_detached_helper_holds_pipe() {
+        if !std::process::Command::new("setsid")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            eprintln!("skipping: setsid unavailable");
+            return;
+        }
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_acp_script(
+                "read -r request; echo 'agent crashed' >&2; setsid sleep 60 >/dev/null & echo helper:$! >&2; exit 42",
+            ),
+        )
+        .await
+        .expect("detached helper must not delay crash reporting");
+        let err = result.unwrap_err().to_string();
+        let pid = err
+            .split_once("helper:")
+            .and_then(|(_, tail)| tail.split_whitespace().next())
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .expect("helper pid in stderr");
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+        assert!(err.contains("exit status: 42"), "{err}");
+        assert!(err.contains("agent crashed"), "{err}");
     }
 
     #[cfg(unix)]
