@@ -206,13 +206,31 @@ fn acp_timeout() -> Duration {
 /// dev servers the agent spawned) running as orphans.
 struct ChildGroup {
     child: tokio::process::Child,
+    pid: Option<u32>,
 }
 
 impl ChildGroup {
     fn spawn(cmd: &mut Command) -> std::io::Result<Self> {
         #[cfg(unix)]
         cmd.process_group(0); // group leader: pgid == child pid
-        cmd.spawn().map(|child| Self { child })
+        cmd.spawn().map(|child| Self {
+            pid: child.id(),
+            child,
+        })
+    }
+
+    fn kill_group(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            let killed = std::process::Command::new("kill")
+                .args(["-KILL", "--", &format!("-{pid}")])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            if killed.is_ok_and(|status| status.success()) {
+                self.pid = None;
+            }
+        }
     }
 }
 
@@ -231,12 +249,7 @@ impl std::ops::DerefMut for ChildGroup {
 
 impl Drop for ChildGroup {
     fn drop(&mut self) {
-        let Some(pid) = self.child.id() else { return };
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", &format!("-{pid}")])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        self.kill_group();
     }
 }
 
@@ -298,10 +311,16 @@ impl AcpHarness {
         let mut lines = BufReader::new(child.stdout.take().expect("piped stdout")).lines();
         // Drain stderr so a chatty agent can't block on a full pipe.
         let mut stderr = child.stderr.take().expect("piped stderr");
-        let stderr_buf = tokio::spawn(async move {
-            let mut s = String::new();
-            let _ = tokio::io::AsyncReadExt::read_to_string(&mut stderr, &mut s).await;
-            s
+        let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+        let stderr_output = stderr_buf.clone();
+        let mut stderr_task = tokio::spawn(async move {
+            let mut chunk = [0; 4096];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut stderr, &mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => stderr_output.lock().unwrap().extend_from_slice(&chunk[..n]),
+                }
+            }
         });
 
         let mut acc = ReplyAccumulator::new();
@@ -322,10 +341,9 @@ impl AcpHarness {
                 let mut line =
                     serde_json::to_string(&req).map_err(|e| Error::Harness(e.to_string()))?;
                 line.push('\n');
-                stdin
-                    .write_all(line.as_bytes())
-                    .await
-                    .map_err(|e| Error::Harness(format!("acp write: {e}")))?;
+                if stdin.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
                 let t = line.trim_end();
                 info!("acp -> {}", &t[..t.floor_char_boundary(t.len().min(300))]);
                 sent += 1;
@@ -355,10 +373,9 @@ impl AcpHarness {
                     let mut l =
                         serde_json::to_string(&resp).map_err(|e| Error::Harness(e.to_string()))?;
                     l.push('\n');
-                    stdin
-                        .write_all(l.as_bytes())
-                        .await
-                        .map_err(|e| Error::Harness(format!("acp write: {e}")))?;
+                    if stdin.write_all(l.as_bytes()).await.is_err() {
+                        break;
+                    }
                 } else if method == "session/update" {
                     let u = &msg["params"]["update"];
                     if let Some(label) = activity_label(u) {
@@ -408,9 +425,34 @@ impl AcpHarness {
 
         drop(stdin); // close the pipe so the server can exit
                      // Per-turn agent: don't wait indefinitely — kill if it lingers.
-        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .ok()
+            .transpose()
+            .map_err(|e| Error::Harness(format!("acp wait: {e}")))?;
+        child.kill_group();
         let _ = child.kill().await;
-        let stderr = stderr_buf.await.unwrap_or_default();
+        if tokio::time::timeout(Duration::from_secs(1), &mut stderr_task)
+            .await
+            .is_err()
+        {
+            stderr_task.abort();
+        }
+        let stderr = String::from_utf8_lossy(&stderr_buf.lock().unwrap()).into_owned();
+        if pending < requests.len() {
+            let reason = match status {
+                Some(status) => format!("{bin} exited {status}"),
+                None => format!("{bin} closed stdout without completing the ACP turn"),
+            };
+            let tail: String = stderr.chars().rev().take(200).collect();
+            return Err(Error::Harness(format!(
+                "{reason}: {}",
+                tail.chars().rev().collect::<String>()
+            )));
+        }
+        if let Some(status) = status.filter(|status| !status.success()) {
+            tracing::warn!(%status, "acp: agent exited after completing the turn");
+        }
         let reply = strip_thinking(acc.finish().trim());
         if reply.is_empty() && !stderr.is_empty() {
             tracing::debug!(stderr = %stderr.chars().take(500).collect::<String>(), "acp: empty reply");
@@ -606,6 +648,163 @@ fn permission_response(id: serde_json::Value, msg: &serde_json::Value) -> serde_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_crash_reports_exit_status_and_stderr() {
+        let err = run_acp_script("read -r request; echo 'agent crashed' >&2; exit 42")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Harness(_)), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("exit status: 42"), "{message}");
+        assert!(message.contains("agent crashed"), "{message}");
+    }
+
+    #[cfg(unix)]
+    async fn run_acp_script(script: &str) -> Result<TurnOutput> {
+        let ctx = TurnContext {
+            bot_name: "test".into(),
+            instructions: String::new(),
+            memory: Vec::new(),
+            history: Vec::new(),
+            peers: Vec::new(),
+            first_contact: false,
+            cwd: std::env::current_dir().unwrap(),
+            model: None,
+            activity: Activity::default(),
+        };
+        let harness = AcpHarness {
+            argv: vec!["sh".into(), "-c".into(), script.into()],
+        };
+        harness.run_turn(&ctx, "hello").await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_incomplete_clean_exit_is_error() {
+        let err = run_acp_script("read -r request; exit 0").await.unwrap_err();
+        assert!(err.to_string().contains("exit status: 0"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_immediate_crash_reports_exit_status() {
+        let err = run_acp_script("exit 42").await.unwrap_err();
+        assert!(err.to_string().contains("exit status: 42"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_crash_with_inherited_stderr_returns_promptly() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_acp_script(
+                "read -r request; sleep 60 >/dev/null & echo 'agent crashed' >&2; exit 42",
+            ),
+        )
+        .await
+        .expect("crash cleanup must not wait for the grandchild's stderr");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("exit status: 42"), "{err}");
+        assert!(err.contains("agent crashed"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_crash_stderr_tail_fits_bridge_error_budget() {
+        let err = run_acp_script(
+            "read -r request; i=0; while [ $i -lt 500 ]; do printf x >&2; i=$((i+1)); done; echo 'final diagnostic' >&2; exit 42",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.chars().count() <= 300, "{err}");
+        assert!(err.contains("exit status: 42"), "{err}");
+        assert!(err.ends_with("final diagnostic\n"), "{err}");
+        assert_eq!(err.matches('x').count(), 185);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_crash_preserves_stderr_when_detached_helper_holds_pipe() {
+        if !std::process::Command::new("setsid")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            eprintln!("skipping: setsid unavailable");
+            return;
+        }
+        let ready = std::env::temp_dir().join(format!(
+            "verity-acp-helper-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script = format!(
+            "read -r request; ready='{}'; setsid sh -c 'echo $$ > \"$1\"; exec sleep 60' sh \"$ready\" >/dev/null & while [ ! -s \"$ready\" ]; do sleep 0.01; done; echo 'agent crashed' >&2; exit 42",
+            ready.to_string_lossy().replace('\'', "'\\''")
+        );
+        let result = tokio::time::timeout(Duration::from_secs(3), run_acp_script(&script)).await;
+        let pid = std::fs::read_to_string(&ready).expect("detached helper ready marker");
+        let pid = pid.trim().parse::<u32>().unwrap().to_string();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .status()
+            .unwrap()
+            .success();
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid])
+            .status();
+        std::fs::remove_file(ready).unwrap();
+        assert!(alive, "detached helper must survive process-group cleanup");
+        let err = result
+            .expect("detached helper must not delay crash reporting")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exit status: 42"), "{err}");
+        assert!(err.contains("agent crashed"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_completed_turn_allows_reply_or_empty_reply() {
+        for reply in ["hello", ""] {
+            assert_eq!(
+                run_acp_script(&completed_acp_script(reply))
+                    .await
+                    .unwrap()
+                    .reply,
+                reply
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_completed_turn_then_exit_one_preserves_reply() {
+        let script = format!("{}\nexit 1", completed_acp_script("hello"));
+        assert_eq!(run_acp_script(&script).await.unwrap().reply, "hello");
+    }
+
+    #[cfg(unix)]
+    fn completed_acp_script(reply: &str) -> String {
+        format!(
+            r#"read -r request
+echo '{{"jsonrpc":"2.0","id":0,"result":{{}}}}'
+read -r request
+echo '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"test"}}}}'
+read -r request
+echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"text":"{reply}"}}}}}}}}'
+echo '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
+"#
+        )
+    }
 
     #[test]
     fn reply_is_last_segment_only() {
