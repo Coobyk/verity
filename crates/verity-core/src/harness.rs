@@ -206,13 +206,28 @@ fn acp_timeout() -> Duration {
 /// dev servers the agent spawned) running as orphans.
 struct ChildGroup {
     child: tokio::process::Child,
+    pid: Option<u32>,
 }
 
 impl ChildGroup {
     fn spawn(cmd: &mut Command) -> std::io::Result<Self> {
         #[cfg(unix)]
         cmd.process_group(0); // group leader: pgid == child pid
-        cmd.spawn().map(|child| Self { child })
+        cmd.spawn().map(|child| Self {
+            pid: child.id(),
+            child,
+        })
+    }
+
+    fn kill_group(&self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", "--", &format!("-{pid}")])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
     }
 }
 
@@ -231,12 +246,7 @@ impl std::ops::DerefMut for ChildGroup {
 
 impl Drop for ChildGroup {
     fn drop(&mut self) {
-        let Some(pid) = self.child.id() else { return };
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", &format!("-{pid}")])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        self.kill_group();
     }
 }
 
@@ -411,8 +421,16 @@ impl AcpHarness {
             .ok()
             .transpose()
             .map_err(|e| Error::Harness(format!("acp wait: {e}")))?;
+        child.kill_group();
         let _ = child.kill().await;
-        let stderr = stderr_buf.await.unwrap_or_default();
+        let mut stderr_buf = stderr_buf;
+        let stderr = match tokio::time::timeout(Duration::from_secs(1), &mut stderr_buf).await {
+            Ok(result) => result.unwrap_or_default(),
+            Err(_) => {
+                stderr_buf.abort();
+                String::new()
+            }
+        };
         if pending < requests.len() {
             let reason = match status {
                 Some(status) => format!("{bin} exited {status}"),
@@ -666,6 +684,22 @@ mod tests {
     async fn acp_immediate_crash_reports_exit_status() {
         let err = run_acp_script("exit 42").await.unwrap_err();
         assert!(err.to_string().contains("exit status: 42"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_crash_with_inherited_stderr_returns_promptly() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_acp_script(
+                "read -r request; sleep 60 >/dev/null & echo 'agent crashed' >&2; exit 42",
+            ),
+        )
+        .await
+        .expect("crash cleanup must not wait for the grandchild's stderr");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("exit status: 42"), "{err}");
+        assert!(err.contains("agent crashed"), "{err}");
     }
 
     #[cfg(unix)]
