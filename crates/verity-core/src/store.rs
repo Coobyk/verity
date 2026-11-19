@@ -43,13 +43,13 @@ impl Store {
                  provider     TEXT NOT NULL DEFAULT 'pi',
                  model        TEXT,
                  greeting     TEXT,
-                 created_at   INTEGER NOT NULL DEFAULT (unixepoch())
+                 created_at   INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER))
              );
              CREATE TABLE IF NOT EXISTS memory (
                  bot     TEXT NOT NULL REFERENCES bots(name),
                  key     TEXT NOT NULL,
                  value   TEXT NOT NULL,
-                 updated INTEGER NOT NULL DEFAULT (unixepoch()),
+                 updated INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER)),
                  PRIMARY KEY (bot, key)
              );
              CREATE TABLE IF NOT EXISTS kv (
@@ -64,8 +64,8 @@ impl Store {
 
     pub fn add_bot(&self, bot: &Bot) -> Result<()> {
         let mut stmt = self.conn.prepare(
-            "INSERT INTO bots (name, token, username, topic_id, instructions, provider, model, greeting)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO bots (name, token, username, topic_id, instructions, provider, model, greeting, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, CAST(strftime('%s', 'now') AS INTEGER))",
         )?;
         stmt.bind((1, bot.name.as_str()))?;
         stmt.bind((2, bot.token.as_str()))?;
@@ -233,8 +233,9 @@ impl Store {
 
     pub fn remember(&self, bot: &str, key: &str, value: &str) -> Result<()> {
         let mut stmt = self.conn.prepare(
-            "INSERT INTO memory (bot, key, value, updated) VALUES (?, ?, ?, unixepoch())
-             ON CONFLICT (bot, key) DO UPDATE SET value = excluded.value, updated = unixepoch()",
+            "INSERT INTO memory (bot, key, value, updated)
+             VALUES (?, ?, ?, CAST(strftime('%s', 'now') AS INTEGER))
+             ON CONFLICT (bot, key) DO UPDATE SET value = excluded.value, updated = excluded.updated",
         )?;
         stmt.bind((1, bot))?;
         stmt.bind((2, key))?;
