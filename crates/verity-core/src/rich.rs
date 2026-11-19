@@ -33,33 +33,20 @@ fn split_with_units(text: &str, limit: usize, units: fn(char) -> usize) -> Vec<S
             if let Some((start, body_start, opening_marker)) = fence {
                 if marker.starts_with(opening_marker) && info.trim().is_empty() {
                     if plain_start < start {
-                        parts.extend(split_plain(&text[plain_start..start], limit, units));
+                        append_plain(&mut parts, &text[plain_start..start], limit, units);
                     }
                     let block = &text[start..end];
                     if len(block) <= limit {
-                        parts.push(block.to_string());
+                        append_piece(&mut parts, block.to_string(), limit, units);
                     } else {
-                        let body = &text[body_start..offset];
-                        let fence_char = opening_marker.chars().next().unwrap();
-                        let longest_run = body
-                            .split(|c| c != fence_char)
-                            .map(str::len)
-                            .max()
-                            .unwrap_or(0);
-                        let delimiter = fence_char
-                            .to_string()
-                            .repeat(opening_marker.len().max(longest_run + 1));
-                        let opening =
-                            text[start..body_start].replacen(opening_marker, &delimiter, 1);
-                        let closing = line.replacen(marker, &delimiter, 1);
-                        let overhead = len(&opening) + len(&closing) + 1;
-                        if overhead + 2 > limit {
-                            parts.extend(split_plain(body, limit, units));
-                        } else {
-                            for chunk in split_plain(body, limit - overhead, units) {
-                                let newline = if chunk.ends_with('\n') { "" } else { "\n" };
-                                parts.push(format!("{opening}{chunk}{newline}{closing}"));
-                            }
+                        for chunk in split_fence_block(
+                            &text[start..body_start],
+                            &text[body_start..offset],
+                            line,
+                            limit,
+                            units,
+                        ) {
+                            append_piece(&mut parts, chunk, limit, units);
                         }
                     }
                     plain_start = end;
@@ -72,9 +59,88 @@ fn split_with_units(text: &str, limit: usize, units: fn(char) -> usize) -> Vec<S
         offset = end;
     }
     if plain_start < text.len() {
-        parts.extend(split_plain(&text[plain_start..], limit, units));
+        append_plain(&mut parts, &text[plain_start..], limit, units);
     }
     parts
+}
+
+fn split_fence_block(
+    opening: &str,
+    body: &str,
+    closing: &str,
+    limit: usize,
+    units: fn(char) -> usize,
+) -> Vec<String> {
+    let opening_marker = fence_marker(opening).unwrap().0;
+    let closing_marker = fence_marker(closing).unwrap().0;
+    let fence_char = opening_marker.chars().next().unwrap();
+    let longest_run = body
+        .split(|c| c != fence_char)
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let delimiter = fence_char
+        .to_string()
+        .repeat(opening_marker.len().max(longest_run + 1));
+    let opening = opening.replacen(opening_marker, &delimiter, 1);
+    let closing = closing.replacen(closing_marker, &delimiter, 1);
+    let overhead = opening
+        .chars()
+        .chain(closing.chars())
+        .map(units)
+        .sum::<usize>()
+        + 1;
+    if overhead + 2 > limit {
+        return split_plain(body, limit, units);
+    }
+    split_plain(body, limit - overhead, units)
+        .into_iter()
+        .map(|chunk| {
+            let newline = if chunk.ends_with('\n') { "" } else { "\n" };
+            format!("{opening}{chunk}{newline}{closing}")
+        })
+        .collect()
+}
+
+fn append_piece(parts: &mut Vec<String>, piece: String, limit: usize, units: fn(char) -> usize) {
+    if let Some(last) = parts.last_mut() {
+        let newline = !last.ends_with('\n')
+            && fence_marker(last.lines().last().unwrap_or("")).is_some()
+            && fence_marker(piece.lines().next().unwrap_or("")).is_some();
+        if last.chars().chain(piece.chars()).map(units).sum::<usize>() + usize::from(newline)
+            <= limit
+        {
+            if newline {
+                last.push('\n');
+            }
+            last.push_str(&piece);
+            return;
+        }
+    }
+    parts.push(piece);
+}
+
+fn append_plain(parts: &mut Vec<String>, mut text: &str, limit: usize, units: fn(char) -> usize) {
+    if text.is_empty() {
+        return;
+    }
+    let mut remaining = text.chars().map(units).sum::<usize>();
+    if let Some(last) = parts.last_mut() {
+        let mut available = limit - last.chars().map(units).sum::<usize>();
+        while remaining > limit && available >= 2 {
+            let end = split_point(text, available, units);
+            let used = text[..end].chars().map(units).sum::<usize>();
+            last.push_str(&text[..end]);
+            text = &text[end..];
+            available -= used;
+            remaining -= used;
+        }
+    }
+    if remaining <= limit {
+        append_piece(parts, text.to_string(), limit, units);
+    } else {
+        parts.extend(split_plain(text, limit, units));
+    }
 }
 
 fn fence_marker(line: &str) -> Option<(&str, &str)> {
@@ -93,36 +159,41 @@ fn fence_marker(line: &str) -> Option<(&str, &str)> {
 fn split_plain(mut text: &str, limit: usize, units: fn(char) -> usize) -> Vec<String> {
     let mut parts = Vec::new();
     while !text.is_empty() {
-        let mut used = 0;
-        let mut end = 0;
-        let (mut paragraph, mut line, mut whitespace) = (None, None, None);
-        for (i, ch) in text.char_indices() {
-            if used + units(ch) > limit {
-                break;
-            }
-            used += units(ch);
-            end = i + ch.len_utf8();
-            if ch.is_whitespace() {
-                whitespace = Some(end);
-            }
-            if ch == '\n' {
-                line = Some(end);
-                if text[..end].ends_with("\n\n") {
-                    paragraph = Some(end);
-                }
-            }
-        }
-        if end < text.len() {
-            end = paragraph.or(line).or(whitespace).unwrap_or(end);
-        }
-        // The bridge's limits always fit a complete Unicode character.
-        if end == 0 {
-            end = text.chars().next().unwrap().len_utf8();
-        }
+        let end = split_point(text, limit, units);
         parts.push(text[..end].to_string());
         text = &text[end..];
     }
     parts
+}
+
+fn split_point(text: &str, limit: usize, units: fn(char) -> usize) -> usize {
+    let mut used = 0;
+    let mut end = 0;
+    let (mut paragraph, mut line, mut whitespace) = (None, None, None);
+    for (i, ch) in text.char_indices() {
+        if used + units(ch) > limit {
+            break;
+        }
+        used += units(ch);
+        end = i + ch.len_utf8();
+        if ch.is_whitespace() {
+            whitespace = Some(end);
+        }
+        if ch == '\n' {
+            line = Some(end);
+            if text[..end].ends_with("\n\n") {
+                paragraph = Some(end);
+            }
+        }
+    }
+    if end < text.len() {
+        end = paragraph.or(line).or(whitespace).unwrap_or(end);
+    }
+    // The bridge's limits always fit a complete Unicode character.
+    if end == 0 {
+        end = text.chars().next().unwrap().len_utf8();
+    }
+    end
 }
 
 /// Wrap agent reasoning in a collapsible thinking block (Rich HTML).
@@ -146,6 +217,28 @@ mod tests {
         assert_eq!(parts.len(), 3);
         assert!(parts.iter().all(|p| p.len() <= 100));
         assert_eq!(parts.concat().replace("\n", ""), text.replace("\n", ""));
+    }
+
+    #[test]
+    fn packs_plain_text_and_whole_fences_greedily() {
+        let text = "intro\n```rs\nx\n```\noutro";
+        assert_eq!(
+            split_markdown(text, 20),
+            vec!["intro\n```rs\nx\n```\n", "outro"]
+        );
+    }
+
+    #[test]
+    fn near_limit_reply_with_short_fences_needs_only_two_parts() {
+        let text = format!(
+            "intro\n{}{}",
+            "```rs\nx\n```\nparagraph\n".repeat(5),
+            "word ".repeat(6_600)
+        );
+        let parts = split_markdown(&text, RICH_LIMIT);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts.concat(), text);
+        assert!(parts.iter().all(|p| p.chars().count() <= RICH_LIMIT));
     }
 
     #[test]
@@ -237,11 +330,17 @@ mod tests {
             let text = format!("before\n{marker}rust\n{}\n{marker}\nafter", "😀".repeat(40));
             let parts = split_markdown_utf16(&text, 40);
             assert!(parts.iter().all(|p| p.encode_utf16().count() <= 40));
-            let code: Vec<_> = parts.iter().filter(|p| p.starts_with(marker)).collect();
+            let code: Vec<_> = parts
+                .iter()
+                .filter(|p| p.lines().any(|line| line.starts_with(marker)))
+                .collect();
             assert!(code.len() > 1);
             for part in code {
-                assert!(part.starts_with(&format!("{marker}rust\n")));
-                assert!(part.ends_with(&format!("\n{marker}\n")));
+                assert!(part.lines().any(|line| line == format!("{marker}rust")));
+                assert_eq!(
+                    part.lines().filter(|line| line.starts_with(marker)).count() % 2,
+                    0
+                );
             }
         }
     }
