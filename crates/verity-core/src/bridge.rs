@@ -1098,8 +1098,36 @@ struct TurnOutcome {
 fn extract_markers(reply: &str) -> (String, Markers) {
     let mut kept = Vec::new();
     let mut markers = Markers::default();
+    let mut fence = None;
     for line in reply.lines() {
         let t = line.trim();
+        let fence_line = line.trim_start_matches(' ');
+        let indent = line.len() - fence_line.len();
+        let delimiter = fence_line.as_bytes().first().copied();
+        let run = fence_line
+            .bytes()
+            .take_while(|b| Some(*b) == delimiter)
+            .count();
+        if let Some((ch, len)) = fence {
+            if indent <= 3
+                && delimiter == Some(ch)
+                && run >= len
+                && fence_line[run..].trim().is_empty()
+            {
+                fence = None;
+            }
+            kept.push(line);
+            continue;
+        }
+        if indent <= 3
+            && matches!(delimiter, Some(b'`' | b'~'))
+            && run >= 3
+            && (delimiter != Some(b'`') || !fence_line[run..].contains('`'))
+        {
+            fence = Some((delimiter.unwrap(), run));
+            kept.push(line);
+            continue;
+        }
         if t.starts_with(":::") && t.ends_with(":::") && t.len() > 6 {
             let inner = t[3..t.len() - 3].trim();
             let (verb, rest) = inner
