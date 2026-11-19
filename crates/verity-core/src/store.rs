@@ -168,9 +168,9 @@ impl Store {
     /// All kv rows whose key starts with `prefix` — e.g. the per-message
     /// `pending:<bot>:` records after a crash.
     pub fn kv_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
-        let mut s = self
-            .conn
-            .prepare("SELECT key, value FROM kv WHERE substr(key, 1, ?) = ?")?;
+        let mut s = self.conn.prepare(
+            "SELECT key, value FROM kv WHERE substr(CAST(key AS BLOB), 1, ?) = CAST(? AS BLOB)",
+        )?;
         s.bind((1, prefix.len() as i64))?;
         s.bind((2, prefix))?;
         let mut out = Vec::new();
@@ -183,7 +183,7 @@ impl Store {
     pub fn kv_del_prefix(&self, prefix: &str) -> Result<()> {
         let mut s = self
             .conn
-            .prepare("DELETE FROM kv WHERE substr(key, 1, ?) = ?")?;
+            .prepare("DELETE FROM kv WHERE substr(CAST(key AS BLOB), 1, ?) = CAST(? AS BLOB)")?;
         s.bind((1, prefix.len() as i64))?;
         s.bind((2, prefix))?;
         s.next()?;
@@ -277,4 +277,55 @@ fn read_bot(stmt: &sqlite::Statement) -> Result<Bot> {
         model: stmt.read::<Option<String>, _>(6)?,
         greeting: stmt.read::<Option<String>, _>(7)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prefix_store() -> Store {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        for prefix in ["pending:scout:", "pending:Ünïcödé🤖:", "pending:a%_:"] {
+            store.kv_set(prefix, "exact").unwrap();
+            store.kv_set(&format!("{prefix}42"), "turn").unwrap();
+        }
+        store.kv_set("pending:other:42", "unrelated").unwrap();
+        store
+    }
+
+    #[test]
+    fn kv_prefix_matches_literal_prefixes() {
+        let store = prefix_store();
+        for prefix in ["pending:scout:", "pending:Ünïcödé🤖:", "pending:a%_:"] {
+            let mut rows = store.kv_prefix(prefix).unwrap();
+            rows.sort();
+            assert_eq!(
+                rows,
+                vec![
+                    (prefix.into(), "exact".into()),
+                    (format!("{prefix}42"), "turn".into())
+                ]
+            );
+        }
+        assert!(store.kv_prefix("missing:").unwrap().is_empty());
+        assert_eq!(store.kv_prefix("").unwrap().len(), 7);
+    }
+
+    #[test]
+    fn kv_del_prefix_matches_literal_prefixes() {
+        let store = prefix_store();
+        store.kv_del_prefix("missing:").unwrap();
+        assert_eq!(store.kv_prefix("").unwrap().len(), 7);
+        for prefix in ["pending:scout:", "pending:Ünïcödé🤖:", "pending:a%_:"] {
+            store.kv_del_prefix(prefix).unwrap();
+            assert_eq!(store.kv_get(prefix).unwrap(), None);
+            assert_eq!(store.kv_get(&format!("{prefix}42")).unwrap(), None);
+            assert_eq!(
+                store.kv_get("pending:other:42").unwrap().as_deref(),
+                Some("unrelated")
+            );
+        }
+        store.kv_del_prefix("").unwrap();
+        assert!(store.kv_prefix("").unwrap().is_empty());
+    }
 }
