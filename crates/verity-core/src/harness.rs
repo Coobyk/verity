@@ -334,7 +334,7 @@ impl AcpHarness {
 
         let mut pending = 0usize; // next request index to send
         let mut sent = 0usize; // requests fully written
-                               // Phase 1: send initialize, then drive the read/write loop.
+        // Phase 1: send initialize, then drive the read/write loop.
         loop {
             if sent < requests.len() && pending == sent {
                 let req = json!({"jsonrpc": "2.0", "id": sent, "method": methods[sent], "params": requests[sent]});
@@ -424,7 +424,7 @@ impl AcpHarness {
         }
 
         drop(stdin); // close the pipe so the server can exit
-                     // Per-turn agent: don't wait indefinitely — kill if it lingers.
+        // Per-turn agent: don't wait indefinitely — kill if it lingers.
         let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
             .await
             .ok()
@@ -648,6 +648,105 @@ fn permission_response(id: serde_json::Value, msg: &serde_json::Value) -> serde_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    async fn run_pi_script(script: &str) -> Result<TurnOutput> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("pi");
+        std::fs::write(&bin, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ctx = TurnContext {
+            bot_name: "test".into(),
+            instructions: String::new(),
+            memory: Vec::new(),
+            history: Vec::new(),
+            peers: Vec::new(),
+            first_contact: false,
+            cwd: dir.path().into(),
+            model: None,
+            activity: Activity::default(),
+        };
+        let mut harness = PiHarness::new(Some(bin.to_string_lossy().into_owned()));
+        harness.timeout = Duration::from_secs(1);
+        tokio::time::timeout(Duration::from_secs(4), harness.run_turn(&ctx, "hello"))
+            .await
+            .expect("pi turn must return within four seconds")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_hung_turn_times_out() {
+        let start = std::time::Instant::now();
+        let err = run_pi_script("exec sleep 60").await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Harness(message) if message.ends_with(": turn exceeded 1s")),
+            "{err}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_timeout_kills_grandchild() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!("sleep 60 &\necho $! > '{}'\nwait", pid_file.display());
+        let result = run_pi_script(&script).await;
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        let mut alive = true;
+        for _ in 0..100 {
+            let output = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", pid.trim()])
+                .output()
+                .unwrap();
+            let state = String::from_utf8_lossy(&output.stdout);
+            alive = !state.trim().is_empty() && !state.trim().starts_with('Z');
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if alive {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", pid.trim()])
+                .status();
+        }
+        assert!(!alive, "grandchild {} survived timeout", pid.trim());
+        assert!(result.unwrap_err().to_string().contains("turn exceeded 1s"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_fast_turn_preserves_stdout() {
+        for (stdout, reply) in [
+            ("  hello  ", "hello"),
+            ("", ""),
+            ("<think>secret</think>reply", "reply"),
+        ] {
+            assert_eq!(
+                run_pi_script(&format!("printf '%s' '{stdout}'"))
+                    .await
+                    .unwrap()
+                    .reply,
+                reply
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_failure_preserves_status_and_stderr() {
+        let err = run_pi_script("echo diagnostic >&2; exit 42")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("exited exit status: 42: diagnostic\n"),
+            "{err}"
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
