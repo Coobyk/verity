@@ -436,7 +436,7 @@ impl AcpHarness {
                 Some(status) => format!("{bin} exited {status}"),
                 None => format!("{bin} closed stdout without completing the ACP turn"),
             };
-            let tail: String = stderr.chars().rev().take(500).collect();
+            let tail: String = stderr.chars().rev().take(200).collect();
             return Err(Error::Harness(format!(
                 "{reason}: {}",
                 tail.chars().rev().collect::<String>()
@@ -700,6 +700,21 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("exit status: 42"), "{err}");
         assert!(err.contains("agent crashed"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_crash_stderr_tail_fits_bridge_error_budget() {
+        let err = run_acp_script(
+            "read -r request; i=0; while [ $i -lt 500 ]; do printf x >&2; i=$((i+1)); done; echo 'final diagnostic' >&2; exit 42",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.chars().count() <= 300, "{err}");
+        assert!(err.contains("exit status: 42"), "{err}");
+        assert!(err.ends_with("final diagnostic\n"), "{err}");
+        assert_eq!(err.matches('x').count(), 185);
     }
 
     #[cfg(unix)]
