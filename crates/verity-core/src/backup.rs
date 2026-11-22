@@ -6,7 +6,7 @@
 //! The upload carries `tg.session` (full account access) and
 //! `state.sqlite` (every bot token) — it's only as private as the group.
 
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 
 use grammers_session::defs::PeerRef;
@@ -474,11 +474,11 @@ fn extract(archive: &Path, home: &Path, user_home: Option<&Path>) -> Result<Vec<
                 std::io::copy(r, &mut std::io::sink()).map_err(read_error)?;
                 src_home = String::from_utf8(data).ok().map(|s| s.trim().to_string());
             } else if name.starts_with(HOME_ROOT) {
-                if let Some(uhome) = user_home {
-                    let change = RestoreChange::stage(uhome.join(rel), r, &name).map_err(|e| {
-                        sevenz_rust2::Error::Io(e, format!("stage archive entry {name}").into())
-                    })?;
-                    home_entries.push((name, change));
+                if user_home.is_some() {
+                    let dir = restore_staging_dir(&std::env::temp_dir()).map_err(read_error)?;
+                    let mut raw = tempfile::tempfile_in(dir.path()).map_err(read_error)?;
+                    std::io::copy(r, &mut raw).map_err(read_error)?;
+                    home_entries.push((name, raw, dir));
                 } else {
                     std::io::copy(r, &mut std::io::sink()).map_err(read_error)?;
                 }
@@ -503,15 +503,18 @@ fn extract(archive: &Path, home: &Path, user_home: Option<&Path>) -> Result<Vec<
         .map_err(sz_err)?;
     if let Some(uhome) = user_home {
         let new_home = uhome.to_string_lossy();
-        for (name, mut change) in home_entries {
-            if let Some(old) = &src_home {
-                if !old.is_empty() && *old != new_home {
-                    let staged = &change.replacement.as_ref().unwrap().file;
-                    let data = std::fs::read(staged)?;
+        for (name, mut raw, _dir) in home_entries {
+            raw.rewind()?;
+            let dest = uhome.join(&name[HOME_ROOT.len()..]);
+            let change = match &src_home {
+                Some(old) if !old.is_empty() && *old != new_home => {
+                    let mut data = Vec::new();
+                    raw.read_to_end(&mut data)?;
                     let text = String::from_utf8_lossy(&data).replace(old.as_str(), &new_home);
-                    change = RestoreChange::stage(change.dest.clone(), text.as_bytes(), &name)?;
+                    RestoreChange::stage(dest, text.as_bytes(), &name)?
                 }
-            }
+                _ => RestoreChange::stage(dest, &mut raw, &name)?,
+            };
             changes.push(change);
             files.push(name);
         }
@@ -920,6 +923,46 @@ mod tests {
         }
         assert_eq!(std::fs::read_dir(&home).unwrap().count(), originals.len());
         assert!(blocked.is_dir());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn home_rewrite_preserves_write_only_destination_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .unwrap()
+            .stdout
+            == b"0\n"
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("backup.7z");
+        let mut writer = ArchiveWriter::create(&archive).unwrap();
+        for (name, data) in [
+            ("_home/verity.service", "ExecStart=/old/home/verity"),
+            (SRC_HOME_MARK, "/old/home"),
+        ] {
+            writer
+                .push_archive_entry(ArchiveEntry::new_file(name), Some(data.as_bytes()))
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        let unit = tmp.path().join("verity.service");
+        std::fs::write(&unit, "old unit").unwrap();
+        std::fs::set_permissions(&unit, std::fs::Permissions::from_mode(0o200)).unwrap();
+
+        extract(&archive, &tmp.path().join("verity"), Some(tmp.path())).unwrap();
+
+        assert_eq!(unit.metadata().unwrap().permissions().mode() & 0o777, 0o200);
+        std::fs::set_permissions(&unit, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&unit).unwrap(),
+            format!("ExecStart={}/verity", tmp.path().display())
+        );
     }
 
     #[test]
