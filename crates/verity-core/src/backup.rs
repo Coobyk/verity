@@ -849,6 +849,31 @@ mod tests {
     }
 
     #[test]
+    fn failed_archive_install_removes_a_new_restore_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("fresh").join("verity");
+        let blocked = tmp.path().join("verity.service");
+        std::fs::create_dir(&blocked).unwrap();
+        let archive = tmp.path().join("backup.7z");
+        let mut writer = ArchiveWriter::create(&archive).unwrap();
+        for (name, data) in [
+            ("sub/config.toml", "new config"),
+            ("_home/verity.service", "new unit"),
+        ] {
+            writer
+                .push_archive_entry(ArchiveEntry::new_file(name), Some(data.as_bytes()))
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let error = extract(&archive, &home, Some(tmp.path())).unwrap_err();
+        assert!(error.to_string().contains("verity.service"), "{error}");
+        assert!(!error.to_string().contains("rollback failed"), "{error}");
+        assert!(!home.parent().unwrap().exists());
+        assert!(blocked.is_dir());
+    }
+
+    #[test]
     fn failed_archive_install_rolls_back_files_and_sqlite_sidecars() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("verity");
