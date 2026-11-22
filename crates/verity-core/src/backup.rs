@@ -289,7 +289,6 @@ async fn unpack(msg: grammers_client::types::Message) -> Result<Vec<String>> {
         .await
         .map_err(|e| Error::Mtproto(format!("download backup: {e}")))?;
     let home = Config::home()?;
-    std::fs::create_dir_all(&home)?;
     let user_home = dirs::home_dir();
     let out = tokio::task::spawn_blocking(move || extract(&archive, &home, user_home.as_deref()))
         .await
@@ -316,7 +315,6 @@ pub async fn restore_arg(arg: &str) -> Result<Vec<String>> {
         let out = async {
             fetch(arg, &archive).await?;
             let home = Config::home()?;
-            std::fs::create_dir_all(&home)?;
             let user_home = dirs::home_dir();
             tokio::task::spawn_blocking(move || extract(&archive, &home, user_home.as_deref()))
                 .await
@@ -334,7 +332,6 @@ pub async fn restore_arg(arg: &str) -> Result<Vec<String>> {
         )));
     }
     let home = Config::home()?;
-    std::fs::create_dir_all(&home)?;
     let user_home = dirs::home_dir();
     tokio::task::spawn_blocking(move || extract(&path, &home, user_home.as_deref()))
         .await
@@ -442,11 +439,9 @@ fn missing_exec(unit: &Path) -> Option<String> {
 
 fn extract(archive: &Path, home: &Path, user_home: Option<&Path>) -> Result<Vec<String>> {
     let mut reader = ArchiveReader::open(archive, Password::empty()).map_err(sz_err)?;
-    let mut got = Vec::new();
-    // `_home` entries buffer in memory — they're tiny (units, sent
-    // state) and only land after the stream ends, once SRC_HOME_MARK
-    // has told us the backup machine's $HOME for the path rewrite.
-    let mut home_entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut files = Vec::new();
+    let mut changes = Vec::new();
+    let mut home_entries = Vec::new();
     let mut src_home: Option<String> = None;
     reader
         .for_each_entries(|entry, r| {
@@ -454,60 +449,51 @@ fn extract(archive: &Path, home: &Path, user_home: Option<&Path>) -> Result<Vec<
             if entry.is_directory() || name.is_empty() {
                 return Ok(true);
             }
-            // Reject `..`/absolute paths outright — never write outside.
-            let rel = Path::new(&name);
-            if rel.components().any(|c| {
-                matches!(
-                    c,
-                    std::path::Component::ParentDir | std::path::Component::RootDir
-                )
-            }) {
+            let rel = Path::new(name.strip_prefix(HOME_ROOT).unwrap_or(&name));
+            let read_error =
+                |e| sevenz_rust2::Error::Io(e, format!("read archive entry {name}").into());
+            if rel.as_os_str().is_empty()
+                || rel.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+            {
+                std::io::copy(r, &mut std::io::sink()).map_err(read_error)?;
                 return Ok(true);
             }
             let mut data = Vec::new();
-            if std::io::Read::read_to_end(r, &mut data).is_err() {
-                return Ok(true); // skip undecodable entries, keep going
-            }
+            std::io::Read::read_to_end(r, &mut data).map_err(read_error)?;
             if name == SRC_HOME_MARK {
                 src_home = String::from_utf8(data).ok().map(|s| s.trim().to_string());
-                return Ok(true);
-            }
-            if let Some(rest) = name.strip_prefix(HOME_ROOT) {
-                home_entries.push((rest.to_string(), data));
-                return Ok(true);
-            }
-            let dest = home.join(rel);
-            if let Some(p) = dest.parent() {
-                let _ = std::fs::create_dir_all(p);
-            }
-            // Same .part → rename dance as legacy restore for the live
-            // session/db files; drop stale sidecars with them.
-            if dest.parent() == Some(home) && SQLITE_FILES.contains(&name.as_str()) {
-                let tmp = home.join(format!("{name}.part"));
-                std::fs::write(&tmp, &data)?;
-                std::fs::rename(&tmp, &dest)?;
-                for ext in ["-wal", "-shm"] {
-                    let _ = std::fs::remove_file(home.join(format!("{name}{ext}")));
-                }
-                chmod_private(&dest);
+            } else if name.starts_with(HOME_ROOT) {
+                home_entries.push((name, data));
             } else {
-                std::fs::write(&dest, &data)?;
-                if LEGACY_FILES.contains(&name.as_str()) {
-                    chmod_private(&dest);
+                changes.push(
+                    RestoreChange::stage(home.join(rel), &data, &name).map_err(|e| {
+                        sevenz_rust2::Error::Io(e, format!("stage archive entry {name}").into())
+                    })?,
+                );
+                if SQLITE_FILES.contains(&name.as_str()) {
+                    for ext in ["-wal", "-shm"] {
+                        changes.push(RestoreChange {
+                            dest: home.join(format!("{name}{ext}")),
+                            replacement: None,
+                        });
+                    }
                 }
+                files.push(name);
             }
-            // The archive keeps no mode bits — re-mark the serve binary
-            // executable or the restored units can't launch it.
-            if name == SERVE_BIN {
-                chmod_exec(&dest);
-            }
-            got.push(name);
             Ok(true)
         })
         .map_err(sz_err)?;
     if let Some(uhome) = user_home {
-        let new_home = uhome.to_string_lossy().into_owned();
-        for (rest, data) in home_entries {
+        let new_home = uhome.to_string_lossy();
+        for (name, data) in home_entries {
+            let rest = &name[HOME_ROOT.len()..];
             let data = match &src_home {
                 // Swap the backup machine's $HOME for this one so
                 // absolute paths in units point at real files again.
@@ -516,27 +502,161 @@ fn extract(archive: &Path, home: &Path, user_home: Option<&Path>) -> Result<Vec<
                     .into_bytes(),
                 _ => data,
             };
-            let dest = uhome.join(&rest);
-            if let Some(p) = dest.parent() {
-                let _ = std::fs::create_dir_all(p);
-            }
-            std::fs::write(&dest, &data)?;
-            got.push(format!("{HOME_ROOT}{rest}"));
+            changes.push(RestoreChange::stage(uhome.join(rest), &data, &name)?);
+            files.push(name);
         }
     }
-    Ok(got)
+    apply_restore(changes)?;
+    Ok(files)
 }
 
-/// Best-effort 0755 — for the shipped `target/release/verity`, which
-/// the archive stores modeless. No-op off unix.
-fn chmod_exec(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+struct RestoreChange {
+    dest: PathBuf,
+    replacement: Option<tempfile::TempPath>,
+}
+
+impl RestoreChange {
+    fn stage(dest: PathBuf, data: &[u8], name: &str) -> std::io::Result<Self> {
+        use std::io::Write as _;
+
+        let dest = std::path::absolute(dest)?;
+        // Stage on the destination filesystem, without creating live directories.
+        let parent = dest
+            .ancestors()
+            .skip(1)
+            .find(|p| p.is_dir())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "no staging directory")
+            })?;
+        let mut builder = tempfile::Builder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(
+                if LEGACY_FILES.contains(&name) {
+                    0o600
+                } else {
+                    0o666
+                },
+            ));
+        }
+        let mut staged = builder.tempfile_in(parent)?;
+        staged.write_all(data)?;
+        if name == SERVE_BIN {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                staged
+                    .as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o755))?;
+            }
+        } else if LEGACY_FILES.contains(&name) {
+            chmod_private(staged.path());
+        } else if let Ok(meta) = std::fs::symlink_metadata(&dest) {
+            if meta.is_file() {
+                staged.as_file().set_permissions(meta.permissions())?;
+            }
+        }
+        Ok(Self {
+            dest,
+            replacement: Some(staged.into_temp_path()),
+        })
     }
-    #[cfg(not(unix))]
-    let _ = path;
+
+    fn apply(self, dirs: &mut Vec<PathBuf>) -> std::io::Result<Option<RestoreUndo>> {
+        let parent = self
+            .dest
+            .parent()
+            .expect("restore destination has a parent");
+        let original = match std::fs::symlink_metadata(&self.dest) {
+            Ok(meta) if meta.is_file() => {
+                // Keep the old inode available for rollback without removing the live name.
+                let backup = tempfile::tempdir_in(parent)?;
+                std::fs::hard_link(&self.dest, backup.path().join("original"))?;
+                Some(backup)
+            }
+            Ok(_) => {
+                return Err(std::io::Error::other(
+                    "restore destination is not a regular file",
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        if let Some(staged) = self.replacement {
+            create_restore_dirs(parent, dirs)?;
+            staged.persist(&self.dest).map_err(|e| e.error)?;
+        } else if original.is_some() {
+            std::fs::remove_file(&self.dest)?;
+        } else {
+            return Ok(None);
+        }
+        Ok(Some(RestoreUndo {
+            dest: self.dest,
+            original,
+        }))
+    }
+}
+
+struct RestoreUndo {
+    dest: PathBuf,
+    original: Option<tempfile::TempDir>,
+}
+
+impl RestoreUndo {
+    fn rollback(self) -> Result<()> {
+        if let Some(backup) = self.original {
+            if let Err(e) = std::fs::rename(backup.path().join("original"), &self.dest) {
+                return Err(Error::Other(format!(
+                    "{}: {e}; previous file kept in {}",
+                    self.dest.display(),
+                    backup.keep().display()
+                )));
+            }
+        } else {
+            std::fs::remove_file(&self.dest)?;
+        }
+        Ok(())
+    }
+}
+
+fn create_restore_dirs(path: &Path, created: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        create_restore_dirs(parent, created)?;
+    }
+    std::fs::create_dir(path)?;
+    created.push(path.to_path_buf());
+    Ok(())
+}
+
+fn apply_restore(changes: Vec<RestoreChange>) -> Result<()> {
+    let mut undo = Vec::new();
+    let mut dirs = Vec::new();
+    for change in changes {
+        let dest = change.dest.clone();
+        match change.apply(&mut dirs) {
+            Ok(Some(original)) => undo.push(original),
+            Ok(None) => {}
+            Err(e) => {
+                let mut error = format!("cannot restore {}: {e}", dest.display());
+                for original in undo.into_iter().rev() {
+                    if let Err(e) = original.rollback() {
+                        error.push_str(&format!("; rollback failed: {e}"));
+                    }
+                }
+                for dir in dirs.into_iter().rev() {
+                    if let Err(e) = std::fs::remove_dir(&dir) {
+                        error.push_str(&format!("; could not remove {}: {e}", dir.display()));
+                    }
+                }
+                return Err(Error::Other(error));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -591,7 +711,10 @@ mod tests {
         let db = home.join("state.sqlite");
         let config = home.join("config.toml");
         std::fs::write(&config, "group_id = 1").unwrap();
-        Store::open(&db).unwrap().kv_set("checkpoint", "old").unwrap();
+        Store::open(&db)
+            .unwrap()
+            .kv_set("checkpoint", "old")
+            .unwrap();
         let old_db = std::fs::read(&db).unwrap();
         let new_db = home.join("new.sqlite");
         let marker = b"NEW_RESTORE_CHECKPOINT";
@@ -617,7 +740,10 @@ mod tests {
             .unwrap();
         writer.finish().unwrap();
         let mut bytes = std::fs::read(&archive).unwrap();
-        let offset = bytes.windows(marker.len()).position(|b| b == marker).unwrap();
+        let offset = bytes
+            .windows(marker.len())
+            .position(|b| b == marker)
+            .unwrap();
         bytes[offset] ^= 1;
         std::fs::write(&archive, bytes).unwrap();
 
@@ -631,6 +757,47 @@ mod tests {
             (true, "group_id = 1", true),
             "restore returned {result:?}"
         );
+    }
+
+    #[test]
+    fn failed_archive_install_rolls_back_files_and_sqlite_sidecars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("verity");
+        let user_home = tmp.path().join("user-home");
+        std::fs::create_dir(&home).unwrap();
+        let blocked = user_home.join(".config/systemd/user/verity.service");
+        std::fs::create_dir_all(&blocked).unwrap();
+        let originals = [
+            ("config.toml", "old config"),
+            ("state.sqlite", "old db"),
+            ("state.sqlite-wal", "old wal"),
+            ("state.sqlite-shm", "old shm"),
+        ];
+        for (name, data) in originals {
+            std::fs::write(home.join(name), data).unwrap();
+        }
+        let archive = tmp.path().join("backup.7z");
+        let mut writer = ArchiveWriter::create(&archive).unwrap();
+        for (name, data) in [
+            ("config.toml", "new config"),
+            ("state.sqlite", "new db"),
+            ("new-dir/file", "new file"),
+            ("_home/.config/systemd/user/verity.service", "new unit"),
+        ] {
+            writer
+                .push_archive_entry(ArchiveEntry::new_file(name), Some(data.as_bytes()))
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let error = extract(&archive, &home, Some(&user_home)).unwrap_err();
+        assert!(error.to_string().contains("verity.service"), "{error}");
+        assert!(!error.to_string().contains("rollback failed"), "{error}");
+        for (name, data) in originals {
+            assert_eq!(std::fs::read_to_string(home.join(name)).unwrap(), data);
+        }
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), originals.len());
+        assert!(blocked.is_dir());
     }
 
     /// pack + extract round-trip: target/-wal/.part skipped, _home
