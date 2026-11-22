@@ -588,23 +588,18 @@ impl RestoreChange {
             .dest
             .parent()
             .expect("restore destination has a parent");
-        let (original, moved) = match std::fs::symlink_metadata(&self.dest) {
+        let original = match std::fs::symlink_metadata(&self.dest) {
             Ok(meta) if meta.is_file() || meta.is_symlink() => {
-                let backup = tempfile::tempdir_in(parent)?;
-                let saved = backup.path().join("original");
-                if meta.is_symlink() {
-                    std::fs::rename(&self.dest, saved)?;
-                } else {
-                    std::fs::hard_link(&self.dest, saved)?;
-                }
-                (Some(backup), meta.is_symlink())
+                let backup = restore_staging_dir(parent)?;
+                std::fs::rename(&self.dest, backup.path().join("original"))?;
+                Some(backup)
             }
             Ok(_) => {
                 return Err(std::io::Error::other(
                     "restore destination is not a regular file",
                 ));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
         };
         let had_original = original.is_some();
@@ -623,8 +618,6 @@ impl RestoreChange {
                     original: None,
                 });
             }
-        } else if had_original && !moved {
-            std::fs::remove_file(&self.dest)?;
         }
         Ok(())
     }
@@ -839,6 +832,20 @@ mod tests {
         assert!(std::fs::symlink_metadata(&db).unwrap().is_file());
         assert_eq!(std::fs::read_to_string(&db).unwrap(), "new db");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "external db");
+    }
+
+    #[test]
+    fn failed_persist_puts_back_the_original_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("config.toml");
+        std::fs::write(&dest, "old config").unwrap();
+        let change = RestoreChange::stage(dest.clone(), b"new config", "config.toml").unwrap();
+        std::fs::remove_file(&change.replacement.as_ref().unwrap().file).unwrap();
+
+        let error = apply_restore(vec![change]).unwrap_err();
+        assert!(error.to_string().contains("config.toml"), "{error}");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "old config");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
     }
 
     #[test]
