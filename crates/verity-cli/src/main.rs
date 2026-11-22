@@ -29,7 +29,7 @@ enum Cmd {
         api_id: Option<i32>,
         #[arg(long)]
         api_hash: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         group_id: Option<i64>,
         /// Create a new forum supergroup with this title and use it
         #[arg(long)]
