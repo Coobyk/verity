@@ -584,6 +584,55 @@ mod tests {
         assert!(snapshot(&db, "tg.session").await.is_err());
     }
 
+    #[test]
+    fn corrupt_database_entry_leaves_restore_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let db = home.join("state.sqlite");
+        let config = home.join("config.toml");
+        std::fs::write(&config, "group_id = 1").unwrap();
+        Store::open(&db).unwrap().kv_set("checkpoint", "old").unwrap();
+        let old_db = std::fs::read(&db).unwrap();
+        let new_db = home.join("new.sqlite");
+        let marker = b"NEW_RESTORE_CHECKPOINT";
+        Store::open(&new_db)
+            .unwrap()
+            .kv_set("checkpoint", std::str::from_utf8(marker).unwrap())
+            .unwrap();
+
+        let archive = home.join("corrupt.7z");
+        let mut writer = ArchiveWriter::create(&archive).unwrap();
+        writer.set_content_methods(vec![sevenz_rust2::EncoderMethod::COPY.into()]);
+        writer
+            .push_archive_entry(
+                ArchiveEntry::new_file("config.toml"),
+                Some(&b"group_id = 2"[..]),
+            )
+            .unwrap();
+        writer
+            .push_archive_entry(
+                ArchiveEntry::new_file("state.sqlite"),
+                Some(std::fs::File::open(new_db).unwrap()),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+        let mut bytes = std::fs::read(&archive).unwrap();
+        let offset = bytes.windows(marker.len()).position(|b| b == marker).unwrap();
+        bytes[offset] ^= 1;
+        std::fs::write(&archive, bytes).unwrap();
+
+        let result = extract(&archive, home, None).map_err(|e| e.to_string());
+        assert_eq!(
+            (
+                result.as_ref().is_err_and(|e| e.contains("state.sqlite")),
+                std::fs::read_to_string(config).unwrap().as_str(),
+                std::fs::read(db).unwrap() == old_db,
+            ),
+            (true, "group_id = 1", true),
+            "restore returned {result:?}"
+        );
+    }
+
     /// pack + extract round-trip: target/-wal/.part skipped, _home
     /// entries land under $HOME, path traversal entries are refused.
     #[test]
