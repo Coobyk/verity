@@ -583,38 +583,50 @@ impl RestoreChange {
         })
     }
 
-    fn apply(self, dirs: &mut Vec<PathBuf>) -> std::io::Result<Option<RestoreUndo>> {
+    fn apply(self, dirs: &mut Vec<PathBuf>, undo: &mut Vec<RestoreUndo>) -> std::io::Result<()> {
         let parent = self
             .dest
             .parent()
             .expect("restore destination has a parent");
-        let original = match std::fs::symlink_metadata(&self.dest) {
-            Ok(meta) if meta.is_file() => {
-                // Keep the old inode available for rollback without removing the live name.
+        let (original, moved) = match std::fs::symlink_metadata(&self.dest) {
+            Ok(meta) if meta.is_file() || meta.is_symlink() => {
                 let backup = tempfile::tempdir_in(parent)?;
-                std::fs::hard_link(&self.dest, backup.path().join("original"))?;
-                Some(backup)
+                let saved = backup.path().join("original");
+                if meta.is_symlink() {
+                    std::fs::rename(&self.dest, saved)?;
+                } else {
+                    std::fs::hard_link(&self.dest, saved)?;
+                }
+                (Some(backup), meta.is_symlink())
             }
             Ok(_) => {
                 return Err(std::io::Error::other(
                     "restore destination is not a regular file",
                 ));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, false),
             Err(e) => return Err(e),
         };
+        let had_original = original.is_some();
+        if had_original {
+            undo.push(RestoreUndo {
+                dest: self.dest.clone(),
+                original,
+            });
+        }
         if let Some(staged) = self.replacement {
             create_restore_dirs(parent, dirs)?;
             staged.file.persist(&self.dest).map_err(|e| e.error)?;
-        } else if original.is_some() {
+            if !had_original {
+                undo.push(RestoreUndo {
+                    dest: self.dest,
+                    original: None,
+                });
+            }
+        } else if had_original && !moved {
             std::fs::remove_file(&self.dest)?;
-        } else {
-            return Ok(None);
         }
-        Ok(Some(RestoreUndo {
-            dest: self.dest,
-            original,
-        }))
+        Ok(())
     }
 }
 
@@ -657,23 +669,19 @@ fn apply_restore(changes: Vec<RestoreChange>) -> Result<()> {
     let mut dirs = Vec::new();
     for change in changes {
         let dest = change.dest.clone();
-        match change.apply(&mut dirs) {
-            Ok(Some(original)) => undo.push(original),
-            Ok(None) => {}
-            Err(e) => {
-                let mut error = format!("cannot restore {}: {e}", dest.display());
-                for original in undo.into_iter().rev() {
-                    if let Err(e) = original.rollback() {
-                        error.push_str(&format!("; rollback failed: {e}"));
-                    }
+        if let Err(e) = change.apply(&mut dirs, &mut undo) {
+            let mut error = format!("cannot restore {}: {e}", dest.display());
+            for original in undo.into_iter().rev() {
+                if let Err(e) = original.rollback() {
+                    error.push_str(&format!("; rollback failed: {e}"));
                 }
-                for dir in dirs.into_iter().rev() {
-                    if let Err(e) = std::fs::remove_dir(&dir) {
-                        error.push_str(&format!("; could not remove {}: {e}", dir.display()));
-                    }
-                }
-                return Err(Error::Other(error));
             }
+            for dir in dirs.into_iter().rev() {
+                if let Err(e) = std::fs::remove_dir(&dir) {
+                    error.push_str(&format!("; could not remove {}: {e}", dir.display()));
+                }
+            }
+            return Err(Error::Other(error));
         }
     }
     Ok(())
@@ -793,6 +801,44 @@ mod tests {
         let mode = |path: &Path| path.metadata().unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(staged._dir.path()), 0o700);
         assert_eq!(mode(&staged.file), 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_restore_replaces_database_symlink_or_restores_it_on_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("verity");
+        std::fs::create_dir(&home).unwrap();
+        let db = home.join("state.sqlite");
+        let target = tmp.path().join("external.sqlite");
+        std::fs::write(&target, "external db").unwrap();
+        std::os::unix::fs::symlink("../external.sqlite", &db).unwrap();
+        let blocked = tmp.path().join("verity.service");
+        std::fs::create_dir(&blocked).unwrap();
+        let archive = tmp.path().join("backup.7z");
+        let mut writer = ArchiveWriter::create(&archive).unwrap();
+        for (name, data) in [
+            ("state.sqlite", "new db"),
+            ("_home/verity.service", "new unit"),
+        ] {
+            writer
+                .push_archive_entry(ArchiveEntry::new_file(name), Some(data.as_bytes()))
+                .unwrap();
+        }
+        writer.finish().unwrap();
+
+        let error = extract(&archive, &home, Some(tmp.path())).unwrap_err();
+        assert!(error.to_string().contains("verity.service"), "{error}");
+        assert_eq!(
+            std::fs::read_link(&db).unwrap(),
+            Path::new("../external.sqlite")
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "external db");
+
+        extract(&archive, &home, None).unwrap();
+        assert!(std::fs::symlink_metadata(&db).unwrap().is_file());
+        assert_eq!(std::fs::read_to_string(&db).unwrap(), "new db");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "external db");
     }
 
     #[test]
