@@ -512,7 +512,22 @@ fn extract(archive: &Path, home: &Path, user_home: Option<&Path>) -> Result<Vec<
 
 struct RestoreChange {
     dest: PathBuf,
-    replacement: Option<tempfile::TempPath>,
+    replacement: Option<StagedRestore>,
+}
+
+struct StagedRestore {
+    file: tempfile::TempPath,
+    _dir: tempfile::TempDir,
+}
+
+fn restore_staging_dir(parent: &Path) -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.prefix(".verity-restore-").tempdir_in(parent)
 }
 
 impl RestoreChange {
@@ -528,19 +543,23 @@ impl RestoreChange {
             .ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::NotFound, "no staging directory")
             })?;
+        let dir = restore_staging_dir(parent)?;
         let mut builder = tempfile::Builder::new();
+        let original_mode = std::fs::symlink_metadata(&dest)
+            .ok()
+            .filter(|meta| meta.is_file())
+            .map(|meta| meta.permissions());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            builder.permissions(std::fs::Permissions::from_mode(
-                if LEGACY_FILES.contains(&name) {
-                    0o600
-                } else {
-                    0o666
-                },
-            ));
+            let mode = if LEGACY_FILES.contains(&name) || original_mode.is_some() {
+                0o600
+            } else {
+                0o666
+            };
+            builder.permissions(std::fs::Permissions::from_mode(mode));
         }
-        let mut staged = builder.tempfile_in(parent)?;
+        let mut staged = builder.tempfile_in(dir.path())?;
         staged.write_all(data)?;
         if name == SERVE_BIN {
             #[cfg(unix)]
@@ -552,14 +571,15 @@ impl RestoreChange {
             }
         } else if LEGACY_FILES.contains(&name) {
             chmod_private(staged.path());
-        } else if let Ok(meta) = std::fs::symlink_metadata(&dest) {
-            if meta.is_file() {
-                staged.as_file().set_permissions(meta.permissions())?;
-            }
+        } else if let Some(mode) = original_mode {
+            staged.as_file().set_permissions(mode)?;
         }
         Ok(Self {
             dest,
-            replacement: Some(staged.into_temp_path()),
+            replacement: Some(StagedRestore {
+                file: staged.into_temp_path(),
+                _dir: dir,
+            }),
         })
     }
 
@@ -585,7 +605,7 @@ impl RestoreChange {
         };
         if let Some(staged) = self.replacement {
             create_restore_dirs(parent, dirs)?;
-            staged.persist(&self.dest).map_err(|e| e.error)?;
+            staged.file.persist(&self.dest).map_err(|e| e.error)?;
         } else if original.is_some() {
             std::fs::remove_file(&self.dest)?;
         } else {
@@ -757,6 +777,22 @@ mod tests {
             (true, "group_id = 1", true),
             "restore returned {result:?}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restore_stages_overlay_in_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("verity.service");
+        std::fs::write(&dest, b"old").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let change = RestoreChange::stage(dest, b"new", "_home/verity.service").unwrap();
+        let staged = change.replacement.unwrap();
+        let mode = |path: &Path| path.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(staged._dir.path()), 0o700);
+        assert_eq!(mode(&staged.file), 0o600);
     }
 
     #[test]
