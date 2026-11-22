@@ -29,7 +29,7 @@ enum Cmd {
         api_id: Option<i32>,
         #[arg(long)]
         api_hash: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         group_id: Option<i64>,
         /// Create a new forum supergroup with this title and use it
         #[arg(long)]
@@ -933,7 +933,27 @@ async fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::pfp_style;
+    use super::{pfp_style, Cli, Cmd};
+    use clap::Parser;
+
+    #[test]
+    fn config_accepts_negative_group_id_as_separate_argument() {
+        let cli = Cli::try_parse_from([
+            "verity",
+            "config",
+            "--api-id",
+            "42",
+            "--api-hash",
+            "dummy",
+            "--group-id",
+            "-1001234567890",
+        ])
+        .unwrap();
+        let Cmd::Config { group_id, .. } = cli.cmd else {
+            panic!("expected config subcommand");
+        };
+        assert_eq!(group_id, Some(-1001234567890));
+    }
 
     #[test]
     fn random_pfp_replays_with_the_same_hue() {
