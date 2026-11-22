@@ -475,10 +475,9 @@ fn extract(archive: &Path, home: &Path, user_home: Option<&Path>) -> Result<Vec<
                 src_home = String::from_utf8(data).ok().map(|s| s.trim().to_string());
             } else if name.starts_with(HOME_ROOT) {
                 if user_home.is_some() {
-                    let dir = restore_staging_dir(&std::env::temp_dir()).map_err(read_error)?;
-                    let mut raw = tempfile::tempfile_in(dir.path()).map_err(read_error)?;
+                    let mut raw = tempfile::tempfile().map_err(read_error)?;
                     std::io::copy(r, &mut raw).map_err(read_error)?;
-                    home_entries.push((name, raw, dir));
+                    home_entries.push((name, raw));
                 } else {
                     std::io::copy(r, &mut std::io::sink()).map_err(read_error)?;
                 }
@@ -503,7 +502,7 @@ fn extract(archive: &Path, home: &Path, user_home: Option<&Path>) -> Result<Vec<
         .map_err(sz_err)?;
     if let Some(uhome) = user_home {
         let new_home = uhome.to_string_lossy();
-        for (name, mut raw, _dir) in home_entries {
+        for (name, mut raw) in home_entries {
             raw.rewind()?;
             let dest = uhome.join(&name[HOME_ROOT.len()..]);
             let change = match &src_home {
@@ -928,18 +927,12 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn home_rewrite_preserves_write_only_destination_permissions() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        if std::process::Command::new("id")
-            .arg("-u")
-            .output()
-            .unwrap()
-            .stdout
-            == b"0\n"
-        {
+        let tmp = tempfile::tempdir().unwrap();
+        if tmp.path().metadata().unwrap().uid() == 0 {
             return;
         }
-        let tmp = tempfile::tempdir().unwrap();
         let archive = tmp.path().join("backup.7z");
         let mut writer = ArchiveWriter::create(&archive).unwrap();
         for (name, data) in [
