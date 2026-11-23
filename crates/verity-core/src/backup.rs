@@ -7,6 +7,7 @@
 //! The upload carries `tg.session` (full account access) and
 //! `state.sqlite` (every bot token) — it's only as private as that DM.
 
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 
 use grammers_session::defs::PeerRef;
@@ -557,6 +558,8 @@ fn extract(
     password: &Password,
 ) -> Result<Vec<String>> {
     let mut reader = ArchiveReader::open(archive, password.clone()).map_err(sz_err)?;
+    // The multithreaded LZMA2 decoder buffers entire decompressed work units.
+    reader.set_thread_count(1);
     let mut files = Vec::new();
     let mut changes = Vec::new();
     let mut home_entries = Vec::new();
@@ -583,15 +586,22 @@ fn extract(
                 std::io::copy(r, &mut std::io::sink()).map_err(read_error)?;
                 return Ok(true);
             }
-            let mut data = Vec::new();
-            std::io::Read::read_to_end(r, &mut data).map_err(read_error)?;
             if name == SRC_HOME_MARK {
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut r.take(4096), &mut data).map_err(read_error)?;
+                std::io::copy(r, &mut std::io::sink()).map_err(read_error)?;
                 src_home = String::from_utf8(data).ok().map(|s| s.trim().to_string());
             } else if name.starts_with(HOME_ROOT) {
-                home_entries.push((name, data));
+                if user_home.is_some() {
+                    let mut raw = tempfile::tempfile().map_err(read_error)?;
+                    std::io::copy(r, &mut raw).map_err(read_error)?;
+                    home_entries.push((name, raw));
+                } else {
+                    std::io::copy(r, &mut std::io::sink()).map_err(read_error)?;
+                }
             } else {
                 changes.push(
-                    RestoreChange::stage(home.join(rel), &data, &name).map_err(|e| {
+                    RestoreChange::stage(home.join(rel), r, &name).map_err(|e| {
                         sevenz_rust2::Error::Io(e, format!("stage archive entry {name}").into())
                     })?,
                 );
@@ -610,17 +620,19 @@ fn extract(
         .map_err(sz_err)?;
     if let Some(uhome) = user_home {
         let new_home = uhome.to_string_lossy();
-        for (name, data) in home_entries {
-            let rest = &name[HOME_ROOT.len()..];
-            let data = match &src_home {
-                // Swap the backup machine's $HOME for this one so
-                // absolute paths in units point at real files again.
-                Some(old) if !old.is_empty() && *old != new_home => String::from_utf8_lossy(&data)
-                    .replace(old.as_str(), &new_home)
-                    .into_bytes(),
-                _ => data,
+        for (name, mut raw) in home_entries {
+            raw.rewind()?;
+            let dest = uhome.join(&name[HOME_ROOT.len()..]);
+            let change = match &src_home {
+                Some(old) if !old.is_empty() && *old != new_home => {
+                    let mut data = Vec::new();
+                    raw.read_to_end(&mut data)?;
+                    let text = String::from_utf8_lossy(&data).replace(old.as_str(), &new_home);
+                    RestoreChange::stage(dest, text.as_bytes(), &name)?
+                }
+                _ => RestoreChange::stage(dest, &mut raw, &name)?,
             };
-            changes.push(RestoreChange::stage(uhome.join(rest), &data, &name)?);
+            changes.push(change);
             files.push(name);
         }
     }
@@ -649,9 +661,7 @@ fn restore_staging_dir(parent: &Path) -> std::io::Result<tempfile::TempDir> {
 }
 
 impl RestoreChange {
-    fn stage(dest: PathBuf, data: &[u8], name: &str) -> std::io::Result<Self> {
-        use std::io::Write as _;
-
+    fn stage(dest: PathBuf, mut reader: impl std::io::Read, name: &str) -> std::io::Result<Self> {
         let dest = std::path::absolute(dest)?;
         // Stage on the destination filesystem, without creating live directories.
         let parent = dest
@@ -678,7 +688,7 @@ impl RestoreChange {
             builder.permissions(std::fs::Permissions::from_mode(mode));
         }
         let mut staged = builder.tempfile_in(dir.path())?;
-        staged.write_all(data)?;
+        std::io::copy(&mut reader, &mut staged)?;
         if name == SERVE_BIN {
             #[cfg(unix)]
             {
@@ -907,7 +917,7 @@ mod tests {
         let dest = tmp.path().join("verity.service");
         std::fs::write(&dest, b"old").unwrap();
         std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let change = RestoreChange::stage(dest, b"new", "_home/verity.service").unwrap();
+        let change = RestoreChange::stage(dest, &b"new"[..], "_home/verity.service").unwrap();
         let staged = change.replacement.unwrap();
         let mode = |path: &Path| path.metadata().unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(staged._dir.path()), 0o700);
@@ -957,7 +967,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("config.toml");
         std::fs::write(&dest, "old config").unwrap();
-        let change = RestoreChange::stage(dest.clone(), b"new config", "config.toml").unwrap();
+        let change = RestoreChange::stage(dest.clone(), &b"new config"[..], "config.toml").unwrap();
         std::fs::remove_file(&change.replacement.as_ref().unwrap().file).unwrap();
 
         let error = apply_restore(vec![change]).unwrap_err();
@@ -1030,6 +1040,116 @@ mod tests {
         }
         assert_eq!(std::fs::read_dir(&home).unwrap().count(), originals.len());
         assert!(blocked.is_dir());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn home_rewrite_preserves_write_only_destination_permissions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        if tmp.path().metadata().unwrap().uid() == 0 {
+            return;
+        }
+        let archive = tmp.path().join("backup.7z");
+        let mut writer = ArchiveWriter::create(&archive).unwrap();
+        for (name, data) in [
+            ("_home/verity.service", "ExecStart=/old/home/verity"),
+            (SRC_HOME_MARK, "/old/home"),
+        ] {
+            writer
+                .push_archive_entry(ArchiveEntry::new_file(name), Some(data.as_bytes()))
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        let unit = tmp.path().join("verity.service");
+        std::fs::write(&unit, "old unit").unwrap();
+        std::fs::set_permissions(&unit, std::fs::Permissions::from_mode(0o200)).unwrap();
+
+        extract(
+            &archive,
+            &tmp.path().join("verity"),
+            Some(tmp.path()),
+            &Password::empty(),
+        )
+        .unwrap();
+
+        assert_eq!(unit.metadata().unwrap().permissions().mode() & 0o777, 0o200);
+        std::fs::set_permissions(&unit, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&unit).unwrap(),
+            format!("ExecStart={}/verity", tmp.path().display())
+        );
+    }
+
+    #[test]
+    fn home_marker_after_entries_rewrites_staged_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("backup.7z");
+        let mut writer = ArchiveWriter::create(&archive).unwrap();
+        for (name, data) in [
+            ("_home/verity.service", "ExecStart=/old/home/verity"),
+            ("config.toml", "config"),
+            ("_home/empty", ""),
+            (SRC_HOME_MARK, "/old/home"),
+        ] {
+            writer
+                .push_archive_entry(ArchiveEntry::new_file(name), Some(data.as_bytes()))
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        let home = tmp.path().join("verity");
+        let user_home = tmp.path().join("user");
+        std::fs::create_dir(&user_home).unwrap();
+        let unit = user_home.join("verity.service");
+        std::fs::write(&unit, "old unit").unwrap();
+        let mut permissions = unit.metadata().unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&unit, permissions).unwrap();
+        let files = extract(&archive, &home, Some(&user_home), &Password::empty()).unwrap();
+        assert_eq!(files, ["config.toml", "_home/verity.service", "_home/empty"]);
+        assert_eq!(
+            std::fs::read_to_string(user_home.join("verity.service")).unwrap(),
+            format!("ExecStart={}/verity", user_home.display())
+        );
+        assert_eq!(std::fs::read(user_home.join("empty")).unwrap(), b"");
+        assert!(unit.metadata().unwrap().permissions().readonly());
+        assert_eq!(
+            extract(&archive, &home, None, &Password::empty()).unwrap(),
+            ["config.toml"]
+        );
+    }
+
+    #[test]
+    fn encrypted_archive_roundtrip_and_wrong_password_preserve_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("source");
+        let user_home = tmp.path().join("source-home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir_all(user_home.join(".local/state")).unwrap();
+        let payload = b"normal entry\0\xff";
+        std::fs::write(home.join("payload"), payload).unwrap();
+        std::fs::write(
+            user_home.join(".local/state/verity-path"),
+            format!("{}/verity", user_home.display()),
+        )
+        .unwrap();
+        let archive = tmp.path().join("setup.7z");
+        let password = Password::new("test archive password");
+        pack(&home, Some(&user_home), &[], &archive, &password, &[]).unwrap();
+
+        let out = tmp.path().join("out");
+        let out_home = tmp.path().join("out-home");
+        let files = extract(&archive, &out, Some(&out_home), &password).unwrap();
+        assert_eq!(files, ["payload", "_home/.local/state/verity-path"]);
+        let overlay = out_home.join(".local/state/verity-path");
+        let expected_overlay = format!("{}/verity", out_home.display());
+        assert_eq!(std::fs::read(out.join("payload")).unwrap(), payload);
+        assert_eq!(std::fs::read(&overlay).unwrap(), expected_overlay.as_bytes());
+
+        assert!(extract(&archive, &out, Some(&out_home), &Password::new("wrong")).is_err());
+        assert_eq!(std::fs::read(out.join("payload")).unwrap(), payload);
+        assert_eq!(std::fs::read(&overlay).unwrap(), expected_overlay.as_bytes());
     }
 
     /// pack + extract round-trip: target/-wal/.part skipped, _home
