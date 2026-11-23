@@ -1,6 +1,8 @@
 //! The quiet-bot loop. Each registered bot long-polls its own Bot API
-//! updates; a message in its topic gets: 🕒 while queued → 👀 → typing → work →
-//! ✅ → rich replies (split at the 32k cap). No tool-call spam.
+//! updates; a DM from the owner gets: 🕒 while queued → 👀 → typing →
+//! work → ✅ → rich replies (split at the 32k cap). No tool-call spam.
+//! Bots live purely in 1:1 chats — only the owner's DM is answered;
+//! everything else gets silence.
 //!
 //! Turns run concurrently — the poll loop spawns each message's work as
 //! a task (bounded by [`max_turns`]), so a long-running turn doesn't
@@ -9,18 +11,19 @@
 //! back to their question no matter the completion order.
 //!
 //! If a user-side MTProto session is attached, each turn also carries the
-//! recent topic transcript — bots can't read history themselves, so the
+//! recent DM transcript — bots can't read history themselves, so the
 //! user's session reads it for them.
 //!
 //! Replies can carry `:::` markers the bridge strips and acts on:
 //! - `:::remember k = v:::` — persist to the bot's memory table
 //! - `:::tell name: msg:::` — run a turn for teammate `name`; it replies
 //!   in the owner's DM as itself (bots can't see each other, so verity
-//!   routes; a never-/started teammate falls back to its own topic)
+//!   routes; a never-/started teammate can't DM and the handoff
+//!   bounces back with a note)
 //! - `:::spawn label: task:::` — fan out up to 3 short-lived helpers on
 //!   the same harness; results fold into the reply as `<details>` blocks
 //! - `:::backup:::` — 7z `~/verity` (minus `target/`) + `$HOME` settings
-//!   into one archive, uploaded to General
+//!   into one archive, uploaded to the owner's DM
 //! - `:::restart:::` — exit(0) once the turn's paperwork is done; the
 //!   supervisor (`Restart=always`) comes back on the new binary
 //! - `:::shutdown:::` — ask systemd to stop our own unit so it stays
@@ -41,11 +44,11 @@ use crate::botapi::{BotApi, InputRichMessage};
 use crate::harness::{Activity, Harness, TurnContext};
 use crate::liveness::{self, Heartbeat};
 use crate::mtproto::Tg;
-use crate::rich::{split_markdown, split_markdown_utf16, RICH_LIMIT, TEXT_LIMIT};
+use crate::rich::{split_markdown, RICH_LIMIT, TEXT_LIMIT};
 use crate::store::{Bot, Store};
 use crate::{Error, Result};
 
-/// How many topic messages are fetched as turn context (when a user
+/// How many DM messages are fetched as turn context (when a user
 /// session is attached).
 const HISTORY_LIMIT: i32 = 30;
 /// Per-message cap so one giant paste can't eat the whole transcript.
@@ -74,16 +77,15 @@ fn max_turns() -> usize {
 pub type MakeHarness = dyn Fn(&str) -> Arc<dyn Harness> + Send + Sync;
 
 pub struct Bridge {
-    pub group_id: i64,
     /// sqlite connections aren't Send, so the bridge takes the db path and
     /// touches the store inside `spawn_blocking` only.
     pub db_path: PathBuf,
     pub make_harness: Arc<MakeHarness>,
-    /// User-side session + resolved group peer, for topic transcripts.
-    /// Absent in `--echo` or when the user isn't logged in.
+    /// User-side session, for DM transcripts and chat ops. Absent in
+    /// `--echo` or when the user isn't logged in.
     pub tg: Option<Arc<Tg>>,
-    pub tg_peer: Option<PeerRef>,
-    /// The logged-in user's id — bots answer their DMs only for them.
+    /// The owner's user id — bots answer DMs only from them. Without
+    /// it no DM is trusted and every message is ignored.
     pub owner_id: Option<i64>,
 }
 
@@ -91,12 +93,10 @@ pub struct Bridge {
 /// detached `tell` turns can carry it.
 #[derive(Clone)]
 struct Env {
-    group_id: i64,
     db: PathBuf,
     make: Arc<MakeHarness>,
     tg: Option<Arc<Tg>>,
-    peer: Option<PeerRef>,
-    /// The logged-in user's id — only they may DM the bots.
+    /// The owner's user id — only they may DM the bots.
     owner_id: Option<i64>,
     /// Each bot's user-side peer — the dialog the owner's DM with that
     /// bot lives in. Resolved lazily on the first DM need (the dialog
@@ -118,7 +118,7 @@ const CONFLICT_BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// `CONFLICT_BACKOFF_MAX` + the 30s getUpdates long-poll so a standby
 /// loop waiting out a token conflict isn't mistaken for dead.
 const LOOP_STALL: u64 = 420;
-/// Default `~/verity` → General backup cadence while `serve` runs;
+/// Default `~/verity` → owner-DM backup cadence while `serve` runs;
 /// `VERITY_BACKUP_EVERY` (seconds) overrides, `0` disables.
 const DEFAULT_BACKUP_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
@@ -127,19 +127,18 @@ impl Bridge {
     /// keep polling on transient failures.
     pub async fn run(&self) -> Result<()> {
         let env = Env {
-            group_id: self.group_id,
             db: self.db_path.clone(),
             make: self.make_harness.clone(),
             tg: self.tg.clone(),
-            peer: self.tg_peer,
             owner_id: self.owner_id,
             dm_peers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             hb: Heartbeat::default(),
         };
         env.hb.spawn_flusher();
-        // Periodic backup of ~/verity into General — the off-machine
-        // copy that survives a dead laptop or a move to a VM. First one
-        // lands a full interval in; `/backup` or `:::backup:::` for now.
+        // Periodic backup of ~/verity into the owner's DM with the lead
+        // bot — the off-machine copy that survives a dead laptop or a
+        // move to a VM. First one lands a full interval in;
+        // `/backup` or `:::backup:::` for now.
         let every = std::env::var("VERITY_BACKUP_EVERY")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -151,17 +150,18 @@ impl Bridge {
                 loop {
                     tokio::time::sleep(every).await;
                     let bot = db_call(&env.db, |s| s.primary_bot()).await.ok().flatten();
-                    match bot {
-                        Some(b) => {
+                    match (bot, env.owner_id) {
+                        (Some(b), Some(owner)) => {
                             let api = BotApi::new(&b.token);
-                            match crate::backup::upload(&api, env.group_id).await {
+                            match crate::backup::upload(&api, owner).await {
                                 Ok(files) => {
-                                    info!(n = files.len(), "backup uploaded to General")
+                                    info!(n = files.len(), "backup uploaded to owner DM")
                                 }
                                 Err(e) => warn!(error = %e, "periodic backup failed"),
                             }
                         }
-                        None => warn!("periodic backup skipped — no bots registered"),
+                        (None, _) => warn!("periodic backup skipped — no bots registered"),
+                        (_, None) => warn!("periodic backup skipped — no owner id"),
                     }
                 }
             });
@@ -172,26 +172,16 @@ impl Bridge {
         // route; never run it open.
         let cfg = crate::config::Config::load().unwrap_or_default();
         if let (Some(bind), Some(tg)) = (cfg.api_bind.clone(), env.tg.clone()) {
-            let group = match env.peer {
-                Some(p) => Some(p),
-                None => tg.peer(&env.group_id.to_string()).await.ok(),
+            let api = crate::api::Api {
+                tg,
+                db: env.db.clone(),
+                token: cfg.api_token.clone(),
             };
-            match group {
-                Some(group) => {
-                    let api = crate::api::Api {
-                        tg,
-                        group,
-                        db: env.db.clone(),
-                        token: cfg.api_token.clone(),
-                    };
-                    tokio::spawn(async move {
-                        if let Err(e) = crate::api::serve(&bind, api).await {
-                            warn!(error = %e, "api server stopped");
-                        }
-                    });
+            tokio::spawn(async move {
+                if let Err(e) = crate::api::serve(&bind, api).await {
+                    warn!(error = %e, "api server stopped");
                 }
-                None => warn!("api_bind set but group peer unresolvable — api disabled"),
-            }
+            });
         } else if cfg.api_bind.is_some() {
             warn!("api_bind set but no user session — api disabled");
         }
@@ -276,40 +266,10 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-async fn ensure_topic(api: &BotApi, bot: &Bot, env: &Env) -> Result<i64> {
-    if let Some(tid) = bot.topic_id {
-        return Ok(tid);
-    }
-    let tid = api
-        .create_forum_topic(env.group_id, &bot.name)
-        .await?
-        .message_thread_id;
-    let name = bot.name.clone();
-    let saved = db_call(&env.db, move |s| s.set_bot_topic_if_empty(&name, tid)).await;
-    if !matches!(saved, Ok(true)) {
-        // A concurrent creation (e.g. from a teammate handoff) may have won.
-        let _ = api.delete_forum_topic(env.group_id, tid).await;
-        saved?;
-        let name = bot.name.clone();
-        return db_call(&env.db, move |s| s.get_bot(&name))
-            .await?
-            .and_then(|b| b.topic_id)
-            .ok_or_else(|| Error::Other("bot topic no longer exists".into()));
-    }
-    info!(bot = %bot.name, topic = tid, "created topic");
-    if let Some(g) = &bot.greeting {
-        let _ = send_reply(api, env.group_id, Some(tid), g, None).await;
-    }
-    Ok(tid)
-}
-
 async fn run_bot(bot: &Bot, env: &Env, beat: &std::sync::atomic::AtomicU64) -> Result<()> {
     let api = BotApi::new(&bot.token);
     let me = api.get_me().await?;
     info!(bot = %bot.name, username = ?me.username, "polling");
-
-    let mut topic_id = Some(ensure_topic(&api, bot, env).await?);
-    let mut topic_retry_at = Instant::now();
 
     // Skip the offline backlog: confirm everything pending so a restart
     // doesn't re-answer stale messages. `offset = -1` returns only the
@@ -330,19 +290,18 @@ async fn run_bot(bot: &Bot, env: &Env, beat: &std::sync::atomic::AtomicU64) -> R
     let mut conflicts = 0u32;
 
     // Crash recovery: leftover pending records mean the last run died
-    // mid-turn — the reaction is still on those messages. Re-run each.
-    for (mid, chat, thread, text) in recover_pending(&env.db, &bot.name).await {
+    // mid-turn — the reaction is still on those messages. Re-run each;
+    // every turn's home is the owner's DM with this bot.
+    let owner = env.owner_id;
+    for (mid, chat, text) in recover_pending(&env.db, &bot.name).await {
         warn!(bot = %bot.name, msg = mid, "resuming crashed turn");
-        let chat_id = chat.unwrap_or(env.group_id);
-        let thread = match thread {
-            Some(0) => None,  // 0 = the record was a DM turn
-            Some(t) => Some(t),
-            None => topic_id, // old record — pre-chat-key topic turn
+        let Some(chat_id) = chat.or(owner) else {
+            continue;
         };
         let (api, bot, env, sem) = (api.clone(), bot.clone(), env.clone(), sem.clone());
         inflight.spawn(async move {
             let _permit = sem.acquire().await.ok();
-            if let Err(e) = handle_turn(&api, &bot, &env, chat_id, thread, mid, &text).await {
+            if let Err(e) = handle_turn(&api, &bot, &env, chat_id, mid, &text).await {
                 warn!(bot = %bot.name, error = %e, "resumed turn failed");
             }
         });
@@ -353,33 +312,12 @@ async fn run_bot(bot: &Bot, env: &Env, beat: &std::sync::atomic::AtomicU64) -> R
         // (hung HTTP, deadlocked task) gets us aborted and respawned.
         beat.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
         env.hb.beat(&bot.name);
-        let updates = api.get_updates(offset, 30).await;
-        // Refresh after the long-poll: clear-chat can delete the topic
-        // while the request is in flight, before its updates are delivered.
+        // Self-terminate if this bot was removed from the store (e.g.
+        // by a confirmed reset) — otherwise the supervisor keeps us
+        // alive.
         let n = bot.name.clone();
         match db_call(&env.db, move |s| s.get_bot(&n)).await {
-            Ok(Some(fresh)) => match fresh.topic_id {
-                Some(t) => {
-                    if Some(t) != topic_id {
-                        info!(bot = %bot.name, old = ?topic_id, new = t, "topic swapped — following");
-                        topic_id = Some(t);
-                    }
-                }
-                None => {
-                    topic_id = None;
-                    // Retry a failed creation without disrupting owner DMs
-                    // or asking a standby poller to create a topic.
-                    if updates.is_ok() && Instant::now() >= topic_retry_at {
-                        match ensure_topic(&api, &fresh, env).await {
-                            Ok(t) => topic_id = Some(t),
-                            Err(e) => {
-                                warn!(bot = %bot.name, error = %e, "topic recreation failed");
-                                topic_retry_at = Instant::now() + BOT_SWEEP;
-                            }
-                        }
-                    }
-                }
-            },
+            Ok(Some(_)) => {}
             Ok(None) => {
                 info!(bot = %bot.name, "unregistered — stopping loop");
                 inflight.abort_all();
@@ -391,7 +329,7 @@ async fn run_bot(bot: &Bot, env: &Env, beat: &std::sync::atomic::AtomicU64) -> R
                 warn!(bot = %bot.name, error = %e, "store check failed — continuing");
             }
         }
-        let updates = match updates {
+        let updates = match api.get_updates(offset, 30).await {
             Ok(u) => {
                 conflicts = 0;
                 u
@@ -426,21 +364,13 @@ async fn run_bot(bot: &Bot, env: &Env, beat: &std::sync::atomic::AtomicU64) -> R
         for update in updates {
             offset = update.update_id + 1;
             // Confirm-button clicks for agent-requested destructive
-            // ops — they land wherever the quiz was posted: our topic
-            // or the owner's DM.
+            // ops — they land in the owner's DM where the quiz was
+            // posted.
             if let Some(cb) = update.callback_query {
                 if let (Some(data), Some(m)) = (cb.data, cb.message) {
-                    let dm = m.chat.id > 0 && env.owner_id == Some(m.chat.id);
-                    let ours = dm
-                        || (m.chat.id == env.group_id
-                            && topic_id.is_some()
-                            && m.message_thread_id == topic_id);
+                    let ours = m.chat.id > 0 && env.owner_id == Some(m.chat.id);
                     if ours {
-                        let (chat_id, thread) = if dm {
-                            (m.chat.id, None)
-                        } else {
-                            (env.group_id, topic_id)
-                        };
+                        let chat_id = m.chat.id;
                         match data.as_str() {
                             "v:cancel" => {
                                 let _ = api.answer_callback_query(&cb.id, Some("cancelled")).await;
@@ -451,16 +381,8 @@ async fn run_bot(bot: &Bot, env: &Env, beat: &std::sync::atomic::AtomicU64) -> R
                                 match (f.next(), f.next()) {
                                     (Some("ok"), Some(cmd)) => {
                                         let _ = api.answer_callback_query(&cb.id, None).await;
-                                        run_command(
-                                            &api,
-                                            bot,
-                                            env,
-                                            chat_id,
-                                            thread,
-                                            cmd,
-                                            m.message_id,
-                                        )
-                                        .await;
+                                        run_command(&api, bot, env, chat_id, cmd, m.message_id)
+                                            .await;
                                     }
                                     (Some("no"), Some(_)) => {
                                         let _ = api
@@ -477,34 +399,23 @@ async fn run_bot(bot: &Bot, env: &Env, beat: &std::sync::atomic::AtomicU64) -> R
                 continue;
             }
             let Some(msg) = update.message else { continue };
-            // Two homes: our forum topic, or a DM with the owner
-            // (private chats have positive ids). Strangers get silence.
-            let dm = msg.chat.id > 0;
-            if dm {
-                let mine =
-                    env.owner_id.is_some() && msg.from.as_ref().map(|u| u.id) == env.owner_id;
-                if !mine {
-                    continue;
-                }
-            } else if msg.chat.id != env.group_id
-                || topic_id.is_none()
-                || msg.message_thread_id != topic_id
+            // One home: the owner's DM with this bot (private chats
+            // have positive ids). Strangers and groups get silence.
+            if msg.chat.id <= 0
+                || msg.from.as_ref().map(|u| u.id) != env.owner_id
+                || env.owner_id.is_none()
             {
                 continue;
             }
             if msg.from.as_ref().map(|u| u.is_bot).unwrap_or(true) {
                 continue; // never react to bots (incl. ourselves)
             }
-            let (chat_id, thread) = if dm {
-                (msg.chat.id, None)
-            } else {
-                (env.group_id, topic_id)
-            };
+            let chat_id = msg.chat.id;
             // Spawn and keep polling: each message gets its own task so a
             // long turn doesn't block the next one.
             let (api, bot, env, sem) = (api.clone(), bot.clone(), env.clone(), sem.clone());
             inflight.spawn(async move {
-                handle_message(&api, &bot, &env, chat_id, thread, sem, msg).await;
+                handle_message(&api, &bot, &env, chat_id, sem, msg).await;
             });
         }
         // Reap finished tasks; log the ones that went down hard.
@@ -524,7 +435,6 @@ async fn handle_message(
     bot: &Bot,
     env: &Env,
     chat_id: i64,
-    thread: Option<i64>,
     sem: Arc<Semaphore>,
     msg: crate::botapi::Message,
 ) {
@@ -557,18 +467,18 @@ async fn handle_message(
     if text.trim().is_empty() {
         return;
     }
-    // DM /start → the greeting, same first-contact ritual the topic has.
-    if thread.is_none() && text.trim() == "/start" {
+    // /start → the greeting ritual (sent once; the kv flag marks it).
+    if text.trim() == "/start" {
         let gkey = format!("greeted:{}", bot.name);
         if let Some(g) = &bot.greeting {
-            let _ = send_reply(api, chat_id, None, g, Some(msg.message_id)).await;
+            let _ = send_reply(api, chat_id, g, Some(msg.message_id)).await;
             let gkey2 = gkey.clone();
             let _ = db_call(&env.db, move |s| s.kv_set(&gkey2, "1")).await;
             return;
         }
     }
     debug!(bot = %bot.name, %text, "turn request");
-    let pkey = pending_key(&bot.name, msg.message_id, chat_id, thread);
+    let pkey = pending_key(&bot.name, msg.message_id, chat_id);
     let pval = text.clone();
     if let Err(e) = db_call(&env.db, move |s| s.kv_set(&pkey, &pval)).await {
         warn!(bot = %bot.name, error = %e, "pending turn write failed");
@@ -577,7 +487,7 @@ async fn handle_message(
     // "recorded, will get to it". `handle_turn` swaps it to 👀 on start.
     let _ = api.set_reaction(chat_id, msg.message_id, "🕒").await;
     let _permit = sem.acquire().await.ok();
-    if let Err(e) = handle_turn(api, bot, env, chat_id, thread, msg.message_id, &text).await {
+    if let Err(e) = handle_turn(api, bot, env, chat_id, msg.message_id, &text).await {
         warn!(bot = %bot.name, error = %e, "turn failed");
         let _ = api.set_reaction(chat_id, msg.message_id, "⚠️").await;
         let detail: String = e.to_string().chars().take(300).collect();
@@ -585,7 +495,6 @@ async fn handle_message(
             .send_message(
                 chat_id,
                 &format!("uh — broke on my side: {detail}"),
-                thread,
                 Some(msg.message_id),
             )
             .await;
@@ -593,15 +502,12 @@ async fn handle_message(
 }
 
 /// Pending-turn records left by a dead run. One key per message —
-/// `pending:<bot>:<mid>:<chat>:<thread>` (thread 0 = a DM turn); older
-/// `pending:<bot>:<mid>` keys and the legacy single-slot record
-/// (`pending:<bot>` = `"<mid>\n<text>"`) predate the chat fields and
-/// migrate so a mid-upgrade crash still resumes. Returns `(message_id,
-/// chat, thread, text)` — `None` chat/thread means "replay in our topic".
-async fn recover_pending(
-    db: &Path,
-    bot_name: &str,
-) -> Vec<(i64, Option<i64>, Option<i64>, String)> {
+/// `pending:<bot>:<mid>:<chat>`; older keys (`pending:<bot>:<mid>`,
+/// pre-DM `pending:<bot>:<mid>:<chat>:<thread>`, and the legacy
+/// single-slot `pending:<bot>` = `"<mid>\n<text>"`) still parse so a
+/// mid-upgrade crash resumes. Returns `(message_id, chat, text)` —
+/// `None` chat means "replay in the owner's DM".
+async fn recover_pending(db: &Path, bot_name: &str) -> Vec<(i64, Option<i64>, String)> {
     let pfx = pending_prefix(bot_name);
     let gpfx = format!("progress:{bot_name}:");
     let legacy = format!("pending:{bot_name}");
@@ -610,7 +516,7 @@ async fn recover_pending(
         if let Some(v) = s.kv_get(&legacy)? {
             if let Some((mid, text)) = v.split_once('\n') {
                 if let Ok(mid) = mid.parse::<i64>() {
-                    out.push((mid, None, None, text.to_string()));
+                    out.push((mid, None, text.to_string()));
                 }
             }
             let _ = s.kv_del(&legacy);
@@ -620,11 +526,13 @@ async fn recover_pending(
             let Some(Ok(mid)) = it.next().map(|m| m.parse::<i64>()) else {
                 continue;
             };
-            let (chat, thread) = match (it.next(), it.next()) {
-                (Some(c), Some(t)) => (c.parse::<i64>().ok(), t.parse::<i64>().ok()),
-                _ => (None, None),
-            };
-            out.push((mid, chat, thread, v));
+            let chat = it.next().and_then(|c| c.parse::<i64>().ok());
+            // Ignore a leftover :<thread> segment — topics are gone;
+            // only owner-DM records replay anyway.
+            if chat.is_some_and(|c| c <= 0) {
+                continue; // a pre-DM topic turn — nowhere to replay to
+            }
+            out.push((mid, chat, v));
         }
         // ⏳ ids whose turn already ended — nothing will reuse them.
         for (k, _) in s.kv_prefix(&gpfx)? {
@@ -657,13 +565,13 @@ async fn dm_peer(env: &Env, api: &BotApi, bot: &Bot) -> Option<PeerRef> {
 /// Post the arithmetic quiz that gates a destructive op. Triggered by
 /// the agent's `:::clear|clearchat|reset:::` markers — Verity asks, a
 /// human confirms; the op never runs on the agent's word alone.
-/// `v:{cmd}:{verdict}` callbacks land wherever the quiz was posted.
-async fn ask_quiz(api: &BotApi, chat_id: i64, thread: Option<i64>, cmd: &str) {
+/// `v:{cmd}:{verdict}` callbacks land in the DM the quiz was posted in.
+async fn ask_quiz(api: &BotApi, chat_id: i64, cmd: &str) {
     let ask = match cmd {
         "clear" => "Wipe my memory? Can't undo this.",
         "clearchat" => "Delete every message in this chat AND wipe my memory? Can't undo.",
         "reset" => {
-            "Nuke EVERYTHING — all topics, all messages, every bot but me, all memory? Can't undo."
+            "Nuke EVERYTHING — every teammate bot but me, all memory? Can't undo."
         }
         _ => return,
     };
@@ -702,24 +610,15 @@ async fn ask_quiz(api: &BotApi, chat_id: i64, thread: Option<i64>, cmd: &str) {
         .send_buttons(
             chat_id,
             &prompt,
-            thread,
             &[row, vec![("Cancel".into(), "v:cancel".into())]],
         )
         .await;
 }
 
-/// Execute a confirmed destructive op (button click landed where the
-/// quiz was posted — our topic or the owner's DM). `confirm_mid` is the
-/// prompt message to clean up after.
-async fn run_command(
-    api: &BotApi,
-    bot: &Bot,
-    env: &Env,
-    chat_id: i64,
-    thread: Option<i64>,
-    cmd: &str,
-    confirm_mid: i64,
-) {
+/// Execute a confirmed destructive op (button click landed in the DM
+/// the quiz was posted in). `confirm_mid` is the prompt message to
+/// clean up after.
+async fn run_command(api: &BotApi, bot: &Bot, env: &Env, chat_id: i64, cmd: &str, confirm_mid: i64) {
     info!(bot = %bot.name, %cmd, "confirmed command executing");
     let n = bot.name.clone();
     let wipe = move |s: &Store| -> Result<()> {
@@ -733,79 +632,25 @@ async fn run_command(
         "clear" => {
             let _ = db_call(&env.db, wipe).await;
             let _ = api.delete_message(chat_id, confirm_mid).await;
-            let _ = api
-                .send_message(chat_id, "memory wiped", thread, None)
-                .await;
+            let _ = api.send_message(chat_id, "memory wiped", None).await;
         }
         "clearchat" => {
-            // Delete every message (ids via the user session — bots
-            // can't list history), wipe memory, re-greet. Topic and DM
-            // take different deletion paths but look the same after.
-            match thread {
-                Some(topic_id) => {
-                    let result = match (&env.tg, &env.peer) {
-                        (Some(tg), Some(peer)) => {
-                            crate::mtproto::clear_topic_pages(
-                                |offset, limit| async move {
-                                    tg.topic_message_ids(*peer, topic_id, offset, limit).await
-                                },
-                                |ids| async move {
-                                    for id in ids {
-                                        api.delete_message(env.group_id, id as i64).await?;
-                                    }
-                                    Ok(())
-                                },
-                            )
-                            .await
-                        }
-                        _ => Err(Error::Other(
-                            "topic clearing requires a user session".into(),
-                        )),
-                    };
-                    if let Err(e) = result {
-                        warn!(bot = %bot.name, error = %e, "clearchat incomplete");
-                        let _ = api
-                            .send_message(
-                                chat_id,
-                                "Chat deletion incomplete. Memory was not wiped. Retry clearchat.",
-                                thread,
-                                None,
-                            )
-                            .await;
-                        return;
-                    }
-                }
-                None => {
-                    if let (Some(tg), Some(peer)) = (&env.tg, dm_peer(env, api, bot).await) {
-                        let _ = tg.clear_chat(peer).await;
-                    }
-                }
+            // Delete every message (user-side with revoke — bots can't
+            // list history), wipe memory, re-greet.
+            if let (Some(tg), Some(peer)) = (&env.tg, dm_peer(env, api, bot).await) {
+                let _ = tg.clear_chat(peer).await;
             }
             let _ = api.delete_message(chat_id, confirm_mid).await;
             let _ = db_call(&env.db, wipe).await;
             if let Some(g) = &bot.greeting {
-                let _ = send_reply(api, chat_id, thread, g, None).await;
+                let _ = send_reply(api, chat_id, g, None).await;
             }
         }
         "reset" => {
-            // 1. Wipe the whole group user-side: every bot member but us
-            //    (admins included — the Bot API can't kick those), every
-            //    topic, every message in General. Registered teammates
-            //    get forgotten below either way; stray bots and topics
-            //    the store no longer knows die here too.
-            if let (Some(tg), Some(peer)) = (&env.tg, &env.peer) {
-                let keep = api.get_me().await.ok().map(|u| u.id);
-                let rep = tg.wipe_group(*peer, keep).await;
-                info!(
-                    kicked = rep.bots_kicked,
-                    topics = rep.topics_deleted,
-                    general = rep.general_messages,
-                    "group wiped"
-                );
-            }
-            // 2. Forget every teammate. Without a user session step 1
-            //    never ran, so do a best-effort kick + topic delete via
-            //    the Bot API too (works on non-admin members).
+            // 1. Forget every teammate — their DM with the owner stays,
+            //    but their registration (and loop) dies here. The
+            //    Telegram accounts themselves survive; `bot delete`
+            //    kills one for good.
             let others = db_call(&env.db, |s| s.list_bots())
                 .await
                 .unwrap_or_default()
@@ -813,66 +658,24 @@ async fn run_command(
                 .filter(|b| b.name != bot.name)
                 .collect::<Vec<_>>();
             for b in others {
-                if env.tg.is_none() {
-                    if let Ok(me) = BotApi::new(&b.token).get_me().await {
-                        let _ = api.kick_member(env.group_id, me.id).await;
-                    }
-                    if let Some(t) = b.topic_id {
-                        let _ = api.delete_forum_topic(env.group_id, t).await;
-                    }
-                }
                 let n = b.name.clone();
                 let _ = db_call(&env.db, move |s| s.remove_bot(&n)).await;
             }
-            // 3. Our topic goes too — already wiped above (or now) — and
-            //    recreated empty. The poll loop follows the new id from
-            //    the store, so we stay live without a serve restart.
-            if let Some(tid) = thread.or(bot.topic_id) {
-                let _ = api.delete_forum_topic(env.group_id, tid).await;
-            }
-            let new_tid = match api.create_forum_topic(env.group_id, &bot.name).await {
-                Ok(t) => Some(t.message_thread_id),
-                Err(e) => {
-                    warn!(bot = %bot.name, error = %e, "reset: topic recreate failed");
-                    None
-                }
-            };
-            if let Some(t) = new_tid {
-                let (db, n) = (env.db.clone(), bot.name.clone());
-                let _ = db_call(&db, move |s| s.set_bot_topic(&n, t)).await;
-            }
-            // 4. Brain wipe: every memory row and transient flag, for
+            // 2. Brain wipe: every memory row and transient flag, for
             //    every bot — not just ours.
             let _ = db_call(&env.db, |s| s.wipe_transient()).await;
             let _ = api.delete_message(chat_id, confirm_mid).await;
-            // 5. Leave exactly one thing behind: a fresh backup in
-            //    General, so the wipe still has a restore point.
-            let note = match crate::backup::upload(api, env.group_id).await {
-                Ok(files) => format!("fresh backup in General: {}", files.join(", ")),
+            // 3. Leave exactly one thing behind: a fresh backup in this
+            //    DM, so the wipe still has a restore point.
+            let note = match crate::backup::upload(api, chat_id).await {
+                Ok(files) => format!("fresh backup above: {}", files.join(", ")),
                 Err(e) => format!("backup failed: {e}"),
             };
-            if let Some(t) = new_tid {
-                let _ = api
-                    .send_message(
-                        env.group_id,
-                        &format!("🧹 clean slate — {note}"),
-                        Some(t),
-                        None,
-                    )
-                    .await;
-                if let Some(g) = &bot.greeting {
-                    let _ = send_reply(api, env.group_id, Some(t), g, None).await;
-                }
-            }
-            // Kicked off from a DM? Report there — the topic the
-            // command ran in no longer exists to hold the note.
-            if thread.is_none() {
-                let _ = api
-                    .send_message(chat_id, &format!("🧹 clean slate — {note}"), None, None)
-                    .await;
-                if let Some(g) = &bot.greeting {
-                    let _ = send_reply(api, chat_id, None, g, None).await;
-                }
+            let _ = api
+                .send_message(chat_id, &format!("🧹 clean slate — {note}"), None)
+                .await;
+            if let Some(g) = &bot.greeting {
+                let _ = send_reply(api, chat_id, g, None).await;
             }
         }
         _ => {}
@@ -977,25 +780,8 @@ fn history_timeout() -> Duration {
         .unwrap_or(Duration::from_secs(60))
 }
 
-/// Pull the recent topic transcript via the user session, as
+/// Pull the recent owner↔bot transcript via the user session, as
 /// `(sender, text)` pairs with oversized messages truncated.
-async fn fetch_history(tg: &Tg, peer: &PeerRef, topic_id: i64) -> Vec<(String, String)> {
-    let fetch = tg.topic_history(*peer, topic_id, HISTORY_LIMIT);
-    match tokio::time::timeout(history_timeout(), fetch).await {
-        Ok(Ok(msgs)) => history_pairs(msgs),
-        Ok(Err(e)) => {
-            debug!(error = %e, "topic history fetch failed; turn runs without it");
-            Vec::new()
-        }
-        Err(_) => {
-            warn!("topic history fetch timed out; turn runs without it");
-            Vec::new()
-        }
-    }
-}
-
-/// Same transcript as [`fetch_history`] for a DM turn — the owner↔bot
-/// dialog read user-side.
 async fn fetch_dm_history(tg: &Tg, peer: PeerRef) -> Vec<(String, String)> {
     let fetch = tg.dm_history(peer, HISTORY_LIMIT);
     match tokio::time::timeout(history_timeout(), fetch).await {
@@ -1032,15 +818,11 @@ fn history_pairs(msgs: Vec<crate::mtproto::TopicMessage>) -> Vec<(String, String
 
 /// Keep the "typing" indicator alive for the duration of a turn —
 /// Telegram clears it after ~5s, so re-send every 4.
-fn typing_keepalive(api: BotApi, chat_id: i64, thread: Option<i64>) -> tokio::task::JoinHandle<()> {
+fn typing_keepalive(api: BotApi, chat_id: i64) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(4)).await;
-            if api
-                .send_chat_action(chat_id, "typing", thread)
-                .await
-                .is_err()
-            {
+            if api.send_chat_action(chat_id, "typing").await.is_err() {
                 return;
             }
         }
@@ -1059,7 +841,6 @@ fn progress_task(
     api: BotApi,
     db: PathBuf,
     chat_id: i64,
-    thread: Option<i64>,
     reply_to: Option<i64>,
     activity: Activity,
     prog_key: String,
@@ -1090,7 +871,7 @@ fn progress_task(
             }
             _ => {
                 let Ok(m) = api
-                    .send_message_silent(chat_id, &format!("⏳ {}…", what()), thread, reply_to)
+                    .send_message_silent(chat_id, &format!("⏳ {}…", what()), reply_to)
                     .await
                 else {
                     return;
@@ -1121,7 +902,7 @@ struct Markers {
     spawn: Vec<(String, String)>,
     /// (name, token, instructions, optional provider) from `bot_new`.
     bot_new: Vec<(String, String, String, Option<String>)>,
-    /// `:::backup:::` — ship ~/verity to General after the reply.
+    /// `:::backup:::` — ship ~/verity to the owner's DM after the reply.
     backup: bool,
     /// `:::clear|clearchat|reset:::` — destructive ops the reply asks
     /// for. Each posts the arithmetic quiz; only a human's right answer
@@ -1277,26 +1058,25 @@ fn extract_markers(reply: &str) -> (String, Markers) {
 async fn send_reply(
     api: &BotApi,
     chat_id: i64,
-    thread: Option<i64>,
     reply: &str,
     reply_to: Option<i64>,
 ) -> Result<()> {
     for part in split_markdown(reply, RICH_LIMIT) {
         match api
-            .send_rich_message(chat_id, InputRichMessage::markdown(&part), thread, reply_to)
+            .send_rich_message(chat_id, InputRichMessage::markdown(&part), reply_to)
             .await
         {
             Ok(_) => continue,
             Err(e) => {
                 warn!(error = %e, "rich send failed, falling back to text");
-                for chunk in split_markdown_utf16(&part, TEXT_LIMIT) {
+                for chunk in split_markdown(&part, TEXT_LIMIT) {
                     // Legacy markdown render first; raw text last resort.
                     if let Err(e) = api
-                        .send_markdown_message(chat_id, &chunk, thread, reply_to)
+                        .send_markdown_message(chat_id, &chunk, reply_to)
                         .await
                     {
                         warn!(error = %e, "legacy markdown send failed, sending raw");
-                        api.send_message(chat_id, &chunk, thread, reply_to).await?;
+                        api.send_message(chat_id, &chunk, reply_to).await?;
                     }
                 }
             }
@@ -1324,7 +1104,6 @@ async fn handle_turn(
     bot: &Bot,
     env: &Env,
     chat_id: i64,
-    thread: Option<i64>,
     message_id: i64,
     text: &str,
 ) -> Result<()> {
@@ -1332,18 +1111,18 @@ async fn handle_turn(
     // Re-mark the turn pending under the current key: `handle_message`
     // already wrote it before queuing, but a recovered legacy record or a
     // failed early write would otherwise leave a mid-turn crash unrecoverable.
-    let pkey = pending_key(&bot.name, message_id, chat_id, thread);
+    let pkey = pending_key(&bot.name, message_id, chat_id);
     let pval = text.to_string();
     if let Err(e) = db_call(&env.db, move |s| s.kv_set(&pkey, &pval)).await {
         warn!(bot = %bot.name, error = %e, "pending turn write failed");
     }
-    let _ = api.send_chat_action(chat_id, "typing", thread).await;
-    let keepalive = typing_keepalive(api.clone(), chat_id, thread);
+    let _ = api.send_chat_action(chat_id, "typing").await;
+    let keepalive = typing_keepalive(api.clone(), chat_id);
     let activity = Activity::default();
     // A crashed attempt at this turn may have left a ⏳ behind — hand
     // its id to the progress task so it edits in place instead of
     // stacking a fresh message on every restart.
-    let gkey = progress_key(&bot.name, message_id, chat_id, thread);
+    let gkey = progress_key(&bot.name, message_id, chat_id);
     let gkey2 = gkey.clone();
     let existing = db_call(&env.db, move |s| s.kv_get(&gkey2))
         .await
@@ -1354,24 +1133,13 @@ async fn handle_turn(
         api.clone(),
         env.db.clone(),
         chat_id,
-        thread,
         Some(message_id),
         activity.clone(),
         gkey.clone(),
         existing,
     );
 
-    let result = do_turn(
-        env,
-        bot,
-        chat_id,
-        thread,
-        text,
-        0,
-        Some(message_id),
-        activity,
-    )
-    .await;
+    let result = do_turn(env, bot, chat_id, text, 0, Some(message_id), activity).await;
 
     keepalive.abort();
     progress.abort();
@@ -1382,7 +1150,7 @@ async fn handle_turn(
     // Turn over — clear the pending record and the ⏳ id that rode
     // beside it, then resolve the 👀: ✅ only when the turn spawned
     // helpers; a plain reply leaves no mark.
-    let pkey = pending_key(&bot.name, message_id, chat_id, thread);
+    let pkey = pending_key(&bot.name, message_id, chat_id);
     let _ = db_call(&env.db, move |s| {
         s.kv_del(&pkey)?;
         s.kv_del(&gkey)
@@ -1415,43 +1183,37 @@ async fn handle_turn(
 }
 
 /// Per-message pending record — concurrent turns each get their own.
-/// The chat + thread ride in the key (thread 0 = a DM) so recovery
-/// replays into the same place the trigger came from.
-fn pending_key(bot_name: &str, message_id: i64, chat_id: i64, thread: Option<i64>) -> String {
-    format!(
-        "pending:{bot_name}:{message_id}:{chat_id}:{}",
-        thread.unwrap_or(0)
-    )
+/// The chat id rides in the key so recovery replays into the DM the
+/// trigger came from.
+fn pending_key(bot_name: &str, message_id: i64, chat_id: i64) -> String {
+    format!("pending:{bot_name}:{message_id}:{chat_id}")
 }
 
 /// A turn's ⏳ id, keyed by the same coordinates as its pending record.
 /// Written when the progress message is sent so a crashed-and-resumed
 /// turn edits it instead of posting another.
-fn progress_key(bot_name: &str, message_id: i64, chat_id: i64, thread: Option<i64>) -> String {
-    format!(
-        "progress:{bot_name}:{message_id}:{chat_id}:{}",
-        thread.unwrap_or(0)
-    )
+fn progress_key(bot_name: &str, message_id: i64, chat_id: i64) -> String {
+    format!("progress:{bot_name}:{message_id}:{chat_id}")
 }
 
 fn pending_prefix(bot_name: &str) -> String {
     format!("pending:{bot_name}:")
 }
 
-/// One turn of agent work for `bot` in `topic_id`: context → harness →
-/// markers → memory, helpers, tells → rich reply. Shared by human turns
-/// (depth 0, via `handle_turn`) and `tell`-routed teammate turns.
-/// `reply_to` threads the reply back to the triggering message (None for
-/// bot-to-bot turns — there's no human message to attach to).
-/// Returns `true` when the turn fanned out spawn helpers — real work
-/// worth a ✅; plain chats get no final reaction. The [`TurnOutcome`]
-/// also carries any `:::shutdown:::`/`:::restart:::` request — the
-/// depth-0 caller enacts it once the pending record is cleared.
+/// One turn of agent work for `bot` in `chat_id` (the owner's DM):
+/// context → harness → markers → memory, helpers, tells → rich reply.
+/// Shared by human turns (depth 0, via `handle_turn`) and `tell`-routed
+/// teammate turns. `reply_to` threads the reply back to the triggering
+/// message (None for bot-to-bot turns — there's no human message to
+/// attach to). Returns `true` when the turn fanned out spawn helpers —
+/// real work worth a ✅; plain chats get no final reaction. The
+/// [`TurnOutcome`] also carries any `:::shutdown:::`/`:::restart:::`
+/// request — the depth-0 caller enacts it once the pending record is
+/// cleared.
 async fn do_turn(
     env: &Env,
     bot: &Bot,
     chat_id: i64,
-    thread: Option<i64>,
     text: &str,
     depth: u8,
     reply_to: Option<i64>,
@@ -1477,15 +1239,14 @@ async fn do_turn(
     })
     .await
     .unwrap_or_default();
-    let history = match (thread, &env.tg, &env.peer) {
-        (Some(t), Some(tg), Some(peer)) => fetch_history(tg, peer, t).await,
-        // A DM turn — the transcript is the owner↔bot dialog, so it
-        // needs this bot's own peer rather than the group peer.
-        (None, Some(tg), _) => match dm_peer(env, &api, bot).await {
+    // The transcript is the owner↔bot dialog, read user-side — bots
+    // can't read history themselves.
+    let history = match &env.tg {
+        Some(tg) => match dm_peer(env, &api, bot).await {
             Some(peer) => fetch_dm_history(tg, peer).await,
             None => Vec::new(),
         },
-        _ => Vec::new(),
+        None => Vec::new(),
     };
     let gkey = format!("greeted:{}", bot.name);
     let first_contact =
@@ -1556,29 +1317,29 @@ async fn do_turn(
         }
     }
 
-    // 5. Reply — as this bot, in the topic the request came from.
+    // 5. Reply — as this bot, in the DM the request came from.
     let reply = if reply.trim().is_empty() {
         "Done.".to_string()
     } else {
         reply
     };
-    send_reply(&api, chat_id, thread, &reply, reply_to).await?;
+    send_reply(&api, chat_id, &reply, reply_to).await?;
 
     // `:::backup:::` — the reply asked for a config snapshot; upload
-    // ~/verity to General and note it in the topic.
+    // ~/verity into this same DM.
     if markers.backup {
-        let note = match crate::backup::upload(&api, env.group_id).await {
-            Ok(files) => format!("🗄 backed up {} to General", files.join(", ")),
+        let note = match crate::backup::upload(&api, chat_id).await {
+            Ok(files) => format!("🗄 backed up {}", files.join(", ")),
             Err(e) => format!("⚠️ backup failed: {e}"),
         };
-        let _ = api.send_message(chat_id, &note, thread, reply_to).await;
+        let _ = api.send_message(chat_id, &note, reply_to).await;
     }
 
     // `:::clear|clearchat|reset:::` — destructive ops the reply asked
     // for. They never execute on the agent's word: each posts the
     // arithmetic quiz and only a human's right answer runs it.
     for cmd in &markers.cmds {
-        ask_quiz(&api, chat_id, thread, cmd).await;
+        ask_quiz(&api, chat_id, cmd).await;
     }
 
     // `:::pfp:::` — fresh BallsMaker avatar, uploaded as this bot.
@@ -1590,12 +1351,12 @@ async fn do_turn(
             },
             Err(e) => format!("⚠️ pfp render failed: {e}"),
         };
-        let _ = api.send_message(chat_id, &note, thread, reply_to).await;
+        let _ = api.send_message(chat_id, &note, reply_to).await;
     }
 
     // 6. Tells: route work to teammates. The teammate answers in the
-    //    owner's DM with it — the forum is just plumbing now; a bot the
-    //    owner never /started falls back to answering in its own topic.
+    //    owner's DM with it — a bot can't DM a user who never /started
+    //    it, so that handoff bounces back with a note instead.
     //    Detached so this turn's reply isn't gated on another bot's
     //    runtime; depth-capped to keep bot-to-bot loops finite.
     if depth < MAX_TELL_DEPTH && !markers.tell.is_empty() {
@@ -1605,48 +1366,38 @@ async fn do_turn(
                 Some(target) if target.name != bot.name => {
                     let origin = bot.name.clone();
                     let tname = target.name.clone();
+                    let tuser = target.username.clone();
                     // Probe the DM with a typing action: it only succeeds
                     // if the owner once /started the teammate.
                     let tapi = BotApi::new(&target.token);
                     let dm = match env2.owner_id {
-                        Some(o) => tapi.send_chat_action(o, "typing", None).await.is_ok(),
+                        Some(o) => tapi.send_chat_action(o, "typing").await.is_ok(),
                         None => false,
                     };
-                    tokio::spawn(async move {
-                        let (tchat, tthread) = match env2.owner_id.filter(|_| dm) {
-                            Some(o) => (o, None),
-                            None => {
-                                // Ensure the teammate has its own topic
-                                // to answer in.
-                                let ttopic = match ensure_topic(&tapi, &target, &env2).await {
-                                    Ok(t) => t,
-                                    Err(e) => {
-                                        warn!(bot = %target.name, error = %e, "tell: topic create failed");
-                                        return;
-                                    }
-                                };
-                                (env2.group_id, Some(ttopic))
-                            }
-                        };
-                        let prompt = format!("Message from teammate {origin}: {msg}");
-                        if let Err(e) =
-                            turn(&env2, &target, tchat, tthread, &prompt, depth + 1, None).await
-                        {
-                            warn!(bot = %target.name, error = %e, "tell turn failed");
+                    let note = match (dm, env2.owner_id) {
+                        (true, Some(o)) => {
+                            let prompt = format!("Message from teammate {origin}: {msg}");
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    turn(&env2, &target, o, &prompt, depth + 1, None).await
+                                {
+                                    warn!(bot = %target.name, error = %e, "tell turn failed");
+                                }
+                            });
+                            format!("📨 handed off to *{tname}* — they'll DM you back")
                         }
-                    });
-                    let where_ = if dm {
-                        "they'll DM you back"
-                    } else {
-                        "they'll answer in their own topic — /start their bot to get handoffs in DM instead"
+                        _ => {
+                            let handle = tuser
+                                .map(|u| format!("@{u}"))
+                                .unwrap_or_else(|| "their bot".into());
+                            format!(
+                                "⚠️ can't hand off to *{tname}* — /start {handle} first, \
+                                 then they'll be able to DM you"
+                            )
+                        }
                     };
                     let _ = api
-                        .send_markdown_message(
-                            chat_id,
-                            &format!("📨 handed off to *{tname}* — {where_}"),
-                            thread,
-                            reply_to,
-                        )
+                        .send_markdown_message(chat_id, &note, reply_to)
                         .await;
                 }
                 _ => warn!(bot = %bot.name, teammate = %name, "tell: unknown teammate"),
@@ -1655,7 +1406,7 @@ async fn do_turn(
     }
 
     // 7. bot_new: register a new teammate. The supervisor sweep picks it
-    //    up within ~10s — it creates its topic and starts working.
+    //    up within ~10s — /start its DM and it's live.
     for (name, token, instructions, provider) in markers.bot_new {
         let result = async {
             let me = BotApi::new(&token).get_me().await?;
@@ -1664,7 +1415,6 @@ async fn do_turn(
                 name: name.clone(),
                 token,
                 username: Some(username.clone()),
-                topic_id: None,
                 instructions,
                 provider: provider.unwrap_or_else(|| bot.provider.clone()),
                 model: None,
@@ -1675,11 +1425,11 @@ async fn do_turn(
         }
         .await;
         let note = match result {
-            Ok(u) => format!("🤖 *{name}* registered (@{u}) — starting up in its own topic"),
+            Ok(u) => format!("🤖 *{name}* registered (@{u}) — /start its DM to chat"),
             Err(e) => format!("⚠️ couldn't register *{name}*: {e}"),
         };
         let _ = api
-            .send_markdown_message(chat_id, &note, thread, reply_to)
+            .send_markdown_message(chat_id, &note, reply_to)
             .await;
     }
     Ok(TurnOutcome {
@@ -1730,7 +1480,6 @@ fn turn<'a>(
     env: &'a Env,
     bot: &'a Bot,
     chat_id: i64,
-    thread: Option<i64>,
     text: &'a str,
     depth: u8,
     reply_to: Option<i64>,
@@ -1741,7 +1490,6 @@ fn turn<'a>(
         env,
         bot,
         chat_id,
-        thread,
         text,
         depth,
         reply_to,
@@ -1900,13 +1648,10 @@ mod tests {
                         "getMe" => {
                             json!({"id":1,"is_bot":true,"first_name":"Mock","username":"mockbot"})
                         }
-                        "createForumTopic" => {
-                            json!({"message_thread_id":7,"name":"x","icon_color":0})
-                        }
                         "getUpdates" => json!([]),
                         "sendMessage" | "sendRichMessage" => json!({
                             "message_id": 1,
-                            "chat": {"id": -100123, "type": "supergroup"},
+                            "chat": {"id": 4242, "type": "private"},
                             "date": 0
                         }),
                         _ => json!(true),
@@ -1933,21 +1678,19 @@ mod tests {
     async fn queued_message_survives_restart() {
         let mock = mock_api().await;
         let dir = std::env::temp_dir().join(format!("verity-queued-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let env = Env {
-            group_id: -100123,
             db: dir.join("state.sqlite"),
             make: Arc::new(|_: &str| -> Arc<dyn Harness> { Arc::new(crate::harness::EchoHarness) }),
             tg: None,
-            peer: None,
-            owner_id: None,
-            dm_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            owner_id: Some(4242),
+            dm_peers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             hb: Heartbeat::default(),
         };
         let bot = Bot {
             name: "scout".into(),
             token: "TESTTOKEN".into(),
             username: Some("scoutbot".into()),
-            topic_id: Some(7),
             instructions: String::new(),
             provider: "echo".into(),
             model: None,
@@ -1957,14 +1700,11 @@ mod tests {
         let db = env.db.clone();
         let task = tokio::spawn(async move {
             let msg = serde_json::from_value(serde_json::json!({
-                "message_id": 42, "chat": {"id": -100123, "type": "supergroup"},
-                "date": 0, "text": "queued hello", "message_thread_id": 7
+                "message_id": 42, "chat": {"id": 4242, "type": "private"},
+                "date": 0, "text": "queued hello"
             }))
             .unwrap();
-            handle_message(
-                &api, &bot, &env, -100123, Some(7), Arc::new(Semaphore::new(0)), msg,
-            )
-            .await;
+            handle_message(&api, &bot, &env, 4242, Arc::new(Semaphore::new(0)), msg).await;
         });
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -1981,10 +1721,7 @@ mod tests {
         assert!(task.await.unwrap_err().is_cancelled());
         let pending = recover_pending(&db, "scout").await;
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(
-            pending,
-            vec![(42, Some(-100123), Some(7), "queued hello".into())]
-        );
+        assert_eq!(pending, vec![(42, Some(4242), "queued hello".into())]);
     }
 
     /// Full quiet-bot turn against the mock: 👀 (🕒 is set earlier, at
@@ -1998,12 +1735,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("verity-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let env = Env {
-            group_id: -100123,
             db: dir.join("state.sqlite"),
             make: Arc::new(|_: &str| -> Arc<dyn Harness> { Arc::new(crate::harness::EchoHarness) }),
             tg: None,
-            peer: None,
-            owner_id: None,
+            owner_id: Some(4242),
             dm_peers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             hb: Heartbeat::default(),
         };
@@ -2011,7 +1746,6 @@ mod tests {
             name: "scout".into(),
             token: "TESTTOKEN".into(),
             username: Some("scoutbot".into()),
-            topic_id: Some(7),
             instructions: String::new(),
             provider: "echo".into(),
             model: None,
@@ -2019,7 +1753,8 @@ mod tests {
         };
         let api = BotApi::new("TESTTOKEN").with_base(&mock.base);
 
-        handle_turn(&api, &bot, &env, -100123, Some(7), 42, "hello verity")
+        // The owner's DM with the bot — chat id is their user id.
+        handle_turn(&api, &bot, &env, 4242, 42, "hello verity")
             .await
             .unwrap();
 

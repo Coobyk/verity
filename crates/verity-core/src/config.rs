@@ -22,8 +22,10 @@ pub struct Config {
     /// MTProto app credentials from https://my.telegram.org
     pub api_id: Option<i32>,
     pub api_hash: Option<String>,
-    /// The forum supergroup that hosts the bots ("Verity").
-    pub group_id: Option<i64>,
+    /// The owner's Telegram user id — only their DMs get answered.
+    /// Normally resolved from the MTProto login (`self_id`); set it
+    /// here (or via VERITY_OWNER_ID) to gate DMs with no user session.
+    pub owner_id: Option<i64>,
     /// Binary used by the Pi harness (`pi` or `pirs`).
     pub pi_bin: Option<String>,
     /// Address the mobile-app JSON API binds to during `verity serve`

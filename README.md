@@ -73,6 +73,32 @@ through `VACUUM INTO` so the copy is consistent mid-write.
 Note the backup carries `tg.session` (full account access) and the bot
 tokens — it's only as private as the group.
 
+## Self-update
+
+`verity-self-update.timer` (user unit) runs `verity self-update`
+every ~15 min: fetch `origin/main`, fast-forward when the tree is
+clean and the histories haven't diverged, `cargo build --release`,
+then `try-restart verity.service` so the bridge picks up the new
+binary. A stopped or asleep bridge stays down and just gets the new
+binary next start. Logs: `journalctl --user -u verity-self-update`.
+
+## Setup keys
+
+For moving machines there's a lighter path: `verity getsetupkey` packs
+the same archive but AES-256-encrypted, uploads it to your DM with the
+lead bot, and prints a `vsk1.` key — bot token + file id + archive
+password, nothing else. On a fresh machine:
+
+```bash
+verity --setupkey vsk1.…   # downloads, decrypts, restores, re-enables units
+```
+
+No `config`, no `login`, no api_id/api_hash — the key is the whole
+credential (it decrypts to `tg.session` and every bot token), so keep
+it secret. Setup archives skip `.git/` and `android/` to stay under the
+Bot API's 20MB getFile ceiling; the serve binary still rides inside,
+and `post_restore` re-enables the units.
+
 ## Setup
 
 ```bash

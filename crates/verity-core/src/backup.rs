@@ -1,15 +1,17 @@
-//! `~/verity` backup into the group's General topic — one 7z archive
-//! carrying the whole install (minus `target/`) plus a `_home/` overlay
-//! for settings that live outside it (systemd units, per-bot send
-//! state). `verity restore` pulls the newest archive back and unpacks.
+//! `~/verity` backup into the owner's DM with the lead bot — one 7z
+//! archive carrying the whole install (minus `target/`) plus a `_home/`
+//! overlay for settings that live outside it (systemd units, per-bot
+//! send state). `verity restore` pulls the newest archive back and
+//! unpacks.
 //!
 //! The upload carries `tg.session` (full account access) and
-//! `state.sqlite` (every bot token) — it's only as private as the group.
+//! `state.sqlite` (every bot token) — it's only as private as that DM.
 
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 
 use grammers_session::defs::PeerRef;
+use sevenz_rust2::encoder_options::{AesEncoderOptions, Lzma2Options};
 use sevenz_rust2::{ArchiveEntry, ArchiveReader, ArchiveWriter, Password};
 
 use crate::botapi::BotApi;
@@ -18,13 +20,16 @@ use crate::mtproto::Tg;
 use crate::store::Store;
 use crate::{Error, Result};
 
-/// Archive names in General look like `verity-backup-<unix>.7z`;
-/// restore picks the newest one it can find.
+/// Backup archives look like `verity-backup-<unix>.7z`; restore picks
+/// the newest one it can find.
 const ARCHIVE_PREFIX: &str = "verity-backup-";
+/// Setup-key archives look like `verity-setup-<unix>.7z` — same layout
+/// but AES-encrypted; the matching `vsk1.` key carries the password.
+const SETUP_PREFIX: &str = "verity-setup-";
 const ARCHIVE_EXT: &str = ".7z";
 
 /// Pre-archive backups shipped these as loose documents — still
-/// restorable so an old General backup isn't stranded.
+/// restorable so an old backup isn't stranded.
 const LEGACY_FILES: &[&str] = &["config.toml", "state.sqlite", "tg.session"];
 
 /// Live sqlite dbs — a raw copy while `serve` writes can tear, so these
@@ -51,29 +56,88 @@ const HOME_PARTS: &[&str] = &[".config/systemd/user", ".local/state"];
 
 const CAPTION: &str =
     "🗄 verity backup — full 7z archive. Save it and `verity restore <path>` on a new machine.";
-/// How far back a restore scans the channel for backup docs.
+/// How far back a restore scans the chat for backup docs.
 const RESTORE_SCAN: usize = 500;
 
-/// Never shipped: build output, sqlite sidecars, restore temp files.
-fn skip(path: &Path, name: &str) -> bool {
-    (path.is_dir() && name == "target")
+/// Never shipped: build output, sqlite sidecars, restore temp files,
+/// previously generated archives. `skip_dirs` drops extra top-level
+/// dirs — setup archives pass SETUP_SKIP because they must stay under
+/// the Bot API's 20MB getFile ceiling, and dev trees don't help a
+/// restored machine run (the repo re-clones, the binary ships).
+fn skip(path: &Path, name: &str, skip_dirs: &[&str]) -> bool {
+    (path.is_dir() && (name == "target" || skip_dirs.iter().any(|d| *d == name)))
         || name.ends_with("-wal")
         || name.ends_with("-shm")
         || name.ends_with(".part")
-        || (name.starts_with(ARCHIVE_PREFIX) && name.ends_with(ARCHIVE_EXT))
+        || (name.ends_with(ARCHIVE_EXT)
+            && (name.starts_with(ARCHIVE_PREFIX) || name.starts_with(SETUP_PREFIX)))
 }
 
+/// Top-level dirs a setup archive leaves out (~100M of the install is
+/// `.git` + `android/` alone — several times the download ceiling).
+const SETUP_SKIP: &[&str] = &[".git", "android"];
+
 /// 7z `~/verity` (sans `target/` and friends) plus the `HOME_PARTS`
-/// overlay, send the archive to General. Returns the archive name.
-pub async fn upload(api: &BotApi, group_id: i64) -> Result<Vec<String>> {
+/// overlay, send the archive to `chat_id` (the owner's DM with `api`'s
+/// bot). Returns the archive name.
+pub async fn upload(api: &BotApi, chat_id: i64) -> Result<Vec<String>> {
     let home = Config::home()?;
-    let stage = std::env::temp_dir().join(format!(
-        "verity-backup-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    let name = format!("{ARCHIVE_PREFIX}{}{ARCHIVE_EXT}", unix_secs());
+    let (stage, archive) = stage_archive(&home, &name, &Password::empty(), &[]).await?;
+    let out = async {
+        api.send_document(chat_id, &archive, Some(CAPTION)).await?;
+        Ok::<_, Error>(vec![name])
+    }
+    .await;
+    let _ = std::fs::remove_dir_all(&stage);
+    out
+}
+
+/// Same archive as [`upload`] but AES-256-encrypted with `password` —
+/// a `vsk1.` setup key carries that password plus this doc's file_id,
+/// which is all `--setupkey` needs on a machine that was never set up.
+/// Returns `(document file_id, archive name)`.
+pub async fn upload_setup(api: &BotApi, chat_id: i64, password: &str) -> Result<(String, String)> {
+    let home = Config::home()?;
+    let name = format!("{SETUP_PREFIX}{}{ARCHIVE_EXT}", unix_secs());
+    let (stage, archive) =
+        stage_archive(&home, &name, &Password::new(password), SETUP_SKIP).await?;
+    let out = async {
+        let msg = api
+            .send_document(chat_id, &archive, Some(SETUP_CAPTION))
+            .await?;
+        let file_id = msg
+            .document
+            .ok_or_else(|| Error::Other("sendDocument: no document in response".into()))?
+            .file_id;
+        Ok::<_, Error>((file_id, name))
+    }
+    .await;
+    let _ = std::fs::remove_dir_all(&stage);
+    out
+}
+
+const SETUP_CAPTION: &str = "🔑 verity setup archive — AES-encrypted 7z. Its `vsk1.` key \
+     (printed by `verity getsetupkey`) feeds `verity --setupkey` on a new machine.";
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Snapshot the live dbs, then pack `home` + the `$HOME` overlay into
+/// `stage/<name>`. Empty `password` writes a plain archive; a real one
+/// switches the content pipeline to LZMA2-then-AES256 and encrypts the
+/// header too (entry names stay hidden). Caller removes `stage`.
+async fn stage_archive(
+    home: &Path,
+    name: &str,
+    password: &Password,
+    skip_dirs: &[&str],
+) -> Result<(PathBuf, PathBuf)> {
+    let stage = std::env::temp_dir().join(format!("verity-archive-{}", unix_secs_nanos()));
     std::fs::create_dir_all(&stage)?;
     let out = async {
         // Consistent copies of the live dbs, staged beside the archive.
@@ -84,26 +148,34 @@ pub async fn upload(api: &BotApi, group_id: i64) -> Result<Vec<String>> {
                 snaps.push(((*name).to_string(), snapshot(&live, name).await?));
             }
         }
-        let name = format!(
-            "{ARCHIVE_PREFIX}{}{ARCHIVE_EXT}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        );
-        let archive = stage.join(&name);
-        let (home2, archive2) = (home.clone(), archive.clone());
+        let archive = stage.join(name);
+        let (home2, archive2) = (home.to_path_buf(), archive.clone());
         let user_home = dirs::home_dir();
-        tokio::task::spawn_blocking(move || pack(&home2, user_home.as_deref(), &snaps, &archive2))
-            .await
-            .map_err(|e| Error::Other(e.to_string()))??;
-        api.send_document(group_id, &archive, Some(CAPTION), None)
-            .await?;
-        Ok::<_, Error>(vec![name])
+        let pw = password.clone();
+        let skips: Vec<String> = skip_dirs.iter().map(|s| s.to_string()).collect();
+        tokio::task::spawn_blocking(move || {
+            let skip_refs: Vec<&str> = skips.iter().map(|s| s.as_str()).collect();
+            pack(&home2, user_home.as_deref(), &snaps, &archive2, &pw, &skip_refs)
+        })
+        .await
+        .map_err(|e| Error::Other(e.to_string()))??;
+        Ok::<_, Error>(archive)
     }
     .await;
-    let _ = std::fs::remove_dir_all(&stage);
-    out
+    match out {
+        Ok(archive) => Ok((stage, archive)),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&stage);
+            Err(e)
+        }
+    }
+}
+
+fn unix_secs_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 /// Walk `home` and write every regular file into `archive`; `snaps`
@@ -114,9 +186,21 @@ fn pack(
     user_home: Option<&Path>,
     snaps: &[(String, Snapshot)],
     archive: &Path,
+    password: &Password,
+    skip_dirs: &[&str],
 ) -> Result<()> {
     let mut sz = ArchiveWriter::create(archive).map_err(sz_err)?;
-    sz.set_encrypt_header(false);
+    if password.is_empty() {
+        sz.set_encrypt_header(false);
+    } else {
+        // AES coder first, then LZMA2 (README's order): the writer
+        // wraps methods inside-out, so data is compressed then
+        // encrypted; the header is encrypted too.
+        sz.set_content_methods(vec![
+            AesEncoderOptions::new(password.clone()).into(),
+            Lzma2Options::default().into(),
+        ]);
+    }
     let mut stack = vec![home.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for e in std::fs::read_dir(&dir)? {
@@ -124,7 +208,7 @@ fn pack(
             let path = e.path();
             let name = e.file_name().to_string_lossy().to_string();
             let ft = e.file_type()?;
-            if skip(&path, &name) {
+            if skip(&path, &name, skip_dirs) {
                 continue;
             }
             if ft.is_dir() {
@@ -236,21 +320,19 @@ async fn snapshot(db: &Path, file_name: &str) -> Result<Snapshot> {
     .map_err(|e| Error::Other(e.to_string()))?
 }
 
-/// Pull the newest backup out of General back into `~/verity`,
+/// Pull the newest backup out of `peer`'s chat back into `~/verity`,
 /// overwriting what's there. Prefers a `verity-backup-*.7z` archive;
 /// falls back to the legacy loose-file layout. Returns names restored.
 pub async fn download(tg: &Tg, peer: PeerRef) -> Result<Vec<String>> {
     if let Some(msg) = tg
-        .find_general_document(peer, |n| {
+        .find_document(peer, |n| {
             n.starts_with(ARCHIVE_PREFIX) && n.ends_with(ARCHIVE_EXT)
         })
         .await?
     {
         return unpack(msg).await;
     }
-    let docs = tg
-        .find_general_documents(peer, LEGACY_FILES, RESTORE_SCAN)
-        .await?;
+    let docs = tg.find_documents(peer, LEGACY_FILES, RESTORE_SCAN).await?;
     let home = Config::home()?;
     std::fs::create_dir_all(&home)?;
     let mut got = Vec::new();
@@ -291,9 +373,36 @@ async fn unpack(msg: grammers_client::types::Message) -> Result<Vec<String>> {
         .map_err(|e| Error::Mtproto(format!("download backup: {e}")))?;
     let home = Config::home()?;
     let user_home = dirs::home_dir();
-    let out = tokio::task::spawn_blocking(move || extract(&archive, &home, user_home.as_deref()))
+    let out = tokio::task::spawn_blocking(move || {
+        extract(&archive, &home, user_home.as_deref(), &Password::empty())
+    })
+    .await
+    .map_err(|e| Error::Other(e.to_string()))?;
+    let _ = std::fs::remove_dir_all(&stage);
+    out
+}
+
+/// The `--setupkey` path: resolve `file_id` with the key's bot token,
+/// download the encrypted archive, extract it into `~/verity`. Works
+/// on a machine with no config and no login — the Bot API needs
+/// nothing but the token the key carries.
+pub async fn restore_setup(api: &BotApi, file_id: &str, password: &str) -> Result<Vec<String>> {
+    let file_path = api.file_path(file_id).await?;
+    let stage = std::env::temp_dir().join(format!("verity-setup-{}", unix_secs_nanos()));
+    std::fs::create_dir_all(&stage)?;
+    let archive = stage.join("setup.7z");
+    let out = async {
+        api.download_file(&file_path, &archive).await?;
+        let home = Config::home()?;
+        let user_home = dirs::home_dir();
+        let pw = Password::new(password);
+        tokio::task::spawn_blocking(move || {
+            extract(&archive, &home, user_home.as_deref(), &pw)
+        })
         .await
-        .map_err(|e| Error::Other(e.to_string()))?;
+        .map_err(|e| Error::Other(e.to_string()))?
+    }
+    .await;
     let _ = std::fs::remove_dir_all(&stage);
     out
 }
@@ -317,9 +426,11 @@ pub async fn restore_arg(arg: &str) -> Result<Vec<String>> {
             fetch(arg, &archive).await?;
             let home = Config::home()?;
             let user_home = dirs::home_dir();
-            tokio::task::spawn_blocking(move || extract(&archive, &home, user_home.as_deref()))
-                .await
-                .map_err(|e| Error::Other(e.to_string()))?
+            tokio::task::spawn_blocking(move || {
+                extract(&archive, &home, user_home.as_deref(), &Password::empty())
+            })
+            .await
+            .map_err(|e| Error::Other(e.to_string()))?
         }
         .await;
         let _ = std::fs::remove_dir_all(&stage);
@@ -329,14 +440,16 @@ pub async fn restore_arg(arg: &str) -> Result<Vec<String>> {
     if !path.is_file() {
         return Err(Error::Config(format!(
             "no archive at \"{arg}\" — pass a {ARCHIVE_PREFIX}*{ARCHIVE_EXT} path or https URL \
-             (to scan General instead: `verity restore --group <id>`)"
+             (to scan a bot DM instead: `verity restore --bot <name>`)"
         )));
     }
     let home = Config::home()?;
     let user_home = dirs::home_dir();
-    tokio::task::spawn_blocking(move || extract(&path, &home, user_home.as_deref()))
-        .await
-        .map_err(|e| Error::Other(e.to_string()))?
+    tokio::task::spawn_blocking(move || {
+        extract(&path, &home, user_home.as_deref(), &Password::empty())
+    })
+    .await
+    .map_err(|e| Error::Other(e.to_string()))?
 }
 
 /// `~/x` → `$HOME/x`; everything else passes through untouched.
@@ -438,8 +551,13 @@ fn missing_exec(unit: &Path) -> Option<String> {
     None
 }
 
-fn extract(archive: &Path, home: &Path, user_home: Option<&Path>) -> Result<Vec<String>> {
-    let mut reader = ArchiveReader::open(archive, Password::empty()).map_err(sz_err)?;
+fn extract(
+    archive: &Path,
+    home: &Path,
+    user_home: Option<&Path>,
+    password: &Password,
+) -> Result<Vec<String>> {
+    let mut reader = ArchiveReader::open(archive, password.clone()).map_err(sz_err)?;
     // The multithreaded LZMA2 decoder buffers entire decompressed work units.
     reader.set_thread_count(1);
     let mut files = Vec::new();
@@ -778,7 +896,7 @@ mod tests {
         bytes[offset] ^= 1;
         std::fs::write(&archive, bytes).unwrap();
 
-        let result = extract(&archive, home, None).map_err(|e| e.to_string());
+        let result = extract(&archive, home, None, &Password::empty()).map_err(|e| e.to_string());
         assert_eq!(
             (
                 result.as_ref().is_err_and(|e| e.contains("state.sqlite")),
@@ -830,7 +948,7 @@ mod tests {
         }
         writer.finish().unwrap();
 
-        let error = extract(&archive, &home, Some(tmp.path())).unwrap_err();
+        let error = extract(&archive, &home, Some(tmp.path()), &Password::empty()).unwrap_err();
         assert!(error.to_string().contains("verity.service"), "{error}");
         assert_eq!(
             std::fs::read_link(&db).unwrap(),
@@ -838,7 +956,7 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "external db");
 
-        extract(&archive, &home, None).unwrap();
+        extract(&archive, &home, None, &Password::empty()).unwrap();
         assert!(std::fs::symlink_metadata(&db).unwrap().is_file());
         assert_eq!(std::fs::read_to_string(&db).unwrap(), "new db");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "external db");
@@ -876,7 +994,7 @@ mod tests {
         }
         writer.finish().unwrap();
 
-        let error = extract(&archive, &home, Some(tmp.path())).unwrap_err();
+        let error = extract(&archive, &home, Some(tmp.path()), &Password::empty()).unwrap_err();
         assert!(error.to_string().contains("verity.service"), "{error}");
         assert!(!error.to_string().contains("rollback failed"), "{error}");
         assert!(!home.parent().unwrap().exists());
@@ -914,7 +1032,7 @@ mod tests {
         }
         writer.finish().unwrap();
 
-        let error = extract(&archive, &home, Some(&user_home)).unwrap_err();
+        let error = extract(&archive, &home, Some(&user_home), &Password::empty()).unwrap_err();
         assert!(error.to_string().contains("verity.service"), "{error}");
         assert!(!error.to_string().contains("rollback failed"), "{error}");
         for (name, data) in originals {
@@ -948,7 +1066,13 @@ mod tests {
         std::fs::write(&unit, "old unit").unwrap();
         std::fs::set_permissions(&unit, std::fs::Permissions::from_mode(0o200)).unwrap();
 
-        extract(&archive, &tmp.path().join("verity"), Some(tmp.path())).unwrap();
+        extract(
+            &archive,
+            &tmp.path().join("verity"),
+            Some(tmp.path()),
+            &Password::empty(),
+        )
+        .unwrap();
 
         assert_eq!(unit.metadata().unwrap().permissions().mode() & 0o777, 0o200);
         std::fs::set_permissions(&unit, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -982,7 +1106,7 @@ mod tests {
         let mut permissions = unit.metadata().unwrap().permissions();
         permissions.set_readonly(true);
         std::fs::set_permissions(&unit, permissions).unwrap();
-        let files = extract(&archive, &home, Some(&user_home)).unwrap();
+        let files = extract(&archive, &home, Some(&user_home), &Password::empty()).unwrap();
         assert_eq!(files, ["config.toml", "_home/verity.service", "_home/empty"]);
         assert_eq!(
             std::fs::read_to_string(user_home.join("verity.service")).unwrap(),
@@ -990,7 +1114,10 @@ mod tests {
         );
         assert_eq!(std::fs::read(user_home.join("empty")).unwrap(), b"");
         assert!(unit.metadata().unwrap().permissions().readonly());
-        assert_eq!(extract(&archive, &home, None).unwrap(), ["config.toml"]);
+        assert_eq!(
+            extract(&archive, &home, None, &Password::empty()).unwrap(),
+            ["config.toml"]
+        );
     }
 
     /// pack + extract round-trip: target/-wal/.part skipped, _home
@@ -1024,7 +1151,7 @@ mod tests {
         .unwrap();
 
         let archive = tmp.join("verity-backup-1.7z");
-        pack(&home, Some(&user_home), &[], &archive).unwrap();
+        pack(&home, Some(&user_home), &[], &archive, &Password::empty(), &[]).unwrap();
 
         // _home overlay and a hostile entry, added by hand.
         {
@@ -1045,7 +1172,7 @@ mod tests {
 
         let out = tmp.join("out");
         let out_home = tmp.join("out-home");
-        let got = extract(&archive, &out, Some(&out_home)).unwrap();
+        let got = extract(&archive, &out, Some(&out_home), &Password::empty()).unwrap();
         assert!(got.contains(&"config.toml".to_string()));
         assert!(got.contains(&"sub/x.txt".to_string()));
         assert!(got.contains(&"state.sqlite".to_string()));
@@ -1077,7 +1204,7 @@ mod tests {
         );
 
         // Hostile entries are refused.
-        let hostile = extract(&tmp.join("extra.7z"), &out, Some(&out_home)).unwrap();
+        let hostile = extract(&tmp.join("extra.7z"), &out, Some(&out_home), &Password::empty()).unwrap();
         assert!(!tmp.join("escape.txt").exists());
         assert!(!hostile.iter().any(|n| n.contains("..")));
 

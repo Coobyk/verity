@@ -140,9 +140,10 @@ async fn unit_uptime(unit: &str) -> Option<Duration> {
     Some(Duration::from_secs_f64(secs).saturating_sub(Duration::from_micros(enter_us)))
 }
 
-/// Drop a death report into ~/verity/deaths — death-watch posts it to
-/// Healthity's topic. Same cause on the same day overwrites itself, so
-/// a restart loop can't flood the topic.
+/// Drop a death report into ~/verity/deaths — `verity death-watch`
+/// posts it into the owner's DM with the lead bot. Same cause on the
+/// same day overwrites
+/// itself, so a restart loop can't flood the chat.
 async fn report(slug: &str, body: &str) {
     let date = match tokio::process::Command::new("date")
         .arg("+%F")

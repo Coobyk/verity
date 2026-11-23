@@ -1,5 +1,5 @@
 //! User-side MTProto client (grammers). Logged in as *you*, it can do what
-//! bots can't: read full forum history, list topics, post into topics,
+//! bots can't: read full DM history, clear chats, automate BotFather,
 //! act as the GUI's eyes and hands.
 
 use std::path::Path;
@@ -16,49 +16,8 @@ use grammers_tl_types as tl;
 
 use crate::{Error, Result};
 
-/// How many recent channel messages a document search scans.
+/// How many recent chat messages a document search scans.
 const RESTORE_SCAN_LIMIT: usize = 500;
-
-pub(crate) async fn clear_topic_pages<F, D, Fetch, Delete>(
-    mut fetch: F,
-    mut delete: D,
-) -> Result<()>
-where
-    F: FnMut(i32, i32) -> Fetch,
-    D: FnMut(Vec<i32>) -> Delete,
-    Fetch: std::future::Future<Output = Result<Vec<i32>>>,
-    Delete: std::future::Future<Output = Result<()>>,
-{
-    let mut offset = 0;
-    loop {
-        let ids = fetch(offset, 100).await?;
-        let Some(&next) = ids.iter().min() else {
-            return Ok(());
-        };
-        if next <= 0 || (offset != 0 && ids.iter().any(|id| *id >= offset)) {
-            return Err(Error::Mtproto(
-                "getReplies: pagination did not advance".into(),
-            ));
-        }
-        delete(ids).await?;
-        offset = next;
-    }
-}
-
-/// General is forum topic 1; pre-forum messages carry no reply_to at
-/// all, which is the same stream.
-fn in_general(m: &Message) -> bool {
-    match &m.raw {
-        tl::enums::Message::Message(tl::types::Message { reply_to, .. }) => match reply_to {
-            None => true,
-            Some(tl::enums::MessageReplyHeader::Header(h)) => {
-                h.reply_to_top_id.is_none_or(|t| t == 1)
-            }
-            _ => false,
-        },
-        _ => false,
-    }
-}
 
 pub struct Tg {
     // held so the pool keeps a live session for its lifetime
@@ -111,22 +70,6 @@ fn describe_next_type(t: &tl::enums::auth::CodeType) -> &'static str {
         T::FlashCall => "a flash call",
         T::MissedCall => "a missed call",
     }
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct TopicInfo {
-    pub id: i64,
-    pub title: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct GroupInfo {
-    /// Bot-API style chat id (`-100…` for supergroups, `-…` for basic).
-    pub chat_id: i64,
-    pub title: String,
-    /// `forum` (topics enabled), `group` (megagroup), `chat` (basic group),
-    /// `channel` (broadcast).
-    pub kind: &'static str,
 }
 
 /// One reaction pill on a message — the emoji, how many people set
@@ -200,7 +143,7 @@ pub struct DialogInfo {
     /// True when this dialog is a bot account.
     pub is_bot: bool,
     /// `private` for user DMs; `forum`/`group`/`chat`/`channel`
-    /// otherwise, matching [`GroupInfo::kind`].
+    /// otherwise.
     pub kind: &'static str,
 }
 
@@ -209,32 +152,54 @@ pub struct DialogInfo {
 #[derive(Debug, Clone)]
 pub enum TgEvent {
     /// A new or edited message landed in `chat_hint` (Bot-API style
-    /// id). `topic` is the forum topic id when the message lives in
-    /// one; `None` for DMs and the pre-forum/general stream.
-    Message {
-        chat_hint: i64,
-        topic: Option<i64>,
-        msg: TopicMessage,
-    },
+    /// id — the DM partner's user id for private chats).
+    Message { chat_hint: i64, msg: TopicMessage },
     /// Anything else Telegram pushed (reads, typing, pins…).
     Other,
 }
 
-/// A bot sitting in the group — member or admin. `input` is what
-/// `channels.editBanned` needs to kick it.
-#[derive(Debug, Clone)]
-pub struct BotMember {
-    pub user_id: i64,
-    pub username: Option<String>,
-    pub input: tl::enums::InputPeer,
+/// One sticker of a fetched set, downloaded to `path`.
+#[derive(Debug)]
+pub struct PackSticker {
+    /// Associated emoji (the `alt` of the sticker attribute).
+    pub emoji: String,
+    pub mime: String,
+    pub path: std::path::PathBuf,
 }
 
-/// What a full-group wipe did.
-#[derive(Debug, Default)]
-pub struct WipeReport {
-    pub bots_kicked: usize,
-    pub topics_deleted: usize,
-    pub general_messages: usize,
+/// A sticker set fetched via `messages.getStickerSet`, with every
+/// sticker downloaded to disk.
+#[derive(Debug)]
+pub struct StickerPack {
+    pub title: String,
+    pub short_name: String,
+    pub count: i32,
+    /// `emojis` flag — a custom-emoji set rather than a sticker pack.
+    pub is_emoji_set: bool,
+    pub stickers: Vec<PackSticker>,
+}
+
+/// `Downloadable` adapter for a bare `tl::types::Document` — grammers'
+/// own impl sits on its `media::Document` wrapper, which a
+/// `messages.StickerSet` result doesn't come in.
+struct DocFile(tl::types::Document);
+
+impl grammers_client::types::Downloadable for DocFile {
+    fn to_raw_input_location(&self) -> Option<tl::enums::InputFileLocation> {
+        Some(
+            tl::types::InputDocumentFileLocation {
+                id: self.0.id,
+                access_hash: self.0.access_hash,
+                file_reference: self.0.file_reference.clone(),
+                thumb_size: String::new(),
+            }
+            .into(),
+        )
+    }
+
+    fn size(&self) -> Option<usize> {
+        Some(self.0.size as usize)
+    }
 }
 
 /// A message's renderable chunks — styled text or a formula image.
@@ -674,9 +639,9 @@ impl Tg {
         }
     }
 
-    /// Find a peer among your dialogs by Bot-API chat id or title substring.
-    /// Chat ids are normalized (see [`chat_id_to_bare`]) so a `-100…`
-    /// `group_id` from `verity config` resolves like the group title does.
+    /// Find a peer among your dialogs by Bot-API chat id or title
+    /// substring. Chat ids are normalized (see [`chat_id_to_bare`]) so
+    /// a `-100…` id resolves like a title does.
     pub async fn peer(&self, id_or_title: &str) -> Result<PeerRef> {
         let want_id = id_or_title.parse::<i64>().ok().map(chat_id_to_bare);
         let mut dialogs = self.client.iter_dialogs();
@@ -699,7 +664,7 @@ impl Tg {
                 return Ok(PeerRef::from(peer));
             }
         }
-        Err(Error::Mtproto(format!("no group matches '{id_or_title}'")))
+        Err(Error::Mtproto(format!("no dialog matches '{id_or_title}'")))
     }
 
     /// Resolve a bare user id to a [`PeerRef`] by scanning the dialog
@@ -721,49 +686,8 @@ impl Tg {
         Err(Error::Mtproto(format!("no dialog for user {user_id}")))
     }
 
-    /// List every group/channel in your dialogs with Bot-API chat ids —
-    /// answers "what's my group_id" without external tools.
-    pub async fn list_groups(&self) -> Result<Vec<GroupInfo>> {
-        use grammers_client::types::Peer;
-        let mut out = Vec::new();
-        let mut dialogs = self.client.iter_dialogs();
-        while let Some(dialog) = dialogs
-            .next()
-            .await
-            .map_err(|e| Error::Mtproto(format!("dialogs: {e}")))?
-        {
-            let peer = dialog.peer();
-            let bare = peer.id().bare_id();
-            let info = match peer {
-                Peer::Group(g) if g.is_megagroup() => {
-                    let is_forum = matches!(&g.raw, tl::enums::Chat::Channel(c) if c.forum);
-                    GroupInfo {
-                        // supergroup chat_id = -100 concat bare channel id
-                        chat_id: -(1_000_000_000_000 + bare),
-                        title: peer.name().unwrap_or_default().to_string(),
-                        kind: if is_forum { "forum" } else { "group" },
-                    }
-                }
-                Peer::Group(_) => GroupInfo {
-                    chat_id: -bare,
-                    title: peer.name().unwrap_or_default().to_string(),
-                    kind: "chat",
-                },
-                Peer::Channel(_) => GroupInfo {
-                    chat_id: -(1_000_000_000_000 + bare),
-                    title: peer.name().unwrap_or_default().to_string(),
-                    kind: "channel",
-                },
-                Peer::User(_) => continue,
-            };
-            out.push(info);
-        }
-        Ok(out)
-    }
-
-    /// Every dialog in the account's chat list — the GUI's sidebar.
-    /// [`Self::list_groups`]'s superset: user DMs (bots included) come
-    /// along too.
+    /// Every dialog in the account's chat list — the GUI's sidebar:
+    /// user DMs (bots included), groups and channels alike.
     pub async fn list_dialogs(&self) -> Result<Vec<DialogInfo>> {
         use grammers_client::types::Peer;
         let mut out = Vec::new();
@@ -794,41 +718,6 @@ impl Tg {
         Ok(out)
     }
 
-    /// Create a forum supergroup via `channels.createChannel`
-    /// (megagroup + forum — the only kind verity can host a roster in).
-    /// Returns its Bot-API chat id.
-    pub async fn create_group(&self, title: &str) -> Result<i64> {
-        let res = self
-            .client
-            .invoke(&tl::functions::channels::CreateChannel {
-                broadcast: false,
-                megagroup: true,
-                for_import: false,
-                forum: true,
-                title: title.to_string(),
-                about: String::new(),
-                geo_point: None,
-                address: None,
-                ttl_period: None,
-            })
-            .await
-            .map_err(|e| Error::Mtproto(format!("createChannel: {e}")))?;
-        let chats: &[tl::enums::Chat] = match &res {
-            tl::enums::Updates::Updates(u) => &u.chats,
-            tl::enums::Updates::Combined(u) => &u.chats,
-            _ => &[],
-        };
-        let channel_id = chats
-            .iter()
-            .find_map(|c| match c {
-                tl::enums::Chat::Channel(c) => Some(c.id),
-                _ => None,
-            })
-            .ok_or_else(|| Error::Mtproto("createChannel: no channel in updates".into()))?;
-        // supergroup chat_id = -100 concat bare channel id
-        Ok(-(1_000_000_000_000 + channel_id))
-    }
-
     /// Our own user id — used to gate bot DMs to the owner.
     pub async fn self_id(&self) -> Result<i64> {
         let me = self
@@ -842,171 +731,8 @@ impl Tg {
         }
     }
 
-    /// Rename a supergroup/channel via `channels.editTitle`.
-    /// (Basic groups would need `messages.editChatTitle` — not needed here.)
-    pub async fn rename_chat(&self, peer: PeerRef, title: &str) -> Result<()> {
-        self.client
-            .invoke(&tl::functions::channels::EditTitle {
-                channel: peer.into(),
-                title: title.to_string(),
-            })
-            .await
-            .map_err(|e| Error::Mtproto(format!("editTitle: {e}")))?;
-        Ok(())
-    }
-
-    /// List forum topics of a group via `messages.getForumTopics`.
-    pub async fn list_topics(&self, peer: PeerRef) -> Result<Vec<TopicInfo>> {
-        let res = self
-            .client
-            .invoke(&tl::functions::messages::GetForumTopics {
-                peer: peer.into(),
-                q: None,
-                offset_date: 0,
-                offset_id: 0,
-                offset_topic: 0,
-                limit: 100,
-            })
-            .await
-            .map_err(|e| Error::Mtproto(format!("getForumTopics: {e}")))?;
-
-        let tl::enums::messages::ForumTopics::Topics(t) = res;
-        Ok(t.topics
-            .into_iter()
-            .filter_map(|t| match t {
-                tl::enums::ForumTopic::Topic(ft) => Some(TopicInfo {
-                    id: ft.id as i64,
-                    title: ft.title,
-                }),
-                tl::enums::ForumTopic::Deleted(_) => None,
-            })
-            .collect())
-    }
-
-    /// Read one page of topic ids, including service messages, newest-first.
-    pub(crate) async fn topic_message_ids(
-        &self,
-        peer: PeerRef,
-        topic_id: i64,
-        offset_id: i32,
-        limit: i32,
-    ) -> Result<Vec<i32>> {
-        let res = self
-            .client
-            .invoke(&tl::functions::messages::GetReplies {
-                peer: peer.into(),
-                msg_id: topic_id as i32,
-                offset_id,
-                offset_date: 0,
-                add_offset: 0,
-                limit,
-                max_id: 0,
-                min_id: 0,
-                hash: 0,
-            })
-            .await
-            .map_err(|e| Error::Mtproto(format!("getReplies: {e}")))?;
-        use tl::enums::messages::Messages as M;
-        let messages = match res {
-            M::Messages(m) => m.messages,
-            M::Slice(m) => m.messages,
-            M::ChannelMessages(m) => m.messages,
-            M::NotModified(_) => {
-                return Err(Error::Mtproto("getReplies: unexpected NotModified".into()));
-            }
-        };
-        Ok(messages.into_iter().map(|m| m.id()).collect())
-    }
-
-    /// Read recent messages of one topic via `messages.getReplies`.
-    /// Returned oldest-first.
-    pub async fn topic_history(
-        &self,
-        peer: PeerRef,
-        topic_id: i64,
-        limit: i32,
-    ) -> Result<Vec<TopicMessage>> {
-        let res = self
-            .client
-            .invoke(&tl::functions::messages::GetReplies {
-                peer: peer.into(),
-                msg_id: topic_id as i32,
-                offset_id: 0,
-                offset_date: 0,
-                add_offset: 0,
-                limit,
-                max_id: 0,
-                min_id: 0,
-                hash: 0,
-            })
-            .await
-            .map_err(|e| Error::Mtproto(format!("getReplies: {e}")))?;
-
-        use tl::enums::messages::Messages as M;
-        let (messages, users) = match res {
-            M::Messages(m) => (m.messages, m.users),
-            M::Slice(m) => (m.messages, m.users),
-            M::ChannelMessages(m) => (m.messages, m.users),
-            M::NotModified(_) => (vec![], vec![]),
-        };
-
-        let name_of = |id: i64| -> String {
-            users
-                .iter()
-                .find_map(|u| match u {
-                    tl::enums::User::User(u) if u.id == id => Some(
-                        u.first_name
-                            .clone()
-                            .filter(|n| !n.is_empty())
-                            .or_else(|| u.username.clone())
-                            .unwrap_or_default(),
-                    ),
-                    _ => None,
-                })
-                .unwrap_or_else(|| id.to_string())
-        };
-
-        let mut out: Vec<TopicMessage> = messages
-            .into_iter()
-            .filter_map(|m| match m {
-                tl::enums::Message::Message(m) => {
-                    let (sender, sender_id) = match m.from_id {
-                        Some(tl::enums::Peer::User(p)) => (name_of(p.user_id), Some(p.user_id)),
-                        _ => ("group".to_string(), None),
-                    };
-                    // Media-only messages carry no text — mark them so
-                    // "what do you see in this image" still has context.
-                    let text = if m.message.is_empty() {
-                        match &m.media {
-                            Some(tl::enums::MessageMedia::Photo(_)) => "[image]".into(),
-                            Some(tl::enums::MessageMedia::Document(_)) => "[file]".into(),
-                            Some(_) => "[media]".into(),
-                            None => String::new(),
-                        }
-                    } else {
-                        m.message
-                    };
-                    let spans = fmt_spans(m.entities.as_ref(), &text);
-                    Some(TopicMessage {
-                        id: m.id,
-                        date: m.date as i64,
-                        sender,
-                        sender_id,
-                        text,
-                        spans,
-                        reactions: Self::reaction_list(m.reactions.as_ref()),
-                    })
-                }
-                _ => None,
-            })
-            .collect();
-        out.reverse(); // API returns newest-first
-        Ok(out)
-    }
-
-    /// Recent history of a private chat with `peer` — the DM twin of
-    /// `topic_history`, same `(id, date, sender, text)` shape so a turn
-    /// gets identical context whichever home it came from.
+    /// Recent history of a private chat with `peer`, oldest-first —
+    /// the transcript a DM turn carries as context.
     pub async fn dm_history(&self, peer: PeerRef, limit: i32) -> Result<Vec<TopicMessage>> {
         use grammers_client::types::Media;
         let mut it = self.client.iter_messages(peer);
@@ -1066,6 +792,13 @@ impl Tg {
         {
             ids.push(m.id());
         }
+        self.delete_any_messages(peer, &ids).await
+    }
+
+    /// Delete arbitrary message ids from a chat (user-side, with
+    /// revoke — works on our own messages and, in a private DM, the
+    /// other side's too).
+    pub async fn delete_any_messages(&self, peer: PeerRef, ids: &[i32]) -> Result<usize> {
         let mut n = 0;
         for chunk in ids.chunks(100) {
             n += self
@@ -1077,8 +810,8 @@ impl Tg {
         Ok(n)
     }
 
-    /// Newest document in General whose file name passes `pred`.
-    pub async fn find_general_document(
+    /// Newest document in a chat whose file name passes `pred`.
+    pub async fn find_document(
         &self,
         peer: PeerRef,
         pred: impl Fn(&str) -> bool,
@@ -1094,9 +827,6 @@ impl Tg {
             if scanned > RESTORE_SCAN_LIMIT {
                 break;
             }
-            if !in_general(&m) {
-                continue;
-            }
             let Some(Media::Document(doc)) = m.media() else {
                 continue;
             };
@@ -1107,10 +837,10 @@ impl Tg {
         Ok(None)
     }
 
-    /// Newest message per file name among documents posted to the
-    /// group's General topic. Scans the `scan` most recent channel
-    /// messages (newest first); stops early once every name matched.
-    pub async fn find_general_documents(
+    /// Newest message per file name among documents in a chat. Scans
+    /// the `scan` most recent messages (newest first); stops early
+    /// once every name matched.
+    pub async fn find_documents(
         &self,
         peer: PeerRef,
         want: &[&str],
@@ -1127,9 +857,6 @@ impl Tg {
             scanned += 1;
             if scanned > scan || found.len() == want.len() {
                 break;
-            }
-            if !in_general(&m) {
-                continue;
             }
             let Some(Media::Document(doc)) = m.media() else {
                 continue;
@@ -1653,261 +1380,25 @@ impl Tg {
             .ok_or_else(|| Error::Mtproto("can't resolve @BotFather".into()))
     }
 
-    /// Invite a bot into the group and grant it admin rights
-    /// (manage topics etc. — needed to own a forum topic).
-    pub async fn invite_bot_admin(&self, group: PeerRef, bot_username: &str) -> Result<()> {
-        let bot = self
+    /// Post a text message into a chat *as the logged-in user*.
+    pub async fn send_message(&self, peer: PeerRef, text: &str) -> Result<()> {
+        self.client
+            .send_message(peer, InputMessage::new().text(text))
+            .await
+            .map_err(|e| Error::Mtproto(format!("send: {e}")))?;
+        Ok(())
+    }
+
+    /// Upload `path` and post it into a chat *as the logged-in user* —
+    /// MTProto, so it sails past the Bot API's 50 MB document cap.
+    pub async fn send_file(&self, peer: PeerRef, path: &Path, caption: &str) -> Result<()> {
+        let uploaded = self
             .client
-            .resolve_username(bot_username.trim_start_matches('@'))
+            .upload_file(path)
             .await
-            .map_err(|e| Error::Mtproto(format!("resolve: {e}")))?
-            .ok_or_else(|| Error::Mtproto(format!("can't resolve @{bot_username}")))?;
-        let bot_ref = PeerRef::from(&bot);
+            .map_err(|e| Error::Mtproto(format!("upload: {e}")))?;
         self.client
-            .invoke(&tl::functions::channels::InviteToChannel {
-                channel: group.into(),
-                users: vec![bot_ref.into()],
-            })
-            .await
-            .map_err(|e| Error::Mtproto(format!("invite: {e}")))?;
-        self.client
-            .invoke(&tl::functions::channels::EditAdmin {
-                channel: group.into(),
-                user_id: bot_ref.into(),
-                admin_rights: tl::enums::ChatAdminRights::Rights(tl::types::ChatAdminRights {
-                    change_info: false,
-                    post_messages: true,
-                    edit_messages: true,
-                    delete_messages: true,
-                    ban_users: false,
-                    invite_users: false,
-                    pin_messages: true,
-                    add_admins: false,
-                    anonymous: false,
-                    manage_call: false,
-                    other: true,
-                    manage_topics: true,
-                    post_stories: false,
-                    edit_stories: false,
-                    delete_stories: false,
-                    manage_direct_messages: false,
-                }),
-                rank: String::new(),
-            })
-            .await
-            .map_err(|e| Error::Mtproto(format!("editAdmin: {e}")))?;
-        Ok(())
-    }
-
-    /// Every bot member of the group — `channels.getParticipants` with
-    /// the bots filter sees admins too, which is exactly what a reset
-    /// needs (teammates hold admin rights to own topics).
-    pub async fn list_bot_members(&self, peer: PeerRef) -> Result<Vec<BotMember>> {
-        let res = self
-            .client
-            .invoke(&tl::functions::channels::GetParticipants {
-                channel: peer.into(),
-                filter: tl::enums::ChannelParticipantsFilter::ChannelParticipantsBots,
-                offset: 0,
-                limit: 200,
-                hash: 0,
-            })
-            .await
-            .map_err(|e| Error::Mtproto(format!("getParticipants: {e}")))?;
-        let tl::enums::channels::ChannelParticipants::Participants(p) = res else {
-            return Ok(Vec::new());
-        };
-        let mut out = Vec::new();
-        for u in p.users {
-            let tl::enums::User::User(u) = u else {
-                continue;
-            };
-            if !u.bot {
-                continue;
-            }
-            let Some(access_hash) = u.access_hash else {
-                continue;
-            };
-            out.push(BotMember {
-                user_id: u.id,
-                username: u.username.clone(),
-                input: tl::enums::InputPeer::User(tl::types::InputPeerUser {
-                    user_id: u.id,
-                    access_hash,
-                }),
-            });
-        }
-        Ok(out)
-    }
-
-    /// Kick a member via `channels.editBanned` — works on admins too
-    /// (the Bot API's unban can't touch them). The ban carries a 60s
-    /// expiry: kicked now, but re-invitable later.
-    pub async fn kick_member(
-        &self,
-        peer: PeerRef,
-        participant: tl::enums::InputPeer,
-    ) -> Result<()> {
-        let until_date = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i32 + 60)
-            .unwrap_or(0);
-        self.client
-            .invoke(&tl::functions::channels::EditBanned {
-                channel: peer.into(),
-                participant,
-                banned_rights: tl::enums::ChatBannedRights::Rights(tl::types::ChatBannedRights {
-                    view_messages: true,
-                    send_messages: false,
-                    send_media: false,
-                    send_stickers: false,
-                    send_gifs: false,
-                    send_games: false,
-                    send_inline: false,
-                    embed_links: false,
-                    send_polls: false,
-                    change_info: false,
-                    invite_users: false,
-                    pin_messages: false,
-                    manage_topics: false,
-                    send_photos: false,
-                    send_videos: false,
-                    send_roundvideos: false,
-                    send_audios: false,
-                    send_voices: false,
-                    send_docs: false,
-                    send_plain: false,
-                    until_date,
-                }),
-            })
-            .await
-            .map_err(|e| Error::Mtproto(format!("editBanned: {e}")))?;
-        Ok(())
-    }
-
-    /// Delete a forum topic and its whole history (user-side
-    /// `messages.deleteTopicHistory` — the Bot API's deleteForumTopic
-    /// equivalent for when no bot token is handy).
-    pub async fn delete_topic(&self, peer: PeerRef, topic_id: i64) -> Result<()> {
-        self.client
-            .invoke(&tl::functions::messages::DeleteTopicHistory {
-                peer: peer.into(),
-                top_msg_id: topic_id as i32,
-            })
-            .await
-            .map_err(|e| Error::Mtproto(format!("deleteTopicHistory: {e}")))?;
-        Ok(())
-    }
-
-    /// Ids of every message in the General stream — the one forum
-    /// "topic" that can't be deleted wholesale. Service posts (joins,
-    /// topic actions) count; they're part of the same stream.
-    pub async fn general_message_ids(&self, peer: PeerRef) -> Result<Vec<i32>> {
-        let mut ids = Vec::new();
-        let mut it = self.client.iter_messages(peer);
-        while let Some(m) = it
-            .next()
-            .await
-            .map_err(|e| Error::Mtproto(format!("messages: {e}")))?
-        {
-            let reply_to = match &m.raw {
-                tl::enums::Message::Message(m) => &m.reply_to,
-                tl::enums::Message::Service(m) => &m.reply_to,
-                _ => continue,
-            };
-            // Pre-forum posts carry no reply_to; General posts point at
-            // topic 1. Everything else lives in a deletable topic.
-            let in_general = match reply_to {
-                None => true,
-                Some(tl::enums::MessageReplyHeader::Header(h)) => {
-                    h.reply_to_top_id.is_none_or(|t| t == 1)
-                }
-                _ => false,
-            };
-            if in_general {
-                ids.push(m.id());
-            }
-        }
-        Ok(ids)
-    }
-
-    /// Delete messages in any dialog by id, 100 per call — user-side
-    /// revoke, so any message goes, not just ones we sent. Works for
-    /// private chats (DMs) and channels alike.
-    pub async fn delete_any_messages(&self, peer: PeerRef, ids: &[i32]) -> Result<usize> {
-        let mut n = 0;
-        for chunk in ids.chunks(100) {
-            n += self
-                .client
-                .delete_messages(peer, chunk)
-                .await
-                .map_err(|e| Error::Mtproto(format!("deleteMessages: {e}")))?;
-        }
-        Ok(n)
-    }
-
-    /// Delete channel messages by id, 100 per call — user-side, so any
-    /// message goes, not just ones we sent.
-    pub async fn delete_messages(&self, peer: PeerRef, ids: &[i32]) -> Result<usize> {
-        let mut n = 0;
-        for chunk in ids.chunks(100) {
-            self.client
-                .invoke(&tl::functions::channels::DeleteMessages {
-                    channel: peer.into(),
-                    id: chunk.to_vec(),
-                })
-                .await
-                .map_err(|e| Error::Mtproto(format!("deleteMessages: {e}")))?;
-            n += chunk.len();
-        }
-        Ok(n)
-    }
-
-    /// Nuke the group back to empty: kick every bot member except
-    /// `keep_user_id`, delete every forum topic except General, and
-    /// purge General's stream. Everything a "wipe all messages + all
-    /// bots" reset needs, done user-side because bots can't see enough.
-    pub async fn wipe_group(&self, peer: PeerRef, keep_user_id: Option<i64>) -> WipeReport {
-        let mut rep = WipeReport::default();
-        if let Ok(members) = self.list_bot_members(peer).await {
-            for m in members {
-                if Some(m.user_id) == keep_user_id {
-                    continue;
-                }
-                if self.kick_member(peer, m.input.clone()).await.is_ok() {
-                    rep.bots_kicked += 1;
-                }
-            }
-        }
-        if let Ok(topics) = self.list_topics(peer).await {
-            for t in topics {
-                if t.id != 1 && self.delete_topic(peer, t.id).await.is_ok() {
-                    rep.topics_deleted += 1;
-                }
-            }
-        }
-        if let Ok(ids) = self.general_message_ids(peer).await {
-            rep.general_messages = self.delete_messages(peer, &ids).await.unwrap_or(0);
-        }
-        rep
-    }
-
-    /// Post a text message into a forum topic *as the logged-in user*.
-    /// The topic id doubles as the thread's root `reply_to` message id.
-    /// Pass `None` to post to the group's general stream.
-    pub async fn send_message(
-        &self,
-        peer: PeerRef,
-        topic_id: Option<i64>,
-        text: &str,
-    ) -> Result<()> {
-        self.client
-            .send_message(
-                peer,
-                InputMessage::new()
-                    .text(text)
-                    .reply_to(topic_id.map(|t| t as i32)),
-            )
+            .send_message(peer, InputMessage::new().text(caption).file(uploaded))
             .await
             .map_err(|e| Error::Mtproto(format!("send: {e}")))?;
         Ok(())
@@ -2003,6 +1494,102 @@ impl Tg {
         Ok(())
     }
 
+    /// Fetch the sticker set a message's sticker belongs to: set meta
+    /// plus every sticker document downloaded into `dir` as
+    /// `NN_<emoji>.<ext>`.
+    pub async fn sticker_pack(
+        &self,
+        peer: PeerRef,
+        msg_id: i32,
+        dir: &Path,
+    ) -> Result<StickerPack> {
+        let mut it = self.client.iter_messages(peer);
+        let mut input = None;
+        while let Some(m) = it
+            .next()
+            .await
+            .map_err(|e| Error::Mtproto(format!("messages: {e}")))?
+        {
+            if m.id() != msg_id {
+                continue;
+            }
+            input = match m.media() {
+                Some(Media::Sticker(s)) => Some(s.raw_attrs.stickerset.clone()),
+                Some(Media::Document(d)) => {
+                    match &d.raw.document {
+                        Some(tl::enums::Document::Document(doc)) => {
+                            doc.attributes.iter().find_map(|a| match a {
+                                tl::enums::DocumentAttribute::Sticker(s) => {
+                                    Some(s.stickerset.clone())
+                                }
+                                tl::enums::DocumentAttribute::CustomEmoji(s) => {
+                                    Some(s.stickerset.clone())
+                                }
+                                _ => None,
+                            })
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            break;
+        }
+        let stickerset = input
+            .ok_or_else(|| Error::Mtproto(format!("message {msg_id} isn't a sticker")))?;
+        let res = self
+            .client
+            .invoke(&tl::functions::messages::GetStickerSet {
+                stickerset,
+                hash: 0,
+            })
+            .await
+            .map_err(|e| Error::Mtproto(format!("getStickerSet: {e}")))?;
+        let tl::enums::messages::StickerSet::Set(ss) = res else {
+            return Err(Error::Mtproto("sticker set not modified".into()));
+        };
+        let tl::enums::StickerSet::Set(set) = ss.set;
+        std::fs::create_dir_all(dir)?;
+        let mut stickers = Vec::new();
+        for (i, d) in ss.documents.iter().enumerate() {
+            let tl::enums::Document::Document(doc) = d else {
+                continue;
+            };
+            let emoji = doc
+                .attributes
+                .iter()
+                .find_map(|a| match a {
+                    tl::enums::DocumentAttribute::Sticker(s) => Some(s.alt.clone()),
+                    tl::enums::DocumentAttribute::CustomEmoji(s) => Some(s.alt.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let ext = match doc.mime_type.as_str() {
+                "image/webp" => "webp",
+                "video/webm" => "webm",
+                "application/x-tgsticker" => "tgs",
+                _ => "bin",
+            };
+            let path = dir.join(format!("{i:02}_{emoji}.{ext}"));
+            self.client
+                .download_media(&DocFile(doc.clone()), &path)
+                .await
+                .map_err(|e| Error::Mtproto(format!("download: {e}")))?;
+            stickers.push(PackSticker {
+                emoji,
+                mime: doc.mime_type.clone(),
+                path,
+            });
+        }
+        Ok(StickerPack {
+            title: set.title,
+            short_name: set.short_name,
+            count: set.count,
+            is_emoji_set: set.emojis,
+            stickers,
+        })
+    }
+
     /// Drain the update queue — every event received since the last
     /// poll, normalized for the GUI ("something new in chat X topic
     /// Y — refresh it"). `UpdateStream::next` blocks until the socket
@@ -2030,21 +1617,10 @@ impl Tg {
                     Err(_) => break,
                 };
             out.push(match update {
-                Update::NewMessage(m) | Update::MessageEdited(m) => {
-                    // Forum posts carry the topic id as reply_to_top_id;
-                    // DMs and plain replies never set it.
-                    let topic = match m.reply_header() {
-                        Some(tl::enums::MessageReplyHeader::Header(h)) => {
-                            h.reply_to_top_id.map(|t| t as i64)
-                        }
-                        _ => None,
-                    };
-                    TgEvent::Message {
-                        chat_hint: m.peer_id().bot_api_dialog_id(),
-                        topic,
-                        msg: Self::topic_message(&m),
-                    }
-                }
+                Update::NewMessage(m) | Update::MessageEdited(m) => TgEvent::Message {
+                    chat_hint: m.peer_id().bot_api_dialog_id(),
+                    msg: Self::topic_message(&m),
+                },
                 _ => TgEvent::Other,
             });
         }
@@ -2055,89 +1631,6 @@ impl Tg {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn clear_topic_walks_all_pages_in_bounded_batches() {
-        use std::cell::RefCell;
-        let remaining = RefCell::new((1..=650).collect::<Vec<i32>>());
-        let offsets = RefCell::new(Vec::new());
-        let largest_batch = std::cell::Cell::new(0);
-        clear_topic_pages(
-            |offset, limit| {
-                offsets.borrow_mut().push(offset);
-                let page = remaining
-                    .borrow()
-                    .iter()
-                    .rev()
-                    .copied()
-                    .filter(|id| offset == 0 || *id < offset)
-                    .take(limit as usize)
-                    .collect();
-                std::future::ready(Ok(page))
-            },
-            |ids| {
-                largest_batch.set(largest_batch.get().max(ids.len()));
-                remaining.borrow_mut().retain(|id| !ids.contains(id));
-                std::future::ready(Ok(()))
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            remaining.borrow().len(),
-            0,
-            "messages remaining after clearchat"
-        );
-        assert!(largest_batch.get() <= 100);
-        assert_eq!(*offsets.borrow(), vec![0, 551, 451, 351, 251, 151, 51, 1]);
-    }
-
-    #[tokio::test]
-    async fn clear_topic_empty_does_not_delete() {
-        clear_topic_pages(
-            |_, _| std::future::ready(Ok(Vec::new())),
-            |_| async { panic!("empty history must not be deleted") },
-        )
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn clear_topic_stops_on_partial_fetch_or_delete_failure() {
-        for fail_fetch in [true, false] {
-            let calls = std::cell::Cell::new(0);
-            let result = clear_topic_pages(
-                |offset, _| {
-                    std::future::ready(if offset == 0 {
-                        Ok(vec![3, 2])
-                    } else {
-                        Err(Error::Mtproto("fetch failed".into()))
-                    })
-                },
-                |_| {
-                    calls.set(calls.get() + 1);
-                    std::future::ready(if fail_fetch {
-                        Ok(())
-                    } else {
-                        Err(Error::Mtproto("delete failed".into()))
-                    })
-                },
-            )
-            .await;
-            assert!(result.is_err());
-            assert_eq!(calls.get(), 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn clear_topic_rejects_nonadvancing_pages() {
-        let result = clear_topic_pages(
-            |_, _| std::future::ready(Ok(vec![5])),
-            |_| std::future::ready(Ok(())),
-        )
-        .await;
-        assert!(result.is_err());
-    }
 
     #[test]
     fn strips_supergroup_prefix() {

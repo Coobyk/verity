@@ -26,6 +26,7 @@ http-body-util = "0.1"
 bytes = "1"
 sevenz-rust2 = "0.24"
 tempfile = "3"
+base64 = "0.22"
 tiny-skia.workspace = true
 verity-pfp = { path = "../verity-pfp" }
 
