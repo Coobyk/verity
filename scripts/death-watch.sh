@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Watch ~/verity/deaths for new *.md reports and post them into Healthity's
-# topic as file documents via `verity send --file`. Sent filenames are
-# tracked in $STATE so restarts never repost.
+# Watch ~/verity/deaths for new *.md reports and post them into the
+# owner's DM with Healthity as file documents via `verity send --file`.
+# Sent filenames are tracked in $STATE so restarts never repost.
 set -u
 DEATHS=/data/home/verity/deaths
 STATE=/data/home/.local/state/verity-healthity-sent

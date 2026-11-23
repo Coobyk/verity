@@ -34,14 +34,11 @@ pub struct Chat {
     #[serde(rename = "type")]
     pub kind: String,
     pub title: Option<String>,
-    pub is_forum: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Message {
     pub message_id: i64,
-    pub message_thread_id: Option<i64>,
-    pub is_topic_message: Option<bool>,
     pub from: Option<User>,
     pub chat: Chat,
     pub date: i64,
@@ -84,14 +81,6 @@ pub struct Update {
     pub message: Option<Message>,
     pub edited_message: Option<Message>,
     pub callback_query: Option<CallbackQuery>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ForumTopic {
-    pub message_thread_id: i64,
-    pub name: String,
-    pub icon_color: i64,
-    pub icon_custom_emoji_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -187,11 +176,9 @@ impl BotApi {
         &self,
         chat_id: i64,
         text: &str,
-        thread_id: Option<i64>,
         reply_to: Option<i64>,
     ) -> Result<Message> {
-        self.send_message_ex(chat_id, text, thread_id, reply_to, false)
-            .await
+        self.send_message_ex(chat_id, text, reply_to, false).await
     }
 
     /// Same send, but `disable_notification` — arrives with no sound
@@ -200,27 +187,21 @@ impl BotApi {
         &self,
         chat_id: i64,
         text: &str,
-        thread_id: Option<i64>,
         reply_to: Option<i64>,
     ) -> Result<Message> {
-        self.send_message_ex(chat_id, text, thread_id, reply_to, true)
-            .await
+        self.send_message_ex(chat_id, text, reply_to, true).await
     }
 
     async fn send_message_ex(
         &self,
         chat_id: i64,
         text: &str,
-        thread_id: Option<i64>,
         reply_to: Option<i64>,
         silent: bool,
     ) -> Result<Message> {
         let mut body = json!({ "chat_id": chat_id, "text": text });
         if silent {
             body["disable_notification"] = true.into();
-        }
-        if let Some(t) = thread_id {
-            body["message_thread_id"] = t.into();
         }
         if let Some(m) = reply_to {
             body["reply_parameters"] =
@@ -235,13 +216,9 @@ impl BotApi {
         &self,
         chat_id: i64,
         text: &str,
-        thread_id: Option<i64>,
         reply_to: Option<i64>,
     ) -> Result<Message> {
         let mut body = json!({ "chat_id": chat_id, "text": text, "parse_mode": "Markdown" });
-        if let Some(t) = thread_id {
-            body["message_thread_id"] = t.into();
-        }
         if let Some(m) = reply_to {
             body["reply_parameters"] =
                 json!({"message_id": m, "allow_sending_without_reply": true});
@@ -254,13 +231,9 @@ impl BotApi {
         &self,
         chat_id: i64,
         rich: InputRichMessage,
-        thread_id: Option<i64>,
         reply_to: Option<i64>,
     ) -> Result<Message> {
         let mut body = json!({ "chat_id": chat_id, "rich_message": rich });
-        if let Some(t) = thread_id {
-            body["message_thread_id"] = t.into();
-        }
         if let Some(m) = reply_to {
             body["reply_parameters"] =
                 json!({"message_id": m, "allow_sending_without_reply": true});
@@ -268,14 +241,12 @@ impl BotApi {
         self.call("sendRichMessage", &body).await
     }
 
-    /// Upload a file as a document (multipart). `thread_id` None posts to
-    /// General in a forum group.
+    /// Upload a file as a document (multipart).
     pub async fn send_document(
         &self,
         chat_id: i64,
         path: &Path,
         caption: Option<&str>,
-        thread_id: Option<i64>,
     ) -> Result<Message> {
         let bytes = std::fs::read(path)?;
         let name = path
@@ -291,9 +262,6 @@ impl BotApi {
             );
         if let Some(c) = caption {
             form = form.text("caption", c.to_string());
-        }
-        if let Some(t) = thread_id {
-            form = form.text("message_thread_id", t.to_string());
         }
         let url = format!("{}/bot{}/sendDocument", self.base, self.token);
         let resp: ApiResponse<Message> = self
@@ -363,19 +331,18 @@ impl BotApi {
         chat_id: i64,
         draft_id: i64,
         text: &str,
-        thread_id: Option<i64>,
         can_stop: bool,
     ) -> Result<()> {
-        let mut body = json!({
-            "chat_id": chat_id,
-            "draft_id": draft_id,
-            "text": text,
-            "can_stop": can_stop,
-        });
-        if let Some(t) = thread_id {
-            body["message_thread_id"] = t.into();
-        }
-        self.call::<bool>("sendMessageDraft", &body).await?;
+        self.call::<bool>(
+            "sendMessageDraft",
+            &json!({
+                "chat_id": chat_id,
+                "draft_id": draft_id,
+                "text": text,
+                "can_stop": can_stop,
+            }),
+        )
+        .await?;
         Ok(())
     }
 
@@ -385,19 +352,18 @@ impl BotApi {
         chat_id: i64,
         draft_id: i64,
         rich: InputRichMessage,
-        thread_id: Option<i64>,
         can_stop: bool,
     ) -> Result<()> {
-        let mut body = json!({
-            "chat_id": chat_id,
-            "draft_id": draft_id,
-            "rich_message": rich,
-            "can_stop": can_stop,
-        });
-        if let Some(t) = thread_id {
-            body["message_thread_id"] = t.into();
-        }
-        self.call::<bool>("sendRichMessageDraft", &body).await?;
+        self.call::<bool>(
+            "sendRichMessageDraft",
+            &json!({
+                "chat_id": chat_id,
+                "draft_id": draft_id,
+                "rich_message": rich,
+                "can_stop": can_stop,
+            }),
+        )
+        .await?;
         Ok(())
     }
 
@@ -424,17 +390,12 @@ impl BotApi {
     }
 
     /// "typing" / "upload_document" / etc. Cheap presence, no message.
-    pub async fn send_chat_action(
-        &self,
-        chat_id: i64,
-        action: &str,
-        thread_id: Option<i64>,
-    ) -> Result<()> {
-        let mut body = json!({ "chat_id": chat_id, "action": action });
-        if let Some(t) = thread_id {
-            body["message_thread_id"] = t.into();
-        }
-        self.call::<bool>("sendChatAction", &body).await?;
+    pub async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<()> {
+        self.call::<bool>(
+            "sendChatAction",
+            &json!({ "chat_id": chat_id, "action": action }),
+        )
+        .await?;
         Ok(())
     }
 
@@ -466,30 +427,12 @@ impl BotApi {
         Ok(())
     }
 
-    pub async fn create_forum_topic(&self, chat_id: i64, name: &str) -> Result<ForumTopic> {
-        self.call(
-            "createForumTopic",
-            &json!({ "chat_id": chat_id, "name": name }),
-        )
-        .await
-    }
-
-    pub async fn edit_forum_topic(&self, chat_id: i64, thread_id: i64, name: &str) -> Result<()> {
-        self.call::<bool>(
-            "editForumTopic",
-            &json!({ "chat_id": chat_id, "message_thread_id": thread_id, "name": name }),
-        )
-        .await?;
-        Ok(())
-    }
-
     /// Send a prompt with rows of inline buttons — `(label, callback_data)`
     /// per button, one Vec per row. Returns the sent message's id.
     pub async fn send_buttons(
         &self,
         chat_id: i64,
         text: &str,
-        topic_id: Option<i64>,
         rows: &[Vec<(String, String)>],
     ) -> Result<i64> {
         let keyboard: Vec<Vec<serde_json::Value>> = rows
@@ -500,14 +443,11 @@ impl BotApi {
                     .collect()
             })
             .collect();
-        let mut body = json!({
+        let body = json!({
             "chat_id": chat_id,
             "text": text,
             "reply_markup": {"inline_keyboard": keyboard},
         });
-        if let Some(t) = topic_id {
-            body["message_thread_id"] = t.into();
-        }
         let m: Message = self.call("sendMessage", &body).await?;
         Ok(m.message_id)
     }
@@ -522,22 +462,4 @@ impl BotApi {
         Ok(())
     }
 
-    /// Kick a member from the group (unbanChatMember with only_if_banned=false).
-    pub async fn kick_member(&self, chat_id: i64, user_id: i64) -> Result<()> {
-        self.call::<bool>(
-            "unbanChatMember",
-            &json!({ "chat_id": chat_id, "user_id": user_id, "only_if_banned": false }),
-        )
-        .await?;
-        Ok(())
-    }
-
-    pub async fn delete_forum_topic(&self, chat_id: i64, thread_id: i64) -> Result<()> {
-        self.call::<bool>(
-            "deleteForumTopic",
-            &json!({ "chat_id": chat_id, "message_thread_id": thread_id }),
-        )
-        .await?;
-        Ok(())
-    }
 }

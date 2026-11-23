@@ -7,20 +7,18 @@ use std::path::Path;
 use crate::Result;
 
 const SELECT_BOT: &str =
-    "SELECT name, token, username, topic_id, instructions, provider, model, greeting FROM bots";
+    "SELECT name, token, username, instructions, provider, model, greeting FROM bots";
 
 #[derive(Debug, Clone)]
 pub struct Bot {
     pub name: String,
     pub token: String,
     pub username: Option<String>,
-    /// Forum topic this bot owns; created lazily.
-    pub topic_id: Option<i64>,
     pub instructions: String,
     /// Harness spec, e.g. "pi" or "acp:claude".
     pub provider: String,
     pub model: Option<String>,
-    /// Posted into the bot's topic right after it's created.
+    /// Sent when the owner /starts the bot's DM.
     pub greeting: Option<String>,
 }
 
@@ -41,7 +39,6 @@ impl Store {
                  name         TEXT PRIMARY KEY,
                  token        TEXT NOT NULL,
                  username     TEXT,
-                 topic_id     INTEGER,
                  instructions TEXT NOT NULL DEFAULT '',
                  provider     TEXT NOT NULL DEFAULT 'pi',
                  model        TEXT,
@@ -60,24 +57,24 @@ impl Store {
                  value TEXT NOT NULL
              );",
         )?;
-        // migration for pre-greeting databases
+        // migrations for older databases
         let _ = conn.execute("ALTER TABLE bots ADD COLUMN greeting TEXT");
+        let _ = conn.execute("ALTER TABLE bots DROP COLUMN topic_id");
         Ok(Self { conn })
     }
 
     pub fn add_bot(&self, bot: &Bot) -> Result<()> {
         let mut stmt = self.conn.prepare(
-            "INSERT INTO bots (name, token, username, topic_id, instructions, provider, model, greeting, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, CAST(strftime('%s', 'now') AS INTEGER))",
+            "INSERT INTO bots (name, token, username, instructions, provider, model, greeting, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, CAST(strftime('%s', 'now') AS INTEGER))",
         )?;
         stmt.bind((1, bot.name.as_str()))?;
         stmt.bind((2, bot.token.as_str()))?;
         stmt.bind((3, bot.username.as_deref()))?;
-        stmt.bind((4, bot.topic_id))?;
-        stmt.bind((5, bot.instructions.as_str()))?;
-        stmt.bind((6, bot.provider.as_str()))?;
-        stmt.bind((7, bot.model.as_deref()))?;
-        stmt.bind((8, bot.greeting.as_deref()))?;
+        stmt.bind((4, bot.instructions.as_str()))?;
+        stmt.bind((5, bot.provider.as_str()))?;
+        stmt.bind((6, bot.model.as_deref()))?;
+        stmt.bind((7, bot.greeting.as_deref()))?;
         stmt.next()?;
         Ok(())
     }
@@ -131,7 +128,7 @@ impl Store {
     /// sender (not whichever name sorts first).
     pub fn primary_bot(&self) -> Result<Option<Bot>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, token, username, topic_id, instructions, provider, model, greeting
+            "SELECT name, token, username, instructions, provider, model, greeting
              FROM bots ORDER BY rowid LIMIT 1",
         )?;
         match stmt.next()? {
@@ -205,26 +202,6 @@ impl Store {
         Ok(())
     }
 
-    /// Forget every bot's topic except `keep` (theirs were deleted).
-    pub fn clear_other_topics(&self, keep: &str) -> Result<()> {
-        let mut s = self
-            .conn
-            .prepare("UPDATE bots SET topic_id = NULL WHERE name != ?")?;
-        s.bind((1, keep))?;
-        s.next()?;
-        Ok(())
-    }
-
-    /// Forget a bot's forum topic so the bridge can recreate it.
-    pub fn clear_bot_topic(&self, name: &str) -> Result<()> {
-        let mut s = self
-            .conn
-            .prepare("UPDATE bots SET topic_id = NULL WHERE name = ?")?;
-        s.bind((1, name))?;
-        s.next()?;
-        Ok(())
-    }
-
     pub fn get_bot(&self, name: &str) -> Result<Option<Bot>> {
         let mut stmt = self.conn.prepare(format!("{SELECT_BOT} WHERE name = ?"))?;
         stmt.bind((1, name))?;
@@ -232,26 +209,6 @@ impl Store {
             State::Row => Ok(Some(read_bot(&stmt)?)),
             State::Done => Ok(None),
         }
-    }
-
-    pub fn set_bot_topic(&self, name: &str, topic_id: i64) -> Result<()> {
-        let mut stmt = self
-            .conn
-            .prepare("UPDATE bots SET topic_id = ? WHERE name = ?")?;
-        stmt.bind((1, topic_id))?;
-        stmt.bind((2, name))?;
-        stmt.next()?;
-        Ok(())
-    }
-
-    pub(crate) fn set_bot_topic_if_empty(&self, name: &str, topic_id: i64) -> Result<bool> {
-        let mut stmt = self
-            .conn
-            .prepare("UPDATE bots SET topic_id = ? WHERE name = ? AND topic_id IS NULL")?;
-        stmt.bind((1, topic_id))?;
-        stmt.bind((2, name))?;
-        stmt.next()?;
-        Ok(self.conn.change_count() > 0)
     }
 
     pub fn remember(&self, bot: &str, key: &str, value: &str) -> Result<()> {
@@ -295,11 +252,10 @@ fn read_bot(stmt: &sqlite::Statement) -> Result<Bot> {
         name: stmt.read(0)?,
         token: stmt.read(1)?,
         username: stmt.read::<Option<String>, _>(2)?,
-        topic_id: stmt.read::<Option<i64>, _>(3)?,
-        instructions: stmt.read(4)?,
-        provider: stmt.read(5)?,
-        model: stmt.read::<Option<String>, _>(6)?,
-        greeting: stmt.read::<Option<String>, _>(7)?,
+        instructions: stmt.read(3)?,
+        provider: stmt.read(4)?,
+        model: stmt.read::<Option<String>, _>(5)?,
+        greeting: stmt.read::<Option<String>, _>(6)?,
     })
 }
 
@@ -317,7 +273,6 @@ mod tests {
                     name: format!("bot-{i}"),
                     token: format!("token-{i}"),
                     username: Some(format!("username-{i}")),
-                    topic_id: Some(i),
                     instructions: format!("instructions-{i}"),
                     provider: "echo".into(),
                     model: Some(format!("model-{i}")),
@@ -329,7 +284,6 @@ mod tests {
         assert_eq!(bot.name, "bot-73");
         assert_eq!(bot.token, "token-73");
         assert_eq!(bot.username.as_deref(), Some("username-73"));
-        assert_eq!(bot.topic_id, Some(73));
         assert_eq!(bot.instructions, "instructions-73");
         assert_eq!(bot.provider, "echo");
         assert_eq!(bot.model.as_deref(), Some("model-73"));
@@ -340,7 +294,6 @@ mod tests {
         add_test_bot(&store);
         let bot = store.get_bot("scout").unwrap().unwrap();
         assert!(bot.username.is_none());
-        assert!(bot.topic_id.is_none());
         assert!(bot.model.is_none());
         assert!(bot.greeting.is_none());
     }
@@ -410,23 +363,12 @@ mod tests {
                 name: "scout".into(),
                 token: "mock".into(),
                 username: None,
-                topic_id: None,
                 instructions: String::new(),
                 provider: "echo".into(),
                 model: None,
                 greeting: None,
             })
             .unwrap();
-    }
-
-    #[test]
-    fn topic_creation_preserves_an_already_saved_topic() {
-        let store = Store::open(Path::new(":memory:")).unwrap();
-        add_test_bot(&store);
-        assert!(store.set_bot_topic_if_empty("scout", 7).unwrap());
-        assert!(!store.set_bot_topic_if_empty("scout", 8).unwrap());
-        assert_eq!(store.get_bot("scout").unwrap().unwrap().topic_id, Some(7));
-        assert!(!store.set_bot_topic_if_empty("missing", 8).unwrap());
     }
 
     fn assert_current_timestamp(store: &Store, table: &str, column: &str) {
@@ -490,7 +432,7 @@ mod tests {
             .execute(
                 "DROP TABLE bots;
                  CREATE TABLE bots (
-                     name TEXT PRIMARY KEY, token TEXT NOT NULL, username TEXT, topic_id INTEGER,
+                     name TEXT PRIMARY KEY, token TEXT NOT NULL, username TEXT,
                      instructions TEXT, provider TEXT, model TEXT, greeting TEXT,
                      created_at INTEGER NOT NULL DEFAULT (unixepoch())
                  );",

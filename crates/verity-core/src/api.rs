@@ -3,12 +3,10 @@
 //! `/api/health` needs `Authorization: Bearer <api_token>` — with no
 //! token configured the API refuses everything (never run it open).
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use grammers_session::defs::PeerRef;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -30,8 +28,6 @@ use crate::{Error, Result};
 pub struct Api {
     /// User-side session the API reads and writes Telegram through.
     pub tg: Arc<Tg>,
-    /// Peer of the forum supergroup (topics, bot membership).
-    pub group: PeerRef,
     /// sqlite path — opened per request, like the bridge's `db_call`.
     pub db: PathBuf,
     /// Bearer token from `api_token`; `None` refuses all but /api/health.
@@ -115,16 +111,6 @@ async fn route(api: Arc<Api>, req: Request<Incoming>) -> Resp {
     let path = req.uri().path().to_string();
     let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
     match (method, segs.as_slice()) {
-        (Method::GET, ["api", "topics"]) => respond(topics(&api).await),
-        (Method::GET, ["api", "topics", id, "messages"]) => match id.parse::<i64>() {
-            Ok(id) => respond(
-                api.tg
-                    .topic_history(api.group, id, limit(&req))
-                    .await
-                    .map(|m| json!({ "messages": m })),
-            ),
-            Err(_) => fail(StatusCode::BAD_REQUEST, "bad topic id"),
-        },
         (Method::GET, ["api", "dms"]) => respond(dms(&api).await),
         (Method::GET, ["api", "dms", uid, "messages"]) => match uid.parse::<i64>() {
             Ok(uid) => dm_history(&api, uid, limit(&req)).await,
@@ -150,28 +136,13 @@ fn limit(req: &Request<Incoming>) -> i32 {
         .clamp(1, 200)
 }
 
-async fn topics(api: &Api) -> Result<Value> {
-    let me = api.tg.self_id().await?;
-    let topics = api.tg.list_topics(api.group).await?;
-    Ok(json!({ "me": me, "topics": topics }))
-}
-
 /// Port of the GUI's `build_dms` (crates/verity-gui/src/main.rs): one
-/// row per registered bot. The bot's user id comes from group membership
-/// where possible, else `getMe` on its token; `available` means the
-/// owner's 1:1 dialog with that user resolved. A bot whose account can't
-/// be identified keeps a row with a negative sentinel id
-/// (`available: false`) so the roster isn't silently missing one.
+/// row per registered bot. The bot's user id comes from `getMe` on its
+/// token; `available` means the owner's 1:1 dialog with that user
+/// resolved. A bot whose account can't be identified keeps a row with a
+/// negative sentinel id (`available: false`) so the roster isn't
+/// silently missing one.
 async fn dms(api: &Api) -> Result<Value> {
-    let members: HashMap<String, i64> = api
-        .tg
-        .list_bot_members(api.group)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|m| m.username.map(|u| (u.to_lowercase(), m.user_id)))
-        .collect();
-
     let db = api.db.clone();
     let bots =
         tokio::task::spawn_blocking(move || -> Result<Vec<Bot>> { Store::open(&db)?.list_bots() })
@@ -181,16 +152,11 @@ async fn dms(api: &Api) -> Result<Value> {
     let mut out = Vec::new();
     for b in bots {
         let mut username = b.username.clone();
-        let mut user_id = username
-            .as_ref()
-            .and_then(|u| members.get(&u.to_lowercase()).copied());
-        // Not a group member (or no username on file): ask the Bot API —
-        // a registered bot's token always knows its own id.
-        if user_id.is_none() {
-            if let Ok(me) = BotApi::new(&b.token).get_me().await {
-                user_id = Some(me.id);
-                username = username.or(me.username);
-            }
+        let mut user_id = None;
+        // A registered bot's token always knows its own id.
+        if let Ok(me) = BotApi::new(&b.token).get_me().await {
+            user_id = Some(me.id);
+            username = username.or(me.username);
         }
         let label = match username {
             Some(u) => format!("@{u}"),
@@ -227,10 +193,8 @@ async fn dm_history(api: &Api, user_id: i64, limit: i32) -> Resp {
 
 #[derive(Deserialize)]
 struct SendBody {
-    /// Forum topic id — xor `dm`.
-    topic: Option<i64>,
-    /// Bot user id whose 1:1 chat gets the message — xor `topic`.
-    dm: Option<i64>,
+    /// Bot user id whose 1:1 chat gets the message.
+    dm: i64,
     text: String,
 }
 
@@ -239,26 +203,17 @@ async fn send(api: Arc<Api>, req: Request<Incoming>) -> Resp {
         Ok(c) => c.to_bytes(),
         Err(e) => return fail(StatusCode::BAD_REQUEST, e),
     };
-    let SendBody { topic, dm, text } = match serde_json::from_slice::<SendBody>(&body) {
+    let SendBody { dm, text } = match serde_json::from_slice::<SendBody>(&body) {
         Ok(b) => b,
         Err(e) => return fail(StatusCode::BAD_REQUEST, e),
     };
-    let (peer, topic) = match (topic, dm) {
-        (Some(t), None) => (api.group, Some(t)),
-        (None, Some(uid)) => match api.tg.peer(&uid.to_string()).await {
-            Ok(p) => (p, None),
-            Err(_) => return fail(StatusCode::NOT_FOUND, "no dm"),
-        },
-        _ => {
-            return fail(
-                StatusCode::BAD_REQUEST,
-                "need exactly one of \"topic\" or \"dm\"",
-            )
-        }
+    let peer = match api.tg.peer(&dm.to_string()).await {
+        Ok(p) => p,
+        Err(_) => return fail(StatusCode::NOT_FOUND, "no dm"),
     };
     respond(
         api.tg
-            .send_message(peer, topic, &text)
+            .send_message(peer, &text)
             .await
             .map(|_| json!({ "ok": true })),
     )

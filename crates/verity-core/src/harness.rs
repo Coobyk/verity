@@ -48,10 +48,10 @@ pub struct TurnContext {
     pub bot_name: String,
     pub instructions: String,
     pub memory: Vec<(String, String)>,
-    /// Recent topic messages as `(sender, text)`, oldest-first. The human's
+    /// Recent DM messages as `(sender, text)`, oldest-first. The human's
     /// current request is included as the last entry — the agent replies to it.
     pub history: Vec<(String, String)>,
-    /// Names of the other bots sharing the group (this bot excluded) —
+    /// Names of the other registered bots (this bot excluded) —
     /// teammates reachable via `:::tell name: …:::`.
     pub peers: Vec<String>,
     /// True on the bot's first-ever user turn: greet the sender by name
@@ -74,7 +74,7 @@ pub trait Harness: Send + Sync {
 /// strips and acts on.
 fn system_prompt(ctx: &TurnContext) -> String {
     let mut s = format!(
-        "You are {}, a teammate bot in a Telegram group. \
+        "You are {}, a teammate bot in a Telegram DM. \
          This is chat, not email: reply casually and directly. \
          No salutations or greeting prefixes — don't open by \
          addressing the sender by name. Get straight to it.\n\
@@ -95,14 +95,14 @@ fn system_prompt(ctx: &TurnContext) -> String {
         }
     }
     if !ctx.history.is_empty() {
-        s.push_str("\nRecent messages in your topic (oldest first):\n");
+        s.push_str("\nRecent messages in this DM (oldest first):\n");
         for (sender, text) in &ctx.history {
             s.push_str(&format!("{sender}: {text}\n"));
         }
     }
     if !ctx.peers.is_empty() {
         s.push_str(&format!(
-            "\nYou share this group with teammates: {}. \
+            "\nYour teammates: {}. \
              To hand work to one, emit `:::tell name: what to do:::` on its own line — \
              they run the task and reply in the owner's DM with them as themselves. \
              To fan out up to three short-lived helpers on part of the task, emit \
@@ -116,10 +116,10 @@ fn system_prompt(ctx: &TurnContext) -> String {
     s.push_str(
         "\nReply for Telegram Rich Markdown: GFM, tables, and LaTeX formulas are supported. Keep it concise. \
          To persist a fact, put it on its own line as `:::remember key = value:::` — it is stored as memory and stripped from your reply. \
-         To archive all of ~/verity (and your $HOME settings) into the group's General topic (backup), emit `:::backup:::`. \
+         To archive all of ~/verity (and your $HOME settings) into this DM as a file (backup), emit `:::backup:::`. \
          To restart the bridge (e.g. after rebuilding its binary), emit `:::restart:::`; to stop it for good, `:::shutdown:::` — \
          both fire only after your reply posts, so never `systemctl` the verity service yourself. \
-         Destructive ops exist too — `:::clear:::` (wipe your memory), `:::clearchat:::` (delete every message here AND wipe memory), `:::reset:::` (nuke everything: all topics, all messages, every bot but you, all memory). \
+         Destructive ops exist too — `:::clear:::` (wipe your memory), `:::clearchat:::` (delete every message here AND wipe memory), `:::reset:::` (nuke everything: every teammate bot but you, all memory). \
          None of them run on your word alone: each posts an arithmetic quiz and only the human's correct tap executes it — propose them when the situation calls for it, never casually.",
     );
     s

@@ -1,4 +1,4 @@
-//! verity — manage teammate bots that live in a Telegram forum group.
+//! verity — manage teammate bots you chat with in 1:1 Telegram DMs.
 
 use std::io::{BufRead, Write};
 
@@ -14,26 +14,29 @@ use verity_core::mtproto::Tg;
 use verity_core::store::{Bot, Store};
 
 #[derive(Parser)]
-#[command(name = "verity", about = "Named teammate bots in a Telegram group")]
+#[command(
+    name = "verity",
+    about = "Named teammate bots in Telegram DMs",
+    arg_required_else_help = true
+)]
 struct Cli {
+    /// Set up this machine from a `vsk1.` setup key: downloads the
+    /// encrypted archive it points at and restores everything —
+    /// config, session, bots, units. Nothing needs configuring first.
+    #[arg(long, value_name = "KEY")]
+    setupkey: Option<String>,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Set api_id/api_hash (my.telegram.org) and the host group —
-    /// or pass --create-group <title> to make a new forum supergroup
+    /// Set api_id/api_hash (my.telegram.org) and the harness binary
     Config {
         #[arg(long)]
         api_id: Option<i32>,
         #[arg(long)]
         api_hash: Option<String>,
-        #[arg(long, allow_negative_numbers = true)]
-        group_id: Option<i64>,
-        /// Create a new forum supergroup with this title and use it
-        #[arg(long)]
-        create_group: Option<String>,
         #[arg(long)]
         pi_bin: Option<String>,
         /// Bind address for the mobile-app JSON API (e.g. 0.0.0.0:8787)
@@ -59,55 +62,51 @@ enum Cmd {
         #[command(subcommand)]
         cmd: BotCmd,
     },
-    /// Wipe everything: kick all bots but the lead, delete all topics +
-    /// messages, then the local brain — clean slate (stop serve first)
+    /// Wipe everything: delete the local brain — every bot registration,
+    /// all memory. The Telegram bot accounts and your DMs with them
+    /// stay; re-register and /start again (stop serve first)
     Reset,
     /// Clear a bot's memory
     Clear { name: String },
-    /// Delete a bot's chat topic too (it recreates fresh on next message)
+    /// Delete every message in your DM with a bot + wipe its memory
     ClearChat { name: String },
-    /// List your supergroups with Bot-API chat ids (find your group_id)
-    Groups,
-    /// Rename the configured group (or one by id/title)
-    Rename {
-        title: String,
-        group: Option<String>,
-    },
-    /// List forum topics in the configured group
-    Topics {
-        /// Group id or title substring (defaults to config group_id)
-        group: Option<String>,
-    },
-    /// Read recent messages of a topic (as your user)
+    /// Read recent messages of your DM with a bot (as your user)
     History {
-        /// Topic id or title substring
-        topic: String,
+        /// Roster name or @username
+        bot: String,
         #[arg(long, default_value = "20")]
         limit: i32,
-        group: Option<String>,
     },
-    /// Post a message into a topic as yourself
+    /// Post a message into your DM with a bot as yourself
     Say {
-        /// Topic id or title substring
-        topic: String,
-        /// Message text
+        /// Roster name or @username
+        bot: String,
+        /// Message text — or a path to upload as a document with --file
         text: String,
-        group: Option<String>,
+        /// Upload `text` as a file (MTProto, over the Bot API's 50MB cap)
+        #[arg(long)]
+        file: bool,
     },
     /// 7z ~/verity (minus target/) + $HOME settings into one archive;
-    /// send it to the group's General topic
+    /// send it to your DM with the lead bot
     Backup,
     /// Restore from a backup archive — pass its path or https URL and
     /// it unpacks + re-enables itself (no Telegram login needed; the
     /// session rides inside the archive). No argument: pull the newest
-    /// archive out of General instead.
+    /// archive out of your DM with the lead bot instead.
     Restore {
         /// Local path or https URL of a verity-backup-*.7z
         archive: Option<String>,
-        /// General-scan mode only: group id or title
+        /// Scan mode only: whose DM to search (default: lead bot)
         #[arg(long)]
-        group: Option<String>,
+        bot: Option<String>,
     },
+    /// Print a `vsk1.` setup key: packs ~/verity into an AES-encrypted
+    /// 7z, uploads it to your DM with the lead bot, and the key carries
+    /// everything `verity --setupkey <key>` needs on a new machine.
+    /// The key is a full credential — keep it secret.
+    #[command(name = "getsetupkey")]
+    GetSetupKey,
     /// Liveness check: start the bridge if it's down, restart it if its
     /// heartbeat went stale. Run by verity-watchdog.timer once a minute
     /// — honors `~/.local/state/verity-asleep` and a disabled unit
@@ -117,11 +116,11 @@ enum Cmd {
         /// Use the echo harness (no agent provider needed)
         #[arg(long)]
         echo: bool,
-        /// Don't attach the user session — turns get no topic transcript
+        /// Don't attach the user session — turns get no DM transcript
         #[arg(long)]
         no_context: bool,
     },
-    /// Post into a topic as a bot
+    /// Post into your DM with a bot, as the bot
     Send {
         bot: String,
         /// Message text — or a path to upload as a document with --file
@@ -134,7 +133,7 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum BotCmd {
-    /// Register a bot by its BotFather token; creates its forum topic on first serve
+    /// Register a bot by its BotFather token; /start its DM to chat
     New {
         name: String,
         #[arg(long)]
@@ -146,7 +145,7 @@ enum BotCmd {
         provider: String,
         #[arg(long)]
         model: Option<String>,
-        /// Posted into the bot's topic once, when it's created
+        /// Sent as the bot's first message when its DM opens
         #[arg(long)]
         greeting: Option<String>,
     },
@@ -164,19 +163,7 @@ enum BotCmd {
         #[arg(long)]
         greeting: Option<String>,
     },
-    /// Invite a bot into the group + grant admin (manage topics)
-    Invite {
-        /// Bot username (with or without @)
-        username: String,
-        group: Option<String>,
-    },
-    /// Rename a bot's forum topic
-    Topic {
-        name: String,
-        #[arg(long)]
-        title: String,
-    },
-    /// Rename a bot (store name, memory keys, and its topic title if set)
+    /// Rename a bot (store name + memory keys)
     Rename { name: String, new_name: String },
     /// Regenerate the bot's profile picture (BallsMaker style) and upload it
     Pfp {
@@ -192,7 +179,7 @@ enum BotCmd {
     },
     /// List registered bots
     List,
-    /// Remove a bot (does not delete its topic)
+    /// Remove a bot (does not delete its DM or Telegram account)
     Rm { name: String },
     /// Delete the bot at @BotFather too — unregisters it and kills the
     /// Telegram account for good. Irreversible.
@@ -277,43 +264,29 @@ async fn authorized_tg() -> Result<(Tg, Config)> {
     Ok((tg, cfg))
 }
 
-/// Create a forum supergroup using cfg's own credentials — `tg()`
-/// reloads from disk, which would miss values being set in the same
-/// `verity config` run.
-async fn create_group_with(cfg: &Config, title: &str) -> Result<i64> {
-    let (api_id, api_hash) = cfg.api_credentials()?;
-    let tg = Tg::connect(api_id, api_hash, &Config::session_path()?).await?;
-    if !tg.is_authorized().await? {
-        bail!("not logged in — run `verity login --phone <number>`");
-    }
-    tg.create_group(title).await.map_err(Into::into)
-}
-
-fn group_of(cfg: &Config, arg: Option<String>) -> Result<String> {
-    if let Some(g) = arg {
-        return Ok(g);
-    }
-    cfg.group_id
-        .map(|g| g.to_string())
-        .context("no group configured — `verity config --group-id <id>` or pass one")
-}
-
-/// Numeric topic ids pass through; anything else is matched against
-/// topic titles (case-insensitive substring).
-async fn resolve_topic(
-    tg: &Tg,
-    peer: &grammers_session::defs::PeerRef,
-    topic: &str,
-) -> Result<i64> {
-    if let Ok(id) = topic.parse::<i64>() {
-        return Ok(id);
-    }
-    tg.list_topics(*peer)
-        .await?
+/// Look a bot up by roster name or @username (either accepts a bare
+/// `@name`, case-insensitive).
+fn find_bot(store: &Store, name: &str) -> Result<Bot> {
+    let want = name.trim_start_matches('@').to_lowercase();
+    store
+        .list_bots()?
         .into_iter()
-        .find(|t| t.title.to_lowercase().contains(&topic.to_lowercase()))
-        .map(|t| t.id)
-        .context("no such topic")
+        .find(|b| {
+            b.name.to_lowercase() == want
+                || b.username
+                    .as_deref()
+                    .map(|u| u.to_lowercase() == want)
+                    .unwrap_or(false)
+        })
+        .with_context(|| format!("no such bot: {name}"))
+}
+
+/// The user-side peer of a bot's DM with the owner, resolved by its
+/// Bot-API user id. Fails when the owner never /started that bot —
+/// the dialog doesn't exist yet.
+async fn dm_peer(tg: &Tg, bot: &Bot) -> Result<grammers_session::defs::PeerRef> {
+    let me = BotApi::new(&bot.token).get_me().await?;
+    tg.peer_for_user(me.id).await.map_err(Into::into)
 }
 
 /// Render a BallsMaker avatar for `bot`, save pfp-<name>.png next to
@@ -383,12 +356,29 @@ async fn run() -> Result<()> {
         )
         .init();
 
-    match Cli::parse().cmd {
+    let cli = Cli::parse();
+    if let Some(key) = &cli.setupkey {
+        if cli.cmd.is_some() {
+            bail!("--setupkey can't be combined with a subcommand");
+        }
+        let files = verity_core::setupkey::apply(key).await?;
+        println!(
+            "restored {} files into {}",
+            files.len(),
+            Config::home()?.display()
+        );
+        for note in verity_core::backup::post_restore(&files) {
+            println!("{note}");
+        }
+        return Ok(());
+    }
+    // Unreachable on a bare `verity` — arg_required_else_help exits
+    // before this — but a key-less fallthrough stays impossible.
+    let Some(cmd) = cli.cmd else { return Ok(()) };
+    match cmd {
         Cmd::Config {
             api_id,
             api_hash,
-            group_id,
-            create_group,
             pi_bin,
             api_bind,
             api_token,
@@ -396,8 +386,6 @@ async fn run() -> Result<()> {
             let mut cfg = Config::load()?;
             let interactive = api_id.is_none()
                 && api_hash.is_none()
-                && group_id.is_none()
-                && create_group.is_none()
                 && pi_bin.is_none()
                 && api_bind.is_none()
                 && api_token.is_none();
@@ -413,23 +401,6 @@ async fn run() -> Result<()> {
                 if let Some(v) = prompt_keep("api_hash", cfg.api_hash.clone(), true)? {
                     cfg.api_hash = Some(v);
                 }
-                if let Some(v) = prompt_keep(
-                    "group_id (Bot-API id, see `verity groups`; 'new' to create)",
-                    cfg.group_id.map(|v| v.to_string()),
-                    false,
-                )? {
-                    if v == "new" || v.starts_with("new ") {
-                        let title = match v.strip_prefix("new").unwrap_or("").trim() {
-                            "" => prompt("new group title")?,
-                            t => t.to_string(),
-                        };
-                        let id = create_group_with(&cfg, &title).await?;
-                        println!("created '{title}' ({id})");
-                        cfg.group_id = Some(id);
-                    } else {
-                        cfg.group_id = Some(v.parse().context("group_id must be a number")?);
-                    }
-                }
                 if let Some(v) = prompt_keep("pi_bin", cfg.pi_bin.clone(), false)? {
                     cfg.pi_bin = Some(v);
                 }
@@ -439,14 +410,6 @@ async fn run() -> Result<()> {
                 }
                 if let Some(v) = api_hash {
                     cfg.api_hash = Some(v);
-                }
-                if let Some(v) = group_id {
-                    cfg.group_id = Some(v);
-                }
-                if let Some(title) = create_group {
-                    let id = create_group_with(&cfg, &title).await?;
-                    println!("created '{title}' ({id})");
-                    cfg.group_id = Some(id);
                 }
                 if let Some(v) = pi_bin {
                     cfg.pi_bin = Some(v);
@@ -489,42 +452,11 @@ async fn run() -> Result<()> {
         }
 
         Cmd::Reset => {
+            // Local-only wipe: the db holds every bot registration and
+            // all memory, so deleting it is the clean slate. Telegram
+            // bot accounts and your DMs with them stay — re-register,
+            // /start each DM again, restart serve.
             let db = Config::db_path()?;
-            // Wipe the Telegram side while the roster still exists —
-            // every bot member kicked but the lead, every topic
-            // deleted, General purged. The db dies last.
-            match authorized_tg().await {
-                Ok((tg, cfg)) => {
-                    let keep = Store::open(&db)
-                        .and_then(|s| s.primary_bot())
-                        .ok()
-                        .flatten();
-                    match cfg.group_id {
-                        Some(group_id) => match tg.peer(&group_id.to_string()).await {
-                            Ok(peer) => {
-                                let keep_id = match &keep {
-                                    Some(k) => {
-                                        BotApi::new(&k.token).get_me().await.ok().map(|u| u.id)
-                                    }
-                                    None => None,
-                                };
-                                let rep = tg.wipe_group(peer, keep_id).await;
-                                println!(
-                                    "group wiped: {} bots kicked, {} topics, {} General messages{}",
-                                    rep.bots_kicked,
-                                    rep.topics_deleted,
-                                    rep.general_messages,
-                                    keep.map(|k| format!(" — kept {}", k.name))
-                                        .unwrap_or_default()
-                                );
-                            }
-                            Err(e) => eprintln!("can't resolve group — skipped wipe: {e}"),
-                        },
-                        None => eprintln!("no group_id configured — skipped group wipe"),
-                    }
-                }
-                Err(e) => eprintln!("{e} — skipped group wipe"),
-            }
             if db.exists() {
                 std::fs::remove_file(&db)?;
             }
@@ -543,58 +475,41 @@ async fn run() -> Result<()> {
         Cmd::ClearChat { name } => {
             let store = Store::open(&Config::db_path()?)?;
             let b = store.get_bot(&name)?.context("no such bot")?;
-            if let Some(t) = b.topic_id {
-                let gid = Config::load()?.group_id.context("no group_id")?;
-                BotApi::new(&b.token).delete_forum_topic(gid, t).await?;
+            let (tg, _) = authorized_tg().await?;
+            match dm_peer(&tg, &b).await {
+                Ok(peer) => {
+                    let n = tg.clear_chat(peer).await?;
+                    println!("deleted {n} messages");
+                }
+                Err(e) => eprintln!("no DM to clear — skipped: {e}"),
             }
-            store.clear_bot_topic(&name)?;
             store.clear_memory(&name)?;
             store.kv_del(&format!("greeted:{name}"))?;
             store.kv_del(&format!("pending:{name}"))?;
             store.kv_del_prefix(&format!("pending:{name}:"))?;
-            println!("cleared {name}'s topic + memory — fresh start");
+            println!("cleared {name}'s chat + memory — fresh start");
         }
 
-        Cmd::Groups => {
+        Cmd::History { bot, limit } => {
+            let store = Store::open(&Config::db_path()?)?;
+            let b = find_bot(&store, &bot)?;
             let (tg, _) = authorized_tg().await?;
-            for g in tg.list_groups().await? {
-                println!("{:<16} {:<8} {}", g.chat_id, g.kind, g.title);
-            }
-        }
-
-        Cmd::Rename { title, group } => {
-            let (tg, cfg) = authorized_tg().await?;
-            let peer = tg.peer(&group_of(&cfg, group)?).await?;
-            tg.rename_chat(peer, &title).await?;
-            println!("renamed to {title}");
-        }
-
-        Cmd::Topics { group } => {
-            let (tg, cfg) = authorized_tg().await?;
-            let peer = tg.peer(&group_of(&cfg, group)?).await?;
-            for t in tg.list_topics(peer).await? {
-                println!("{:>8}  {}", t.id, t.title);
-            }
-        }
-
-        Cmd::History {
-            topic,
-            limit,
-            group,
-        } => {
-            let (tg, cfg) = authorized_tg().await?;
-            let peer = tg.peer(&group_of(&cfg, group)?).await?;
-            let topic_id = resolve_topic(&tg, &peer, &topic).await?;
-            for m in tg.topic_history(peer, topic_id, limit).await? {
+            let peer = dm_peer(&tg, &b).await?;
+            for m in tg.dm_history(peer, limit).await? {
                 println!("[{}] {}: {}", m.id, m.sender, m.text);
             }
         }
 
-        Cmd::Say { topic, text, group } => {
-            let (tg, cfg) = authorized_tg().await?;
-            let peer = tg.peer(&group_of(&cfg, group)?).await?;
-            let topic_id = resolve_topic(&tg, &peer, &topic).await?;
-            tg.send_message(peer, Some(topic_id), &text).await?;
+        Cmd::Say { bot, text, file } => {
+            let store = Store::open(&Config::db_path()?)?;
+            let b = find_bot(&store, &bot)?;
+            let (tg, _) = authorized_tg().await?;
+            let peer = dm_peer(&tg, &b).await?;
+            if file {
+                tg.send_file(peer, std::path::Path::new(&text), "").await?;
+            } else {
+                tg.send_message(peer, &text).await?;
+            }
             println!("sent");
         }
 
@@ -615,7 +530,6 @@ async fn run() -> Result<()> {
                         name: name.clone(),
                         token,
                         username: me.username.clone(),
-                        topic_id: None,
                         instructions,
                         provider,
                         model,
@@ -642,7 +556,6 @@ async fn run() -> Result<()> {
                         name: name.clone(),
                         token,
                         username: me.username.clone(),
-                        topic_id: None,
                         instructions,
                         provider,
                         model: None,
@@ -653,34 +566,9 @@ async fn run() -> Result<()> {
                         me.username.unwrap_or_default()
                     );
                 }
-                BotCmd::Invite { username, group } => {
-                    let (tg, cfg) = authorized_tg().await?;
-                    let peer = tg.peer(&group_of(&cfg, group)?).await?;
-                    tg.invite_bot_admin(peer, &username).await?;
-                    println!("invited @{username} + granted admin");
-                }
-                BotCmd::Topic { name, title } => {
-                    let b = store.get_bot(&name)?.context("no such bot")?;
-                    let topic = b
-                        .topic_id
-                        .context("bot has no topic yet — run `verity serve` once")?;
-                    let group_id = Config::load()?.group_id.context("no group_id")?;
-                    BotApi::new(&b.token)
-                        .edit_forum_topic(group_id, topic, &title)
-                        .await?;
-                    println!("topic renamed to {title}");
-                }
                 BotCmd::Rename { name, new_name } => {
                     if !store.rename_bot(&name, &new_name)? {
                         bail!("no such bot");
-                    }
-                    if let Some(b) = store.get_bot(&new_name)? {
-                        if let Some(t) = b.topic_id {
-                            let gid = Config::load()?.group_id.context("no group_id")?;
-                            let _ = BotApi::new(&b.token)
-                                .edit_forum_topic(gid, t, &new_name)
-                                .await;
-                        }
                     }
                     println!("renamed {name} → {new_name} (restart serve to apply)");
                 }
@@ -690,14 +578,10 @@ async fn run() -> Result<()> {
                             .username
                             .map(|u| format!("@{u}"))
                             .unwrap_or_else(|| "-".into());
-                        let topic = b
-                            .topic_id
-                            .map(|t| t.to_string())
-                            .unwrap_or_else(|| "-".into());
                         let model = b.model.unwrap_or_else(|| "-".into());
                         println!(
-                            "{:<16} {:<24} topic={:<6} provider={} model={}",
-                            b.name, user, topic, b.provider, model
+                            "{:<16} {:<24} provider={} model={}",
+                            b.name, user, b.provider, model
                         );
                     }
                 }
@@ -799,28 +683,33 @@ async fn run() -> Result<()> {
         }
 
         Cmd::Backup => {
-            let cfg = Config::load()?;
-            let group_id = cfg
-                .group_id
-                .context("no group_id — `verity config --group-id`")?;
+            let (tg, _) = authorized_tg().await?;
+            let owner = tg.self_id().await?;
             let bot = Store::open(&Config::db_path()?)?
                 .primary_bot()?
                 .context("no bots registered — `verity bot new`")?;
-            let files = verity_core::backup::upload(&BotApi::new(&bot.token), group_id).await?;
-            println!("uploaded to General: {}", files.join(", "));
+            let files = verity_core::backup::upload(&BotApi::new(&bot.token), owner).await?;
+            println!("uploaded to your DM with {}: {}", bot.name, files.join(", "));
         }
 
-        Cmd::Restore { archive, group } => {
+        Cmd::Restore { archive, bot } => {
             let files = match &archive {
                 Some(a) => verity_core::backup::restore_arg(a).await?,
                 None => {
-                    let (tg, cfg) = authorized_tg().await?;
-                    let peer = tg.peer(&group_of(&cfg, group)?).await?;
+                    let (tg, _) = authorized_tg().await?;
+                    let store = Store::open(&Config::db_path()?)?;
+                    let bot = match &bot {
+                        Some(name) => find_bot(&store, name)?,
+                        None => store
+                            .primary_bot()?
+                            .context("no bots registered — pass an archive path/URL instead")?,
+                    };
+                    let peer = dm_peer(&tg, &bot).await?;
                     verity_core::backup::download(&tg, peer).await?
                 }
             };
             if files.is_empty() {
-                println!("no backup documents found in General");
+                println!("no backup documents found in the DM");
             } else {
                 println!(
                     "restored {} files into {}",
@@ -833,15 +722,29 @@ async fn run() -> Result<()> {
             }
         }
 
+        Cmd::GetSetupKey => {
+            let (tg, _) = authorized_tg().await?;
+            let owner = tg.self_id().await?;
+            let bot = Store::open(&Config::db_path()?)?
+                .primary_bot()?
+                .context("no bots registered — `verity bot new`")?;
+            let key =
+                verity_core::setupkey::issue(&BotApi::new(&bot.token), &bot.token, owner).await?;
+            eprintln!(
+                "archive uploaded to your DM with {} — the key below restores the whole \
+                 install on another machine (`verity --setupkey <key>`). It decrypts to your \
+                 full login + every bot token: keep it secret.",
+                bot.name
+            );
+            println!("{key}");
+        }
+
         Cmd::Watchdog => {
             verity_core::liveness::check().await?;
         }
 
         Cmd::Serve { echo, no_context } => {
             let cfg = Config::load()?;
-            let group_id = cfg
-                .group_id
-                .context("no group_id — `verity config --group-id`")?;
             // Per-bot provider string → harness. `--echo` overrides all.
             let pi_bin = cfg.pi_bin.clone();
             let make_harness: Arc<verity_core::bridge::MakeHarness> =
@@ -854,43 +757,45 @@ async fn run() -> Result<()> {
                         Arc::new(PiHarness::new(pi_bin.clone()))
                     }
                 });
-            // Attach the user session so turns can read the topic transcript.
+            // Attach the user session so turns can read the DM transcript.
             // Degrades gracefully to context-free turns when unavailable.
-            let (tg, tg_peer) = if no_context {
-                (None, None)
+            let tg = if no_context {
+                None
             } else {
                 match authorized_tg().await {
-                    Ok((tg, _)) => match tg.peer(&group_id.to_string()).await {
-                        Ok(peer) => (Some(Arc::new(tg)), Some(peer)),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "can't resolve group peer — no transcripts");
-                            (Some(Arc::new(tg)), None)
-                        }
-                    },
+                    Ok((tg, _)) => Some(Arc::new(tg)),
                     Err(e) => {
                         tracing::warn!(error = %e, "no user session — turns run without transcript");
-                        (None, None)
+                        None
                     }
                 }
             };
-            // Our user id gates bot DMs — without a session there is
-            // no trusted identity, so DMs stay ignored.
-            let owner_id = match &tg {
-                Some(tg) => match tg.self_id().await {
-                    Ok(id) => Some(id),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "get_me failed — bot DMs disabled");
-                        None
-                    }
+            // Our user id gates bot DMs. Normally it comes from the
+            // logged-in session; config owner_id / VERITY_OWNER_ID
+            // covers running with no user session at all.
+            let explicit = cfg
+                .owner_id
+                .or_else(|| std::env::var("VERITY_OWNER_ID").ok().and_then(|v| v.parse().ok()));
+            let owner_id = match explicit {
+                Some(id) => Some(id),
+                None => match &tg {
+                    Some(tg) => match tg.self_id().await {
+                        Ok(id) => Some(id),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "get_me failed — bot DMs disabled");
+                            None
+                        }
+                    },
+                    None => None,
                 },
-                None => None,
             };
+            if owner_id.is_none() {
+                tracing::warn!("no owner id — every DM will be ignored");
+            }
             let bridge = Bridge {
-                group_id,
                 db_path: Config::db_path()?,
                 make_harness,
                 tg,
-                tg_peer,
                 owner_id,
             };
             tokio::select! {
@@ -903,26 +808,18 @@ async fn run() -> Result<()> {
 
         Cmd::Send { bot, text, file } => {
             let store = Store::open(&Config::db_path()?)?;
-            let b = store.get_bot(&bot)?.context("no such bot")?;
-            let cfg = Config::load()?;
-            let group_id = cfg.group_id.context("no group_id")?;
-            let topic = b
-                .topic_id
-                .context("bot has no topic yet — run `verity serve` once")?;
+            let b = find_bot(&store, &bot)?;
+            let (tg, _) = authorized_tg().await?;
+            let owner = tg.self_id().await?;
             let api = BotApi::new(&b.token);
             if file {
-                api.send_document(group_id, std::path::Path::new(&text), None, Some(topic))
+                api.send_document(owner, std::path::Path::new(&text), None)
                     .await?;
             } else {
                 for part in verity_core::rich::split_markdown(&text, verity_core::rich::RICH_LIMIT)
                 {
-                    api.send_rich_message(
-                        group_id,
-                        InputRichMessage::markdown(&part),
-                        Some(topic),
-                        None,
-                    )
-                    .await?;
+                    api.send_rich_message(owner, InputRichMessage::markdown(&part), None)
+                        .await?;
                 }
             }
             println!("sent");
@@ -933,27 +830,7 @@ async fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{pfp_style, Cli, Cmd};
-    use clap::Parser;
-
-    #[test]
-    fn config_accepts_negative_group_id_as_separate_argument() {
-        let cli = Cli::try_parse_from([
-            "verity",
-            "config",
-            "--api-id",
-            "42",
-            "--api-hash",
-            "dummy",
-            "--group-id",
-            "-1001234567890",
-        ])
-        .unwrap();
-        let Cmd::Config { group_id, .. } = cli.cmd else {
-            panic!("expected config subcommand");
-        };
-        assert_eq!(group_id, Some(-1001234567890));
-    }
+    use super::pfp_style;
 
     #[test]
     fn random_pfp_replays_with_the_same_hue() {

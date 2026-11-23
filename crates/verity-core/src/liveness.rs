@@ -141,8 +141,8 @@ async fn unit_uptime(unit: &str) -> Option<Duration> {
 }
 
 /// Drop a death report into ~/verity/deaths — death-watch posts it to
-/// Healthity's topic. Same cause on the same day overwrites itself, so
-/// a restart loop can't flood the topic.
+/// Healthity's DM with the owner. Same cause on the same day overwrites
+/// itself, so a restart loop can't flood the chat.
 async fn report(slug: &str, body: &str) {
     let date = match tokio::process::Command::new("date")
         .arg("+%F")

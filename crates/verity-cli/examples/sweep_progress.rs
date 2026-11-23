@@ -19,8 +19,15 @@ async fn main() -> Result<()> {
 
     let store = Store::open(&Config::db_path()?)?;
     for bot in store.list_bots()? {
-        let Ok(peer) = tg.peer(&bot.name).await else {
-            eprintln!("{}: can't resolve peer, skipping", bot.name);
+        let uid = match verity_core::botapi::BotApi::new(&bot.token).get_me().await {
+            Ok(me) => me.id,
+            Err(e) => {
+                eprintln!("{}: getMe failed ({e}), skipping", bot.name);
+                continue;
+            }
+        };
+        let Ok(peer) = tg.peer_for_user(uid).await else {
+            eprintln!("{}: no DM, skipping", bot.name);
             continue;
         };
         let history = tg.dm_history(peer.clone(), 200).await?;

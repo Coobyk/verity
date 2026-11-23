@@ -1,11 +1,11 @@
-//! verity-gui — GPUI client. Reads and writes the bot supergroup as *you*
-//! (MTProto), so chat history comes straight from Telegram: no daemon
-//! required to read, and a typed message lands in the topic like one sent
-//! from any Telegram client.
+//! verity-gui — GPUI client. Reads and writes your 1:1 bot chats as
+//! *you* (MTProto), so history comes straight from Telegram: no daemon
+//! required to read, and a typed message lands in the bot's DM like one
+//! sent from any Telegram client.
 //!
-//! The DIRECT section lists your 1:1 chats with each registered bot —
-//! resolved out of your own dialogs, so anything `verity serve` or you
-//! ever said there shows up too.
+//! The sidebar lists your DM with each registered bot — resolved out of
+//! your own dialogs, so anything `verity serve` or you ever said there
+//! shows up too.
 //!
 //! A worker thread owns a tokio runtime + the grammers client; the view
 //! swaps commands and snapshots with it over std mpsc channels.
@@ -19,22 +19,20 @@ use gpui::*;
 use grammers_session::defs::PeerRef;
 use verity_core::botapi::BotApi;
 use verity_core::config::Config;
-use verity_core::mtproto::{split_math, Blk, FmtKind, FmtSpan, Tg, TgEvent, TopicInfo, TopicMessage};
+use verity_core::mtproto::{split_math, Blk, FmtKind, FmtSpan, Tg, TgEvent, TopicMessage};
 use verity_core::store::{Bot, Store};
 use verity_core::{Error, Result};
 
 /// What the transcript pane is showing.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Sel {
-    /// A forum topic in the host group, by topic id.
-    Topic(i64),
     /// Your 1:1 chat with a registered bot, by bot user id
     /// (negative = bot unresolvable, shown greyed).
     Dm(i64),
 }
 
 enum Cmd {
-    /// Re-list topics + DMs and re-fetch the selected view's messages.
+    /// Re-list DMs and re-fetch the selected view's messages.
     Refresh,
     /// Re-fetch only the selected view's messages (the live tick).
     Poll,
@@ -50,7 +48,7 @@ enum Cmd {
     },
 }
 
-/// One row of the DIRECT sidebar section.
+/// One row of the sidebar.
 #[derive(Clone)]
 struct DmRow {
     user_id: i64,
@@ -60,9 +58,8 @@ struct DmRow {
 }
 
 enum Ev {
-    /// Full refresh: topic list, DM list, current selection, its messages.
+    /// Full refresh: DM list, current selection, its messages.
     Snapshot {
-        topics: Vec<TopicInfo>,
         dms: Vec<DmRow>,
         selected: Option<Sel>,
         messages: Vec<TopicMessage>,
@@ -97,33 +94,22 @@ struct Dm {
     peer: Option<PeerRef>,
 }
 
-/// Build the DIRECT list: one row per registered bot. The bot's user id
-/// comes from group membership where possible, else from `getMe` on its
-/// token — the DM peer itself is your dialog with that user id, so only
-/// chats that actually exist resolve.
-async fn build_dms(tg: &Tg, group: PeerRef) -> Vec<Dm> {
-    let members: HashMap<String, i64> = tg
-        .list_bot_members(group)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|m| m.username.map(|u| (u.to_lowercase(), m.user_id)))
-        .collect();
-
+/// Build the sidebar: one row per registered bot. The bot's user id
+/// comes from `getMe` on its token — the DM peer itself is your dialog
+/// with that user id, so only chats that actually exist resolve.
+async fn build_dms(tg: &Tg) -> Vec<Dm> {
     let mut out = Vec::new();
     for b in roster() {
         let mut username = b.username.clone();
-        let mut user_id = username
-            .as_ref()
-            .and_then(|u| members.get(&u.to_lowercase()).copied());
-        // Not a group member (or no username on file): ask the Bot API —
-        // a registered bot's token always knows its own id.
-        if user_id.is_none() {
-            if let Ok(me) = BotApi::new(&b.token).get_me().await {
-                user_id = Some(me.id);
+        // Ask the Bot API — a registered bot's token always knows its
+        // own id.
+        let user_id = match BotApi::new(&b.token).get_me().await {
+            Ok(me) => {
                 username = username.or(me.username);
+                Some(me.id)
             }
-        }
+            Err(_) => None,
+        };
         let label = match username {
             Some(u) => format!("@{u}"),
             None => b.name.clone(),
@@ -131,7 +117,7 @@ async fn build_dms(tg: &Tg, group: PeerRef) -> Vec<Dm> {
         let dm = match user_id {
             // The 1:1 chat is one of your dialogs — resolve by bare id.
             Some(id) => {
-                let peer = tg.peer(&id.to_string()).await.ok();
+                let peer = tg.peer_for_user(id).await.ok();
                 Dm {
                     user_id: id,
                     label,
@@ -153,21 +139,15 @@ async fn build_dms(tg: &Tg, group: PeerRef) -> Vec<Dm> {
 
 /// Messages for `sel`; re-tries DM peer resolution on the way so a chat
 /// you opened since the last refresh shows up without a restart.
-async fn fetch_view(
-    tg: &Tg,
-    group: PeerRef,
-    dms: &mut [Dm],
-    sel: Sel,
-) -> Result<Vec<TopicMessage>> {
+async fn fetch_view(tg: &Tg, dms: &mut [Dm], sel: Sel) -> Result<Vec<TopicMessage>> {
     match sel {
-        Sel::Topic(id) => tg.topic_history(group, id, HISTORY).await,
         Sel::Dm(uid) => {
             let dm = dms
                 .iter_mut()
                 .find(|d| d.user_id == uid)
                 .ok_or_else(|| Error::Mtproto("bot is gone".into()))?;
             if dm.peer.is_none() && uid > 0 {
-                dm.peer = tg.peer(&uid.to_string()).await.ok();
+                dm.peer = tg.peer_for_user(uid).await.ok();
             }
             match dm.peer {
                 Some(p) => tg.dm_history(p, HISTORY).await,
@@ -177,52 +157,42 @@ async fn fetch_view(
     }
 }
 
-/// Re-list topics + DMs and re-fetch the selected view, emitting a Snapshot.
+/// Re-list DMs and re-fetch the selected view, emitting a Snapshot.
 async fn refresh_all(
     tg: &Tg,
-    group: PeerRef,
     dms: &mut Vec<Dm>,
     selected: &mut Option<Sel>,
     tx: &mpsc::Sender<Ev>,
 ) {
     let me = tg.self_id().await.ok();
-    match tg.list_topics(group).await {
-        Ok(topics) => {
-            *dms = build_dms(tg, group).await;
-            // Drop a selection whose target vanished.
-            let still_there = selected.is_some_and(|s| match s {
-                Sel::Topic(id) => topics.iter().any(|t| t.id == id),
-                Sel::Dm(uid) => dms.iter().any(|d| d.user_id == uid),
-            });
-            if !still_there {
-                *selected = topics.first().map(|t| Sel::Topic(t.id));
-            }
-            let messages = match *selected {
-                Some(s) => fetch_view(tg, group, dms, s).await.unwrap_or_default(),
-                None => vec![],
-            };
-            let _ = tx.send(Ev::Snapshot {
-                topics,
-                me,
-                dms: dms
-                    .iter()
-                    .map(|d| DmRow {
-                        user_id: d.user_id,
-                        label: d.label.clone(),
-                        available: d.peer.is_some(),
-                    })
-                    .collect(),
-                selected: *selected,
-                messages,
-            });
-        }
-        Err(e) => {
-            let _ = tx.send(Ev::Status(format!("topics: {e}")));
-        }
+    *dms = build_dms(tg).await;
+    // Drop a selection whose target vanished.
+    let still_there = selected.is_some_and(|s| match s {
+        Sel::Dm(uid) => dms.iter().any(|d| d.user_id == uid),
+    });
+    if !still_there {
+        *selected = dms.first().map(|d| Sel::Dm(d.user_id));
     }
+    let messages = match *selected {
+        Some(s) => fetch_view(tg, dms, s).await.unwrap_or_default(),
+        None => vec![],
+    };
+    let _ = tx.send(Ev::Snapshot {
+        me,
+        dms: dms
+            .iter()
+            .map(|d| DmRow {
+                user_id: d.user_id,
+                label: d.label.clone(),
+                available: d.peer.is_some(),
+            })
+            .collect(),
+        selected: *selected,
+        messages,
+    });
 }
 
-async fn worker(group: String, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Ev>) {
+async fn worker(rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Ev>) {
     macro_rules! status {
         ($($arg:tt)*) => {{
             let _ = tx.send(Ev::Status(format!($($arg)*)));
@@ -251,28 +221,20 @@ async fn worker(group: String, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Ev>) {
         Ok(false) => return status!("not logged in — run `verity login`"),
         Err(e) => return status!("auth: {e}"),
     }
-    let peer = match tg.peer(&group).await {
-        Ok(p) => p,
-        Err(e) => return status!("group: {e}"),
-    };
     status!("");
-
-    // Bot-API style id of the group — matches TgEvent::chat_hint so a
-    // pushed update can be mapped onto the selected view.
-    let group_hint = peer.id.bot_api_dialog_id();
 
     let mut dms: Vec<Dm> = Vec::new();
     let mut selected: Option<Sel> = None;
-    refresh_all(&tg, peer, &mut dms, &mut selected, &tx).await;
+    refresh_all(&tg, &mut dms, &mut selected, &tx).await;
 
     loop {
         match rx.try_recv() {
             Ok(cmd) => {
                 match cmd {
-                    Cmd::Refresh => refresh_all(&tg, peer, &mut dms, &mut selected, &tx).await,
+                    Cmd::Refresh => refresh_all(&tg, &mut dms, &mut selected, &tx).await,
                     Cmd::Poll => {
                         if let Some(s) = selected {
-                            match fetch_view(&tg, peer, &mut dms, s).await {
+                            match fetch_view(&tg, &mut dms, s).await {
                                 Ok(messages) => {
                                     let _ = tx.send(Ev::Messages { sel: s, messages });
                                 }
@@ -282,7 +244,7 @@ async fn worker(group: String, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Ev>) {
                     }
                     Cmd::Select(s) => {
                         selected = Some(s);
-                        match fetch_view(&tg, peer, &mut dms, s).await {
+                        match fetch_view(&tg, &mut dms, s).await {
                             Ok(messages) => {
                                 let _ = tx.send(Ev::Messages { sel: s, messages });
                             }
@@ -294,12 +256,10 @@ async fn worker(group: String, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Ev>) {
                             status!("nothing selected");
                             continue;
                         };
-                        // Topics get a threaded reply; DMs go straight to the bot.
                         let sent = match s {
-                            Sel::Topic(t) => tg.send_message(peer, Some(t), &text).await,
                             Sel::Dm(uid) => {
                                 match dms.iter().find(|d| d.user_id == uid).and_then(|d| d.peer) {
-                                    Some(p) => tg.send_message(p, None, &text).await,
+                                    Some(p) => tg.send_message(p, &text).await,
                                     None => Err(Error::Mtproto("no 1:1 chat to send into".into())),
                                 }
                             }
@@ -308,7 +268,7 @@ async fn worker(group: String, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Ev>) {
                             status!("send: {e}");
                             continue;
                         }
-                        match fetch_view(&tg, peer, &mut dms, s).await {
+                        match fetch_view(&tg, &mut dms, s).await {
                             Ok(messages) => {
                                 let _ = tx.send(Ev::Messages { sel: s, messages });
                             }
@@ -325,7 +285,6 @@ async fn worker(group: String, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Ev>) {
                             continue;
                         };
                         let target = match s {
-                            Sel::Topic(_) => Some(peer),
                             Sel::Dm(uid) => {
                                 dms.iter().find(|d| d.user_id == uid).and_then(|d| d.peer)
                             }
@@ -343,7 +302,7 @@ async fn worker(group: String, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Ev>) {
                                     status!("reaction: {e}");
                                     continue;
                                 }
-                                match fetch_view(&tg, peer, &mut dms, s).await {
+                                match fetch_view(&tg, &mut dms, s).await {
                                     Ok(messages) => {
                                         let _ = tx.send(Ev::Messages { sel: s, messages });
                                     }
@@ -369,20 +328,16 @@ async fn worker(group: String, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Ev>) {
             Ok(events) => {
                 let mut hit = false;
                 for ev in events {
-                    if let TgEvent::Message {
-                        chat_hint, topic, ..
-                    } = ev
-                    {
+                    if let TgEvent::Message { chat_hint, .. } = ev {
                         hit |= match selected {
-                            Some(Sel::Topic(t)) => chat_hint == group_hint && topic == Some(t),
-                            Some(Sel::Dm(u)) => chat_hint == u && topic.is_none(),
+                            Some(Sel::Dm(u)) => chat_hint == u,
                             None => false,
                         };
                     }
                 }
                 if hit {
                     if let Some(s) = selected {
-                        match fetch_view(&tg, peer, &mut dms, s).await {
+                        match fetch_view(&tg, &mut dms, s).await {
                             Ok(messages) => {
                                 let _ = tx.send(Ev::Messages { sel: s, messages });
                             }
@@ -459,7 +414,6 @@ fn reaction_chips(
 struct Root {
     cmd_tx: mpsc::Sender<Cmd>,
     ev_rx: mpsc::Receiver<Ev>,
-    topics: Vec<TopicInfo>,
     dms: Vec<DmRow>,
     selected: Option<Sel>,
     messages: Vec<TopicMessage>,
@@ -488,7 +442,6 @@ impl Root {
         let this = Self {
             cmd_tx,
             ev_rx,
-            topics: vec![],
             dms: vec![],
             selected: None,
             messages: vec![],
@@ -526,7 +479,7 @@ impl Root {
             math_cache: HashMap::new(),
         };
         // Pump worker events into view state; live-tick the selected
-        // view every ~3s, re-list topics + DMs every ~30s.
+        // view every ~3s, re-list DMs every ~30s.
         cx.spawn(async move |this: WeakEntity<Root>, cx: &mut AsyncApp| {
             let mut ticks = 0u32;
             loop {
@@ -566,13 +519,11 @@ impl Root {
             any = true;
             match ev {
                 Ev::Snapshot {
-                    topics,
                     dms,
                     selected,
                     messages,
                     me,
                 } => {
-                    self.topics = topics;
                     self.dms = dms;
                     self.me = me.or(self.me);
                     self.selected = selected;
@@ -790,13 +741,9 @@ impl Root {
         }
     }
 
-    /// Combined sidebar order — topics first, then DMs — for ↑/↓.
+    /// Sidebar order for ↑/↓.
     fn items(&self) -> Vec<Sel> {
-        self.topics
-            .iter()
-            .map(|t| Sel::Topic(t.id))
-            .chain(self.dms.iter().map(|d| Sel::Dm(d.user_id)))
-            .collect()
+        self.dms.iter().map(|d| Sel::Dm(d.user_id)).collect()
     }
 
     fn move_selection(&mut self, dir: i64, cx: &mut Context<Self>) {
@@ -847,15 +794,9 @@ impl Root {
         cx.notify();
     }
 
-    /// Title for the transcript header — topic title or @bot.
+    /// Title for the transcript header — the bot's @username.
     fn view_title(&self) -> String {
         match self.selected {
-            Some(Sel::Topic(id)) => self
-                .topics
-                .iter()
-                .find(|t| t.id == id)
-                .map(|t| t.title.clone())
-                .unwrap_or_else(|| "…".into()),
             Some(Sel::Dm(uid)) => self
                 .dms
                 .iter()
@@ -939,24 +880,7 @@ impl Render for Root {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("Verity"),
             )
-            .child(section("Topics"))
-            .children(self.topics.iter().map(|t| {
-                let id = t.id;
-                div()
-                    .id(ElementId::Name(format!("topic-{id}").into()))
-                    .mx_2()
-                    .px_3()
-                    .py_2()
-                    .rounded_lg()
-                    .cursor_pointer()
-                    .when(selected == Some(Sel::Topic(id)), |d| d.bg(selected_bg))
-                    .hover(|d| d.bg(hover_bg))
-                    .child(t.title.clone())
-                    .on_click(cx.listener(move |this, _ev: &ClickEvent, _w, cx| {
-                        this.select(Sel::Topic(id), cx);
-                    }))
-            }))
-            .child(section("Direct"))
+            .child(section("Bots"))
             .children(self.dms.iter().map(|d| {
                 let uid = d.user_id;
                 div()
@@ -1085,7 +1009,6 @@ impl Render for Root {
             );
 
         let hint = match self.selected {
-            Some(Sel::Topic(_)) => "Message this topic",
             Some(Sel::Dm(_)) => "Message the bot",
             None => "Select a conversation",
         };
@@ -1147,19 +1070,11 @@ impl Render for Root {
 }
 
 fn main() {
-    let group = std::env::args().nth(1).unwrap_or_else(|| {
-        Config::load()
-            .ok()
-            .and_then(|c| c.group_id)
-            .map(|g| g.to_string())
-            .unwrap_or_default()
-    });
-
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
     let (ev_tx, ev_rx) = mpsc::channel::<Ev>();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        rt.block_on(worker(group, cmd_rx, ev_tx));
+        rt.block_on(worker(cmd_rx, ev_tx));
     });
 
     Application::new().run(move |cx: &mut App| {
