@@ -111,6 +111,19 @@ enum Cmd {
     /// heartbeat went stale. Run by verity-watchdog.timer once a minute
     /// — honors `~/.local/state/verity-asleep` and a disabled unit
     Watchdog,
+    /// Fetch origin/main, fast-forward the tree, rebuild the release
+    /// binaries, then try-restart the bridge. Run by
+    /// verity-self-update.timer every ~15 min; a clean skip (offline,
+    /// mid-git-op, already current, ahead of origin) exits quietly
+    SelfUpdate,
+    /// Watch ~/verity/deaths for new reports and post them into your
+    /// DM as file documents. verity-death-watch.service runs it under
+    /// Restart=always
+    DeathWatch {
+        /// Roster name or @username of the bot reports are posted as
+        /// (default: the lead bot)
+        bot: Option<String>,
+    },
     /// Run the bridge: bots listen, work quietly, reply when done
     Serve {
         /// Use the echo harness (no agent provider needed)
@@ -741,6 +754,23 @@ async fn run() -> Result<()> {
 
         Cmd::Watchdog => {
             verity_core::liveness::check().await?;
+        }
+
+        Cmd::SelfUpdate => {
+            verity_core::selfupdate::run()?;
+        }
+
+        Cmd::DeathWatch { bot } => {
+            let store = Store::open(&Config::db_path()?)?;
+            let b = match &bot {
+                Some(name) => find_bot(&store, name)?,
+                None => store
+                    .primary_bot()?
+                    .context("no bots registered — `verity bot new`")?,
+            };
+            let (tg, _) = authorized_tg().await?;
+            let owner = tg.self_id().await?;
+            verity_core::deathwatch::watch(&BotApi::new(&b.token), owner).await?;
         }
 
         Cmd::Serve { echo, no_context } => {

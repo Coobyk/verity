@@ -1786,4 +1786,10 @@ mod tests {
         let reactions: Vec<&str> = calls
             .iter()
             .filter(|(m, _)| m == "setMessageReaction")
-            .filter_map(|(_, b)| b["reactio
+            .filter_map(|(_, b)| b["reaction"][0]["emoji"].as_str())
+            .collect();
+        assert_eq!(reactions, ["👀"], "👀 set, then cleared on plain reply");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

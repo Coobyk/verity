@@ -75,7 +75,7 @@ tokens — it's only as private as the group.
 
 ## Self-update
 
-`verity-self-update.timer` (user unit) runs `scripts/self-update.sh`
+`verity-self-update.timer` (user unit) runs `verity self-update`
 every ~15 min: fetch `origin/main`, fast-forward when the tree is
 clean and the histories haven't diverged, `cargo build --release`,
 then `try-restart verity.service` so the bridge picks up the new

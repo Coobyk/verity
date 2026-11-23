@@ -12,11 +12,13 @@ pub mod backup;
 pub mod botapi;
 pub mod bridge;
 pub mod config;
+pub mod deathwatch;
 pub mod error;
 pub mod harness;
 pub mod liveness;
 pub mod mtproto;
 pub mod rich;
+pub mod selfupdate;
 pub mod setupkey;
 pub mod store;
 
