@@ -1120,6 +1120,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn encrypted_archive_roundtrip_and_wrong_password_preserve_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("source");
+        let user_home = tmp.path().join("source-home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir_all(user_home.join(".local/state")).unwrap();
+        let payload = b"normal entry\0\xff";
+        std::fs::write(home.join("payload"), payload).unwrap();
+        std::fs::write(
+            user_home.join(".local/state/verity-path"),
+            format!("{}/verity", user_home.display()),
+        )
+        .unwrap();
+        let archive = tmp.path().join("setup.7z");
+        let password = Password::new("test archive password");
+        pack(&home, Some(&user_home), &[], &archive, &password, &[]).unwrap();
+
+        let out = tmp.path().join("out");
+        let out_home = tmp.path().join("out-home");
+        let files = extract(&archive, &out, Some(&out_home), &password).unwrap();
+        assert_eq!(files, ["payload", "_home/.local/state/verity-path"]);
+        let overlay = out_home.join(".local/state/verity-path");
+        let expected_overlay = format!("{}/verity", out_home.display());
+        assert_eq!(std::fs::read(out.join("payload")).unwrap(), payload);
+        assert_eq!(std::fs::read(&overlay).unwrap(), expected_overlay.as_bytes());
+
+        assert!(extract(&archive, &out, Some(&out_home), &Password::new("wrong")).is_err());
+        assert_eq!(std::fs::read(out.join("payload")).unwrap(), payload);
+        assert_eq!(std::fs::read(&overlay).unwrap(), expected_overlay.as_bytes());
+    }
+
     /// pack + extract round-trip: target/-wal/.part skipped, _home
     /// entries land under $HOME, path traversal entries are refused.
     #[test]
