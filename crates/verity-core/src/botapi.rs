@@ -275,6 +275,41 @@ impl BotApi {
         unwrap(resp)
     }
 
+    /// Upload an image as a photo (multipart) — displays inline, unlike
+    /// [`Self::send_document`].
+    pub async fn send_photo(
+        &self,
+        chat_id: i64,
+        path: &Path,
+        caption: Option<&str>,
+    ) -> Result<Message> {
+        let bytes = std::fs::read(path)?;
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("photo.png")
+            .to_string();
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part(
+                "photo",
+                reqwest::multipart::Part::bytes(bytes).file_name(name),
+            );
+        if let Some(c) = caption {
+            form = form.text("caption", c.to_string());
+        }
+        let url = format!("{}/bot{}/sendPhoto", self.base, self.token);
+        let resp: ApiResponse<Message> = self
+            .http
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await?
+            .json()
+            .await?;
+        unwrap(resp)
+    }
+
     /// `setMyProfilePhoto` — swap the bot's avatar. The photo ships as a
     /// multipart attachment referenced from the InputProfilePhoto JSON.
     pub async fn set_profile_photo(&self, png: Vec<u8>) -> Result<()> {

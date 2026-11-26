@@ -136,11 +136,14 @@ enum Cmd {
     /// Post into your DM with a bot, as the bot
     Send {
         bot: String,
-        /// Message text — or a path to upload as a document with --file
+        /// Message text — or a path to upload with --file/--photo
         text: String,
         /// Upload `text` as a file (sendDocument) instead of a message
         #[arg(long)]
         file: bool,
+        /// Upload `text` as a photo (sendPhoto) — shows inline
+        #[arg(long)]
+        photo: bool,
     },
 }
 
@@ -836,13 +839,21 @@ async fn run() -> Result<()> {
             }
         }
 
-        Cmd::Send { bot, text, file } => {
+        Cmd::Send {
+            bot,
+            text,
+            file,
+            photo,
+        } => {
             let store = Store::open(&Config::db_path()?)?;
             let b = find_bot(&store, &bot)?;
             let (tg, _) = authorized_tg().await?;
             let owner = tg.self_id().await?;
             let api = BotApi::new(&b.token);
-            if file {
+            if photo {
+                api.send_photo(owner, std::path::Path::new(&text), None)
+                    .await?;
+            } else if file {
                 api.send_document(owner, std::path::Path::new(&text), None)
                     .await?;
             } else {
