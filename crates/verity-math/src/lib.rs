@@ -27,8 +27,14 @@ static FONT_FILES: &[&[u8]] = &[
 /// Vendored typst sources — mitex spec package + a per-render body file.
 static SPEC_FILES: &[(&str, &str)] = &[
     ("specs/mod.typ", include_str!("../mitex-pkg/mod.typ")),
-    ("specs/prelude.typ", include_str!("../mitex-pkg/prelude.typ")),
-    ("specs/latex/standard.typ", include_str!("../mitex-pkg/latex/standard.typ")),
+    (
+        "specs/prelude.typ",
+        include_str!("../mitex-pkg/prelude.typ"),
+    ),
+    (
+        "specs/latex/standard.typ",
+        include_str!("../mitex-pkg/latex/standard.typ"),
+    ),
 ];
 
 fn file_id(path: &str) -> FileId {
@@ -121,9 +127,15 @@ pub fn render_latex(tex: &str, display: bool, density: f32, dark: bool) -> Resul
     // body.typ is eval'd as math — raw mitex output, no escaping needed.
     let world = MathWorld::new(main_src, typst_math);
     let warned = typst::compile::<PagedDocument>(&world);
-    let doc = warned
-        .output
-        .map_err(|e| format!("typst: {}", e.iter().map(|d| d.message.to_string()).collect::<Vec<_>>().join("; ")))?;
+    let doc = warned.output.map_err(|e| {
+        format!(
+            "typst: {}",
+            e.iter()
+                .map(|d| d.message.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    })?;
     let page = doc.pages().first().ok_or("empty doc")?;
     let opts = typst_render::RenderOptions {
         pixel_per_pt: typst::utils::Scalar::new((density.max(1.0) * 1.5) as f64),
@@ -165,7 +177,9 @@ pub extern "system" fn Java_sh_coobyk_verity_math_TypstBridge_lastError(
     _cls: JClass,
 ) -> jstring {
     let s = LAST_ERR.lock().unwrap().clone();
-    env.new_string(s).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    env.new_string(s)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 #[cfg(test)]

@@ -1161,7 +1161,7 @@ impl Tg {
         let mut prompt = self.wait_confirm(bf_ref, picker_id).await?;
         let mut photo_sent = false;
         for _ in 0..10 {
-            if prompt.contains(&format!("t.me/")) && prompt.contains(&format!("/{short_name}")) {
+            if prompt.contains("t.me/") && prompt.contains(&format!("/{short_name}")) {
                 return Ok(prompt);
             }
             let l = prompt.to_lowercase();
@@ -1515,28 +1515,24 @@ impl Tg {
             }
             input = match m.media() {
                 Some(Media::Sticker(s)) => Some(s.raw_attrs.stickerset.clone()),
-                Some(Media::Document(d)) => {
-                    match &d.raw.document {
-                        Some(tl::enums::Document::Document(doc)) => {
-                            doc.attributes.iter().find_map(|a| match a {
-                                tl::enums::DocumentAttribute::Sticker(s) => {
-                                    Some(s.stickerset.clone())
-                                }
-                                tl::enums::DocumentAttribute::CustomEmoji(s) => {
-                                    Some(s.stickerset.clone())
-                                }
-                                _ => None,
-                            })
-                        }
-                        _ => None,
+                Some(Media::Document(d)) => match &d.raw.document {
+                    Some(tl::enums::Document::Document(doc)) => {
+                        doc.attributes.iter().find_map(|a| match a {
+                            tl::enums::DocumentAttribute::Sticker(s) => Some(s.stickerset.clone()),
+                            tl::enums::DocumentAttribute::CustomEmoji(s) => {
+                                Some(s.stickerset.clone())
+                            }
+                            _ => None,
+                        })
                     }
-                }
+                    _ => None,
+                },
                 _ => None,
             };
             break;
         }
-        let stickerset = input
-            .ok_or_else(|| Error::Mtproto(format!("message {msg_id} isn't a sticker")))?;
+        let stickerset =
+            input.ok_or_else(|| Error::Mtproto(format!("message {msg_id} isn't a sticker")))?;
         let res = self
             .client
             .invoke(&tl::functions::messages::GetStickerSet {

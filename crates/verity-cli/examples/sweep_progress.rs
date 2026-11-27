@@ -35,8 +35,7 @@ async fn main() -> Result<()> {
             .iter()
             .filter(|m| {
                 m.text.starts_with('⏳')
-                    && (m.sender == bot.name
-                        || Some(m.sender.as_str()) == bot.username.as_deref())
+                    && (m.sender == bot.name || Some(m.sender.as_str()) == bot.username.as_deref())
             })
             .collect();
         if hits.is_empty() {

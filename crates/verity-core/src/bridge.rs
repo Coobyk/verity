@@ -550,15 +550,12 @@ async fn recover_pending(db: &Path, bot_name: &str) -> Vec<(i64, Option<i64>, St
 /// where DM turns live. Resolved once per bot, then cached in `env`.
 async fn dm_peer(env: &Env, api: &BotApi, bot: &Bot) -> Option<PeerRef> {
     if let Some(p) = env.dm_peers.lock().unwrap().get(&bot.name) {
-        return Some(p.clone());
+        return Some(*p);
     }
     let tg = env.tg.as_ref()?;
     let me = api.get_me().await.ok()?;
     let p = tg.peer(&me.id.to_string()).await.ok()?;
-    env.dm_peers
-        .lock()
-        .unwrap()
-        .insert(bot.name.clone(), p.clone());
+    env.dm_peers.lock().unwrap().insert(bot.name.clone(), p);
     Some(p)
 }
 
@@ -570,9 +567,7 @@ async fn ask_quiz(api: &BotApi, chat_id: i64, cmd: &str) {
     let ask = match cmd {
         "clear" => "Wipe my memory? Can't undo this.",
         "clearchat" => "Delete every message in this chat AND wipe my memory? Can't undo.",
-        "reset" => {
-            "Nuke EVERYTHING — every teammate bot but me, all memory? Can't undo."
-        }
+        "reset" => "Nuke EVERYTHING — every teammate bot but me, all memory? Can't undo.",
         _ => return,
     };
     // Quiz-confirm: pick the right answer among decoys.
@@ -618,7 +613,14 @@ async fn ask_quiz(api: &BotApi, chat_id: i64, cmd: &str) {
 /// Execute a confirmed destructive op (button click landed in the DM
 /// the quiz was posted in). `confirm_mid` is the prompt message to
 /// clean up after.
-async fn run_command(api: &BotApi, bot: &Bot, env: &Env, chat_id: i64, cmd: &str, confirm_mid: i64) {
+async fn run_command(
+    api: &BotApi,
+    bot: &Bot,
+    env: &Env,
+    chat_id: i64,
+    cmd: &str,
+    confirm_mid: i64,
+) {
     info!(bot = %bot.name, %cmd, "confirmed command executing");
     let n = bot.name.clone();
     let wipe = move |s: &Store| -> Result<()> {
@@ -1055,12 +1057,7 @@ fn extract_markers(reply: &str) -> (String, Markers) {
 /// Send a reply as one or more rich messages, falling back to plain text
 /// (again split at the cap) when rich parsing rejects the markdown.
 /// `reply_to` threads every part back to the triggering message.
-async fn send_reply(
-    api: &BotApi,
-    chat_id: i64,
-    reply: &str,
-    reply_to: Option<i64>,
-) -> Result<()> {
+async fn send_reply(api: &BotApi, chat_id: i64, reply: &str, reply_to: Option<i64>) -> Result<()> {
     for part in split_markdown(reply, RICH_LIMIT) {
         match api
             .send_rich_message(chat_id, InputRichMessage::markdown(&part), reply_to)
@@ -1071,10 +1068,7 @@ async fn send_reply(
                 warn!(error = %e, "rich send failed, falling back to text");
                 for chunk in split_markdown(&part, TEXT_LIMIT) {
                     // Legacy markdown render first; raw text last resort.
-                    if let Err(e) = api
-                        .send_markdown_message(chat_id, &chunk, reply_to)
-                        .await
-                    {
+                    if let Err(e) = api.send_markdown_message(chat_id, &chunk, reply_to).await {
                         warn!(error = %e, "legacy markdown send failed, sending raw");
                         api.send_message(chat_id, &chunk, reply_to).await?;
                     }
@@ -1396,9 +1390,7 @@ async fn do_turn(
                             )
                         }
                     };
-                    let _ = api
-                        .send_markdown_message(chat_id, &note, reply_to)
-                        .await;
+                    let _ = api.send_markdown_message(chat_id, &note, reply_to).await;
                 }
                 _ => warn!(bot = %bot.name, teammate = %name, "tell: unknown teammate"),
             }
@@ -1428,9 +1420,7 @@ async fn do_turn(
             Ok(u) => format!("🤖 *{name}* registered (@{u}) — /start its DM to chat"),
             Err(e) => format!("⚠️ couldn't register *{name}*: {e}"),
         };
-        let _ = api
-            .send_markdown_message(chat_id, &note, reply_to)
-            .await;
+        let _ = api.send_markdown_message(chat_id, &note, reply_to).await;
     }
     Ok(TurnOutcome {
         helpers: !markers.spawn.is_empty(),
@@ -1589,7 +1579,7 @@ mod tests {
 
     /// A bare-bones mock of the Bot API HTTP surface: records each method
     /// + body and answers with canned results — enough to drive a whole
-    /// turn without Telegram.
+    ///   turn without Telegram.
     struct MockApi {
         base: String,
         calls: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
@@ -1630,7 +1620,7 @@ mod tests {
                         .to_lowercase()
                         .split("content-length:")
                         .nth(1)
-                        .and_then(|s| s.trim_start().split_whitespace().next())
+                        .and_then(|s| s.split_whitespace().next())
                         .and_then(|s| s.parse::<usize>().ok())
                         .unwrap_or(0);
                     while buf.len() < header_end + len {
@@ -1708,7 +1698,13 @@ mod tests {
         });
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if mock.calls.lock().unwrap().iter().any(|(m, _)| m == "setMessageReaction") {
+                if mock
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(m, _)| m == "setMessageReaction")
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;

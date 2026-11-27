@@ -64,7 +64,7 @@ const RESTORE_SCAN: usize = 500;
 /// the Bot API's 20MB getFile ceiling, and dev trees don't help a
 /// restored machine run (the repo re-clones, the binary ships).
 fn skip(path: &Path, name: &str, skip_dirs: &[&str]) -> bool {
-    (path.is_dir() && (name == "target" || skip_dirs.iter().any(|d| *d == name)))
+    (path.is_dir() && (name == "target" || skip_dirs.contains(&name)))
         || name.ends_with("-wal")
         || name.ends_with("-shm")
         || name.ends_with(".part")
@@ -154,7 +154,14 @@ async fn stage_archive(
         let skips: Vec<String> = skip_dirs.iter().map(|s| s.to_string()).collect();
         tokio::task::spawn_blocking(move || {
             let skip_refs: Vec<&str> = skips.iter().map(|s| s.as_str()).collect();
-            pack(&home2, user_home.as_deref(), &snaps, &archive2, &pw, &skip_refs)
+            pack(
+                &home2,
+                user_home.as_deref(),
+                &snaps,
+                &archive2,
+                &pw,
+                &skip_refs,
+            )
         })
         .await
         .map_err(|e| Error::Other(e.to_string()))??;
@@ -395,11 +402,9 @@ pub async fn restore_setup(api: &BotApi, file_id: &str, password: &str) -> Resul
         let home = Config::home()?;
         let user_home = dirs::home_dir();
         let pw = Password::new(password);
-        tokio::task::spawn_blocking(move || {
-            extract(&archive, &home, user_home.as_deref(), &pw)
-        })
-        .await
-        .map_err(|e| Error::Other(e.to_string()))?
+        tokio::task::spawn_blocking(move || extract(&archive, &home, user_home.as_deref(), &pw))
+            .await
+            .map_err(|e| Error::Other(e.to_string()))?
     }
     .await;
     let _ = std::fs::remove_dir_all(&stage);
@@ -662,21 +667,23 @@ impl RestoreChange {
                 std::io::Error::new(std::io::ErrorKind::NotFound, "no staging directory")
             })?;
         let dir = restore_staging_dir(parent)?;
-        let mut builder = tempfile::Builder::new();
+        let builder = tempfile::Builder::new();
         let original_mode = std::fs::symlink_metadata(&dest)
             .ok()
             .filter(|meta| meta.is_file())
             .map(|meta| meta.permissions());
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::PermissionsExt;
             let mode = if LEGACY_FILES.contains(&name) || original_mode.is_some() {
                 0o600
             } else {
                 0o666
             };
+            let mut builder = builder;
             builder.permissions(std::fs::Permissions::from_mode(mode));
-        }
+            builder
+        };
         let mut staged = builder.tempfile_in(dir.path())?;
         staged.write_all(data)?;
         if name == SERVE_BIN {
@@ -1063,7 +1070,15 @@ mod tests {
         .unwrap();
 
         let archive = tmp.join("verity-backup-1.7z");
-        pack(&home, Some(&user_home), &[], &archive, &Password::empty(), &[]).unwrap();
+        pack(
+            &home,
+            Some(&user_home),
+            &[],
+            &archive,
+            &Password::empty(),
+            &[],
+        )
+        .unwrap();
 
         // _home overlay and a hostile entry, added by hand.
         {
@@ -1116,7 +1131,13 @@ mod tests {
         );
 
         // Hostile entries are refused.
-        let hostile = extract(&tmp.join("extra.7z"), &out, Some(&out_home), &Password::empty()).unwrap();
+        let hostile = extract(
+            &tmp.join("extra.7z"),
+            &out,
+            Some(&out_home),
+            &Password::empty(),
+        )
+        .unwrap();
         assert!(!tmp.join("escape.txt").exists());
         assert!(!hostile.iter().any(|n| n.contains("..")));
 

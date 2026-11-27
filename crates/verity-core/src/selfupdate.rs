@@ -1,12 +1,14 @@
 //! Self-update: `verity self-update` — fetch `origin/main`, fast-forward
-//! the working tree, rebuild the release binaries, then `try-restart`
-//! the bridge so it picks up the new code. `verity-self-update.timer`
-//! runs it every ~15 min; output lands in the journal
-//! (`journalctl --user -u verity-self-update`).
+//! the working tree, rebuild the release binaries, then recycle the bridge
+//! so it picks up the new code. systemd's `try-restart` is used when
+//! available; otherwise a restart request is left for the portable
+//! `verity supervise` process. `verity-self-update.timer` can still run it
+//! every ~15 min, and `verity supervise --self-update` provides the same
+//! cadence without systemd.
 //!
 //! Unlike a shell script, the running binary can't be rewritten out
-//! from under itself by the pull — the kernel pins the old inode — so
-//! there is no re-exec dance here.
+//! from under itself by the pull on unix-like systems — the kernel pins
+//! the old inode — so there is no re-exec dance here.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -110,22 +112,27 @@ pub fn run() -> Result<()> {
         .status()?
         .success()
     {
-        return Err(Error::Other("build failed — old binary keeps running".into()));
+        return Err(Error::Other(
+            "build failed — old binary keeps running".into(),
+        ));
     }
 
-    // try-restart only touches an active bridge; an asleep/stopped unit
-    // stays down and picks up the new binary on its next start.
-    if Command::new("systemctl")
+    // systemd gets the first chance because try-restart only touches an
+    // active bridge. Without systemd (or without the unit), leave a restart
+    // request for the portable supervisor instead of failing the update.
+    let systemd_restarted = Command::new("systemctl")
         .args(["--user", "try-restart", "verity.service"])
-        .status()?
-        .success()
-    {
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if systemd_restarted {
         log(&format!(
             "bridge restarted on {}",
             git_stdout(&repo, &["rev-parse", "--short", "HEAD"])?
         ));
-        Ok(())
     } else {
-        Err(Error::Other("restart failed".into()))
+        crate::supervisor::request_restart()?;
+        log("no systemd restart — requested a portable supervisor restart");
     }
+    Ok(())
 }

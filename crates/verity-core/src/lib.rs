@@ -21,6 +21,7 @@ pub mod rich;
 pub mod selfupdate;
 pub mod setupkey;
 pub mod store;
+pub mod supervisor;
 
 pub use verity_pfp as pfp;
 

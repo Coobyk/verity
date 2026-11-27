@@ -235,6 +235,7 @@ fn turn_timeout() -> Duration {
 /// dev servers the agent spawned) running as orphans.
 struct ChildGroup {
     child: tokio::process::Child,
+    #[cfg_attr(not(unix), allow(dead_code))]
     pid: Option<u32>,
 }
 
@@ -624,8 +625,7 @@ fn truncate(s: &str, max: usize) -> String {
 fn strip_thinking(s: &str) -> String {
     let mut out = s.to_string();
     for (open, close) in [("<think>", "</think>"), ("<thinking>", "</thinking>")] {
-        loop {
-            let Some(start) = out.find(open) else { break };
+        while let Some(start) = out.find(open) {
             let Some(end) = out[start + open.len()..].find(close) else {
                 out.truncate(start);
                 break;

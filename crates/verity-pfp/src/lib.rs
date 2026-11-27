@@ -18,7 +18,7 @@ pub enum PfpError {
 
 impl From<PfpError> for std::io::Error {
     fn from(e: PfpError) -> Self {
-        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+        std::io::Error::other(e.to_string())
     }
 }
 
@@ -160,8 +160,10 @@ pub fn render_opts(seed: u64, size: u32, hue: Option<f64>) -> Result<Vec<u8>> {
         .ok_or_else(|| PfpError::Other("pfp: pixmap alloc failed".into()))?;
     px.fill(Color::from_rgba8(bgc.0, bgc.1, bgc.2, 255));
 
-    let mut paint = Paint::default();
-    paint.anti_alias = true;
+    let mut paint = Paint {
+        anti_alias: true,
+        ..Default::default()
+    };
     let k = (s / MW as f64) as f32;
 
     // body — one path of all traced loops; near-black, or one solid
@@ -274,8 +276,10 @@ fn blur(f: &mut [f32], w: usize, r: usize) {
 /// field as closed loops (grid coords).
 fn trace(f: &[f32], mw: usize) -> Vec<Vec<(f64, f64)>> {
     use std::collections::HashMap;
+    type Point = (f64, f64);
+    type Segment = (usize, usize, Point, Point);
     // edge ids: horizontal h(x,y) → y*mw+x; vertical v(x,y) → mw² + y*mw+x
-    let mut segs: Vec<(usize, usize, (f64, f64), (f64, f64))> = vec![];
+    let mut segs: Vec<Segment> = vec![];
     let mut by_edge: HashMap<usize, Vec<usize>> = HashMap::new();
     let interp = |va: f32, vb: f32| ((0.5 - va) / (vb - va)).clamp(0.0, 1.0) as f64;
     let pts_of = |f: &[f32], e: usize| -> (f64, f64) {

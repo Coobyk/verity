@@ -112,9 +112,9 @@ enum Cmd {
     /// — honors `~/.local/state/verity-asleep` and a disabled unit
     Watchdog,
     /// Fetch origin/main, fast-forward the tree, rebuild the release
-    /// binaries, then try-restart the bridge. Run by
-    /// verity-self-update.timer every ~15 min; a clean skip (offline,
-    /// mid-git-op, already current, ahead of origin) exits quietly
+    /// binaries, then recycle the bridge through systemd when present or
+    /// a portable supervisor restart request otherwise. A clean skip
+    /// (offline, mid-git-op, already current, ahead of origin) exits quietly
     SelfUpdate,
     /// Watch ~/verity/deaths for new reports and post them into your
     /// DM as file documents. verity-death-watch.service runs it under
@@ -132,6 +132,22 @@ enum Cmd {
         /// Don't attach the user session — turns get no DM transcript
         #[arg(long)]
         no_context: bool,
+    },
+    /// Run serve under a portable supervisor — restarts crashes and stale
+    /// processes without requiring systemd
+    Supervise {
+        /// Use the echo harness in the supervised serve child
+        #[arg(long)]
+        echo: bool,
+        /// Don't attach the user session in the supervised serve child
+        #[arg(long)]
+        no_context: bool,
+        /// Periodically fetch origin/main, rebuild, and recycle serve
+        #[arg(long)]
+        self_update: bool,
+        /// Seconds between self-update passes when --self-update is set
+        #[arg(long, default_value_t = 900)]
+        self_update_every: u64,
     },
     /// Post into your DM with a bot, as the bot
     Send {
@@ -705,7 +721,11 @@ async fn run() -> Result<()> {
                 .primary_bot()?
                 .context("no bots registered — `verity bot new`")?;
             let files = verity_core::backup::upload(&BotApi::new(&bot.token), owner).await?;
-            println!("uploaded to your DM with {}: {}", bot.name, files.join(", "));
+            println!(
+                "uploaded to your DM with {}: {}",
+                bot.name,
+                files.join(", ")
+            );
         }
 
         Cmd::Restore { archive, bot } => {
@@ -806,9 +826,11 @@ async fn run() -> Result<()> {
             // Our user id gates bot DMs. Normally it comes from the
             // logged-in session; config owner_id / VERITY_OWNER_ID
             // covers running with no user session at all.
-            let explicit = cfg
-                .owner_id
-                .or_else(|| std::env::var("VERITY_OWNER_ID").ok().and_then(|v| v.parse().ok()));
+            let explicit = cfg.owner_id.or_else(|| {
+                std::env::var("VERITY_OWNER_ID")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            });
             let owner_id = match explicit {
                 Some(id) => Some(id),
                 None => match &tg {
@@ -837,6 +859,27 @@ async fn run() -> Result<()> {
                     tracing::info!("shutting down");
                 }
             }
+        }
+
+        Cmd::Supervise {
+            echo,
+            no_context,
+            self_update,
+            self_update_every,
+        } => {
+            let mut serve_args = Vec::new();
+            if echo {
+                serve_args.push("--echo".to_string());
+            }
+            if no_context {
+                serve_args.push("--no-context".to_string());
+            }
+            verity_core::supervisor::run(verity_core::supervisor::Options {
+                serve_args,
+                self_update_every: self_update
+                    .then(|| std::time::Duration::from_secs(self_update_every.max(60))),
+            })
+            .await?;
         }
 
         Cmd::Send {

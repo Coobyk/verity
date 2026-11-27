@@ -21,7 +21,7 @@ const FLUSH_EVERY: Duration = Duration::from_secs(15);
 /// A newest-beat this old means the writer is dead. Comfortably above
 /// the worst healthy gap: the 75 s getUpdates timeout plus a turn of
 /// bookkeeping, and conflict-backoff sleeps are chunked under it.
-const STALE_AFTER: Duration = Duration::from_secs(150);
+pub const STALE_AFTER: Duration = Duration::from_secs(150);
 
 fn now() -> u64 {
     SystemTime::now()
@@ -48,6 +48,19 @@ pub fn asleep_path() -> PathBuf {
     state_dir().join("verity-asleep")
 }
 
+/// `~/.local/state/verity-restart` — written by self-update when no
+/// systemd restart path is available; a portable supervisor consumes it.
+pub fn restart_request_path() -> PathBuf {
+    state_dir().join("verity-restart")
+}
+
+/// Consume a pending portable-restart request. Missing files are normal;
+/// unreadable ones are treated as absent so a bad state file can't wedge
+/// the supervisor loop.
+pub fn take_restart_request() -> bool {
+    std::fs::remove_file(restart_request_path()).is_ok()
+}
+
 /// Sign-of-life registry: each bot loop and the supervisor beat under
 /// their own name; the flusher persists the map for the watchdog.
 #[derive(Clone, Default)]
@@ -58,10 +71,7 @@ pub struct Heartbeat {
 impl Heartbeat {
     /// Record a sign of life from `who` — a bot name or "_supervisor".
     pub fn beat(&self, who: &str) {
-        self.beats
-            .lock()
-            .unwrap()
-            .insert(who.to_string(), now());
+        self.beats.lock().unwrap().insert(who.to_string(), now());
     }
 
     /// Persist beats every `FLUSH_EVERY` until the process exits, and

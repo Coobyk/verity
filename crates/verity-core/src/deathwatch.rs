@@ -27,19 +27,16 @@ pub async fn watch(api: &BotApi, owner: i64) -> Result<()> {
     std::fs::create_dir_all(state_dir())?;
     // Union the legacy Healthity-era ledger so already-posted reports
     // aren't sent again after the rename.
-    let mut sent: BTreeSet<String> = [
-        state_dir().join("verity-healthity-sent"),
-        state.clone(),
-    ]
-    .iter()
-    .flat_map(|p| {
-        std::fs::read_to_string(p)
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    })
-    .collect();
+    let mut sent: BTreeSet<String> = [state_dir().join("verity-healthity-sent"), state.clone()]
+        .iter()
+        .flat_map(|p| {
+            std::fs::read_to_string(p)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect();
     loop {
         let mut names: Vec<PathBuf> = std::fs::read_dir(&deaths)
             .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect())

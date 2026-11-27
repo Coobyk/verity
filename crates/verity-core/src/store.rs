@@ -403,7 +403,10 @@ mod tests {
                 .unwrap();
             assert_eq!(stmt.next().unwrap(), State::Row);
             let default = stmt.read::<String, _>(0).unwrap();
-            assert!(!default.contains("unixepoch"), "{table}.{column}: {default}");
+            assert!(
+                !default.contains("unixepoch"),
+                "{table}.{column}: {default}"
+            );
         }
     }
 

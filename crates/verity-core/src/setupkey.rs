@@ -81,8 +81,7 @@ fn new_password() -> String {
             .map(|d| d.as_nanos())
             .unwrap_or(0x9e3779b97f4a7c15);
         for (i, v) in b.iter_mut().enumerate() {
-            *v = (n >> ((i % 16) * 8)) as u8
-                ^ (std::process::id() as u8).wrapping_mul(i as u8 + 1);
+            *v = (n >> ((i % 16) * 8)) as u8 ^ (std::process::id() as u8).wrapping_mul(i as u8 + 1);
         }
     }
     b64().encode(b)
@@ -101,9 +100,15 @@ mod tests {
             f: "file_id".into(),
             p: "pw".into(),
         };
-        let s = format!("{PREFIX}{}", b64().encode(serde_json::to_string(&k).unwrap()));
+        let s = format!(
+            "{PREFIX}{}",
+            b64().encode(serde_json::to_string(&k).unwrap())
+        );
         let k2 = decode(&format!("  {s}\n")).unwrap();
-        assert_eq!((k2.t, k2.f, k2.p), ("123:abc".into(), "file_id".into(), "pw".into()));
+        assert_eq!(
+            (k2.t, k2.f, k2.p),
+            ("123:abc".into(), "file_id".into(), "pw".into())
+        );
 
         assert!(decode("not-a-key").is_err());
         assert!(decode("vsk1.!!!").is_err());
