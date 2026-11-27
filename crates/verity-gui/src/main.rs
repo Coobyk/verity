@@ -19,7 +19,9 @@ use gpui::*;
 use grammers_session::defs::PeerRef;
 use verity_core::botapi::BotApi;
 use verity_core::config::Config;
-use verity_core::mtproto::{split_math, Blk, FmtKind, FmtSpan, Tg, TgEvent, TopicMessage};
+use verity_core::mtproto::{
+    split_math, Blk, FmtKind, FmtSpan, LoginCodeResult, Tg, TgEvent, TopicMessage,
+};
 use verity_core::store::{Bot, Store};
 use verity_core::{Error, Result};
 
@@ -46,6 +48,28 @@ enum Cmd {
         emoji: String,
         chosen: bool,
     },
+    /// Save Telegram API credentials entered in the onboarding form.
+    Configure { api_id: String, api_hash: String },
+    /// Start Telegram login for a phone number.
+    LoginPhone(String),
+    /// Submit a login code; the literal string `resend` re-delivers it.
+    LoginCode(String),
+    /// Submit a two-factor password after the login code is accepted.
+    LoginPassword(String),
+}
+
+/// Which onboarding field currently owns the composer-style input.
+#[derive(Clone, PartialEq)]
+enum LoginStep {
+    ApiId,
+    ApiHash,
+    Phone,
+    Code {
+        delivery: String,
+        resend: Option<String>,
+    },
+    Password,
+    Busy,
 }
 
 /// One row of the sidebar.
@@ -73,6 +97,19 @@ enum Ev {
     },
     /// One-line status / error for the footer.
     Status(String),
+    /// Telegram API credentials are missing or invalid.
+    NeedApiKeys,
+    /// The session exists but no user is logged in.
+    NeedPhone,
+    /// Telegram sent a login code; `resend` means another channel exists.
+    NeedCode {
+        delivery: String,
+        resend: Option<String>,
+    },
+    /// The account's two-factor password is required.
+    NeedPassword,
+    /// Login finished; ordinary chat mode can begin.
+    LoggedIn,
 }
 
 const HISTORY: i32 = 100;
@@ -192,6 +229,161 @@ async fn refresh_all(
     });
 }
 
+/// Receive one command without blocking the tokio runtime. The command
+/// channel is std-mpsc because the GPUI view is sync, so poll it gently.
+async fn next_cmd(rx: &mpsc::Receiver<Cmd>) -> Option<Cmd> {
+    loop {
+        match rx.try_recv() {
+            Ok(cmd) => return Some(cmd),
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => return None,
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Load API credentials, asking through the GUI and saving `config.toml`
+/// when they are missing. Environment-provided credentials still win via
+/// `Config::api_credentials`.
+async fn ensure_api_credentials(
+    rx: &mpsc::Receiver<Cmd>,
+    tx: &mpsc::Sender<Ev>,
+) -> Option<(i32, String)> {
+    let mut cfg = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(Ev::Status(format!("config: {e}")));
+            return None;
+        }
+    };
+    loop {
+        if let Ok(creds) = cfg.api_credentials() {
+            return Some(creds);
+        }
+        let _ = tx.send(Ev::NeedApiKeys);
+        let _ = tx.send(Ev::Status("Telegram API credentials needed".into()));
+        loop {
+            let cmd = next_cmd(rx).await?;
+            if let Cmd::Configure { api_id, api_hash } = cmd {
+                let api_id = match api_id.trim().parse::<i32>() {
+                    Ok(v) if v > 0 => v,
+                    _ => {
+                        let _ = tx.send(Ev::Status("api_id must be a positive number".into()));
+                        continue;
+                    }
+                };
+                let api_hash = api_hash.trim().to_string();
+                if api_hash.is_empty() {
+                    let _ = tx.send(Ev::Status("api_hash cannot be empty".into()));
+                    continue;
+                }
+                cfg.api_id = Some(api_id);
+                cfg.api_hash = Some(api_hash);
+                match cfg.save() {
+                    Ok(()) => {
+                        let _ = tx.send(Ev::Status("API credentials saved".into()));
+                        break;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Ev::Status(format!("save config: {e}")));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Interactive Telegram login driven by GUI prompts rather than stdin.
+/// Returns true once the session is authorized.
+async fn telegram_login(tg: &Tg, rx: &mpsc::Receiver<Cmd>, tx: &mpsc::Sender<Ev>) -> bool {
+    macro_rules! status {
+        ($($arg:tt)*) => {{
+            let _ = tx.send(Ev::Status(format!($($arg)*)));
+        }};
+    }
+
+    'phone: loop {
+        let _ = tx.send(Ev::NeedPhone);
+        let phone = loop {
+            match next_cmd(rx).await {
+                Some(Cmd::LoginPhone(phone)) if !phone.trim().is_empty() => {
+                    break phone.trim().to_string()
+                }
+                Some(_) => {}
+                None => return false,
+            }
+        };
+
+        status!("sending login code…");
+        let mut challenge = match tg.login_send_code(&phone).await {
+            Ok(c) => c,
+            Err(e) => {
+                status!("send code: {e}");
+                continue 'phone;
+            }
+        };
+
+        'code: loop {
+            let _ = tx.send(Ev::NeedCode {
+                delivery: challenge.delivery.clone(),
+                resend: challenge.next_delivery.clone(),
+            });
+            let input = loop {
+                match next_cmd(rx).await {
+                    Some(Cmd::LoginCode(input)) if !input.trim().is_empty() => {
+                        break input.trim().to_string()
+                    }
+                    Some(Cmd::LoginPhone(_)) => continue 'phone,
+                    Some(_) => {}
+                    None => return false,
+                }
+            };
+
+            if input.eq_ignore_ascii_case("resend") {
+                status!("resending login code…");
+                match tg.login_resend_code(&phone, &challenge).await {
+                    Ok(c) => {
+                        challenge = c;
+                        status!("code resent");
+                    }
+                    Err(e) => status!("resend: {e}"),
+                }
+                continue 'code;
+            }
+
+            status!("checking login code…");
+            match tg.login_submit_code(&phone, &challenge, &input).await {
+                Ok(LoginCodeResult::Done) => {
+                    let _ = tx.send(Ev::LoggedIn);
+                    return true;
+                }
+                Ok(LoginCodeResult::PasswordNeeded) => loop {
+                    let _ = tx.send(Ev::NeedPassword);
+                    let password = loop {
+                        match next_cmd(rx).await {
+                            Some(Cmd::LoginPassword(pw)) if !pw.is_empty() => break pw,
+                            Some(_) => {}
+                            None => return false,
+                        }
+                    };
+                    status!("checking 2FA password…");
+                    match tg.login_submit_password(&password).await {
+                        Ok(()) => {
+                            let _ = tx.send(Ev::LoggedIn);
+                            return true;
+                        }
+                        Err(e) => status!("2FA: {e}"),
+                    }
+                },
+                Err(e) => {
+                    status!("{e}");
+                    continue 'code;
+                }
+            }
+        }
+    }
+}
+
 async fn worker(rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Ev>) {
     macro_rules! status {
         ($($arg:tt)*) => {{
@@ -200,13 +392,8 @@ async fn worker(rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Ev>) {
     }
 
     status!("connecting…");
-    let cfg = match Config::load() {
-        Ok(c) => c,
-        Err(e) => return status!("config: {e}"),
-    };
-    let (api_id, api_hash) = match cfg.api_credentials() {
-        Ok(v) => v,
-        Err(_) => return status!("no api credentials — run `verity config`"),
+    let Some((api_id, api_hash)) = ensure_api_credentials(&rx, &tx).await else {
+        return;
     };
     let path = match Config::session_path() {
         Ok(p) => p,
@@ -218,9 +405,24 @@ async fn worker(rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Ev>) {
     };
     match tg.is_authorized().await {
         Ok(true) => {}
-        Ok(false) => return status!("not logged in — run `verity login`"),
+        Ok(false) => {
+            if !telegram_login(&tg, &rx, &tx).await {
+                return;
+            }
+            match Config::session_path() {
+                Ok(path) => {
+                    if let Err(e) = tg.save_session(&path) {
+                        status!("save session: {e}");
+                    }
+                }
+                Err(e) => status!("save session: {e}"),
+            }
+        }
         Err(e) => return status!("auth: {e}"),
     }
+    // Whether the session was already authorized or the onboarding flow
+    // just finished, the GUI can leave login mode now.
+    let _ = tx.send(Ev::LoggedIn);
     status!("");
 
     let mut dms: Vec<Dm> = Vec::new();
@@ -311,6 +513,12 @@ async fn worker(rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Ev>) {
                             }
                             None => status!("no 1:1 chat to react in"),
                         }
+                    }
+                    Cmd::Configure { .. }
+                    | Cmd::LoginPhone(_)
+                    | Cmd::LoginCode(_)
+                    | Cmd::LoginPassword(_) => {
+                        status!("already logged in");
                     }
                 }
                 // Keep draining queued commands before the next tick.
@@ -421,6 +629,10 @@ struct Root {
     me: Option<i64>,
     input: String,
     status: String,
+    /// Active onboarding/login field; `None` means ordinary chat input.
+    login_step: Option<LoginStep>,
+    /// API id carried from the first onboarding field to the second.
+    login_api_id: Option<String>,
     /// Id of the newest message shown — auto-scroll only on arrivals.
     last_msg: Option<i32>,
     /// A Poll is in flight — don't stack another on top of it.
@@ -448,6 +660,8 @@ impl Root {
             me: None,
             input: String::new(),
             status: "connecting…".into(),
+            login_step: None,
+            login_api_id: None,
             last_msg: None,
             awaiting: false,
             focus_handle: cx.focus_handle(),
@@ -487,17 +701,19 @@ impl Root {
                     .timer(Duration::from_millis(250))
                     .await;
                 ticks += 1;
-                let poll = ticks % 12 == 0;
-                let refresh = ticks % 120 == 0;
+                let poll = ticks.is_multiple_of(12);
+                let refresh = ticks.is_multiple_of(120);
                 let alive = this
                     .update(cx, |this, cx| {
                         this.drain_events();
                         if refresh {
                             let _ = this.cmd_tx.send(Cmd::Refresh);
-                        } else if poll && !this.awaiting && this.selected.is_some() {
-                            if this.cmd_tx.send(Cmd::Poll).is_ok() {
-                                this.awaiting = true;
-                            }
+                        } else if poll
+                            && !this.awaiting
+                            && this.selected.is_some()
+                            && this.cmd_tx.send(Cmd::Poll).is_ok()
+                        {
+                            this.awaiting = true;
                         }
                         cx.notify();
                     })
@@ -542,6 +758,29 @@ impl Root {
                     }
                 }
                 Ev::Status(s) => self.status = s,
+                Ev::NeedApiKeys => {
+                    self.login_step = Some(LoginStep::ApiId);
+                    self.login_api_id = None;
+                    self.input.clear();
+                }
+                Ev::NeedPhone => {
+                    self.login_step = Some(LoginStep::Phone);
+                    self.input.clear();
+                }
+                Ev::NeedCode { delivery, resend } => {
+                    self.login_step = Some(LoginStep::Code { delivery, resend });
+                    self.input.clear();
+                }
+                Ev::NeedPassword => {
+                    self.login_step = Some(LoginStep::Password);
+                    self.input.clear();
+                }
+                Ev::LoggedIn => {
+                    self.login_step = None;
+                    self.login_api_id = None;
+                    self.input.clear();
+                    self.status = "logged in".into();
+                }
             }
         }
         if any {
@@ -554,6 +793,7 @@ impl Root {
     /// until tapped, code runs get the resolved mono face. `spans`
     /// are rebased to `text` and paired with their original start —
     /// the spoiler reveal key.
+    #[allow(clippy::too_many_arguments)]
     fn rich_text(
         &self,
         msg_id: i32,
@@ -670,7 +910,7 @@ impl Root {
         text.on_click(clickables, move |ix, _window, cx| match &acts[ix] {
             Act::Url(url) => cx.open_url(url),
             Act::Spoiler(msg, span) => {
-                let _ = view.update(cx, |this, cx| {
+                view.update(cx, |this, cx| {
                     this.revealed.insert((*msg, *span));
                     cx.notify();
                 });
@@ -695,6 +935,7 @@ impl Root {
     }
 
     /// `split_math` output → renderable elements for one message.
+    #[allow(clippy::too_many_arguments)]
     fn msg_blocks(
         &self,
         m: &TopicMessage,
@@ -769,22 +1010,104 @@ impl Root {
         self.input.clear();
     }
 
+    /// Advance the onboarding form. The worker validates again; local
+    /// validation here only prevents obviously incomplete submissions.
+    fn submit_login(&mut self) {
+        let value = self.input.trim().to_string();
+        let Some(step) = self.login_step.clone() else {
+            return;
+        };
+        match step {
+            LoginStep::ApiId => {
+                if value.parse::<i32>().ok().is_some_and(|v| v > 0) {
+                    self.login_api_id = Some(value);
+                    self.input.clear();
+                    self.login_step = Some(LoginStep::ApiHash);
+                    self.status = "now paste the API hash".into();
+                } else {
+                    self.status = "api_id must be a positive number".into();
+                }
+            }
+            LoginStep::ApiHash => {
+                let Some(api_id) = self.login_api_id.clone() else {
+                    self.login_step = Some(LoginStep::ApiId);
+                    return;
+                };
+                if value.is_empty() {
+                    self.status = "api_hash cannot be empty".into();
+                    return;
+                }
+                let _ = self.cmd_tx.send(Cmd::Configure {
+                    api_id,
+                    api_hash: value,
+                });
+                self.input.clear();
+                self.login_step = Some(LoginStep::Busy);
+                self.status = "saving API credentials…".into();
+            }
+            LoginStep::Phone => {
+                if value.is_empty() {
+                    return;
+                }
+                let _ = self.cmd_tx.send(Cmd::LoginPhone(value));
+                self.input.clear();
+                self.login_step = Some(LoginStep::Busy);
+                self.status = "sending login code…".into();
+            }
+            LoginStep::Code { .. } => {
+                if value.is_empty() {
+                    return;
+                }
+                let _ = self.cmd_tx.send(Cmd::LoginCode(value));
+                self.input.clear();
+                self.login_step = Some(LoginStep::Busy);
+                self.status = "checking login code…".into();
+            }
+            LoginStep::Password => {
+                if value.is_empty() {
+                    return;
+                }
+                let _ = self.cmd_tx.send(Cmd::LoginPassword(value));
+                self.input.clear();
+                self.login_step = Some(LoginStep::Busy);
+                self.status = "checking 2FA password…".into();
+            }
+            LoginStep::Busy => {}
+        }
+    }
+
     fn on_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        let onboarding = self.login_step.is_some();
         match ks.key.as_str() {
             "backspace" => {
                 self.input.pop();
             }
-            "enter" => self.send_input(),
+            "enter" => {
+                if onboarding {
+                    self.submit_login();
+                } else {
+                    self.send_input();
+                }
+            }
             "escape" => self.input.clear(),
-            "up" => self.move_selection(-1, cx),
-            "down" => self.move_selection(1, cx),
-            "r" if ks.modifiers.control || ks.modifiers.platform => {
+            "up" if !onboarding => self.move_selection(-1, cx),
+            "down" if !onboarding => self.move_selection(1, cx),
+            "r" if !onboarding && (ks.modifiers.control || ks.modifiers.platform) => {
                 let _ = self.cmd_tx.send(Cmd::Refresh);
+            }
+            "v" if (ks.modifiers.control || ks.modifiers.platform)
+                && !matches!(self.login_step, Some(LoginStep::Busy)) =>
+            {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    self.input.push_str(&text);
+                }
             }
             _ => {
                 let m = &ks.modifiers;
-                if !(m.control || m.platform || m.alt) {
+                if !(m.control || m.platform || m.alt)
+                    && !matches!(self.login_step, Some(LoginStep::Busy))
+                {
                     if let Some(c) = &ks.key_char {
                         self.input.push_str(c);
                     }
@@ -835,6 +1158,117 @@ impl Render for Root {
         let text_style = window.text_style();
         let view = cx.entity();
         let chip_chosen = rgb(0x20304a);
+
+        if let Some(step) = self.login_step.clone() {
+            let (title, description, placeholder, secret): (&str, String, &str, bool) = match &step {
+                LoginStep::ApiId => (
+                    "Connect Verity to Telegram",
+                    "Paste the API ID from my.telegram.org → API development tools.".to_string(),
+                    "API ID",
+                    false,
+                ),
+                LoginStep::ApiHash => (
+                    "Connect Verity to Telegram",
+                    "Now paste the API hash from the same Telegram page. It is stored locally in ~/verity/config.toml.".to_string(),
+                    "API hash",
+                    true,
+                ),
+                LoginStep::Phone => (
+                    "Log in to Telegram",
+                    "Enter your phone number in international format, including the leading +.".to_string(),
+                    "+15551234567",
+                    false,
+                ),
+                LoginStep::Code { delivery, resend } => (
+                    "Check Telegram",
+                    match resend {
+                        Some(next) => format!(
+                            "Telegram sent the login code via {delivery}. Type 'resend' to send it again via {next}."
+                        ),
+                        None => format!("Telegram sent the login code via {delivery}."),
+                    },
+                    "Login code",
+                    false,
+                ),
+                LoginStep::Password => (
+                    "Two-factor authentication",
+                    "Enter your Telegram 2FA password. It is used only for this login.".to_string(),
+                    "2FA password",
+                    true,
+                ),
+                LoginStep::Busy => (
+                    "Working",
+                    "Verity is talking to Telegram.".to_string(),
+                    "working…",
+                    false,
+                ),
+            };
+            let busy = matches!(step, LoginStep::Busy);
+            let typed = if secret {
+                "•".repeat(self.input.chars().count())
+            } else {
+                self.input.clone()
+            };
+            let input_line = if busy {
+                self.status.clone()
+            } else if typed.is_empty() {
+                placeholder.to_string()
+            } else {
+                format!("{typed}▌")
+            };
+
+            return div()
+                .id("root")
+                .track_focus(&self.focus_handle)
+                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
+                    this.on_key(ev, cx);
+                }))
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(black())
+                .text_color(text)
+                .child(
+                    div()
+                        .w(px(440.0))
+                        .bg(composer_bg)
+                        .border_1()
+                        .border_color(hairline)
+                        .rounded_xl()
+                        .p_6()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .child(
+                            div()
+                                .text_xl()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(title),
+                        )
+                        .child(div().text_sm().text_color(dim).child(description))
+                        .child(
+                            div()
+                                .h(px(48.0))
+                                .px_4()
+                                .rounded_lg()
+                                .bg(black())
+                                .border_1()
+                                .border_color(if busy { hairline } else { accent })
+                                .flex()
+                                .items_center()
+                                .text_color(if typed.is_empty() || busy { dim } else { text })
+                                .child(input_line),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(dim)
+                                .child("Enter continues · Ctrl/Cmd+V pastes · Esc clears"),
+                        )
+                        .child(div().text_xs().text_color(dim).child(self.status.clone())),
+                );
+        }
 
         // Compile any new formulas once — render() runs on every
         // notify, so typst work must not happen inside the tree walk.

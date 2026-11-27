@@ -38,6 +38,36 @@ struct PendingCode {
     next_type: Option<tl::enums::auth::CodeType>,
 }
 
+/// Public, stepwise login challenge for GUIs. The code hash stays
+/// opaque inside the core; the display strings tell the user where Telegram
+/// delivered the code and what channel a resend would use.
+pub struct LoginChallenge {
+    pending: PendingCode,
+    pub delivery: String,
+    pub next_delivery: Option<String>,
+}
+
+impl From<PendingCode> for LoginChallenge {
+    fn from(pending: PendingCode) -> Self {
+        Self {
+            delivery: describe_code_type(&pending.code_type),
+            next_delivery: pending
+                .next_type
+                .as_ref()
+                .map(describe_next_type)
+                .map(str::to_string),
+            pending,
+        }
+    }
+}
+
+/// Result of submitting a Telegram login code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginCodeResult {
+    Done,
+    PasswordNeeded,
+}
+
 impl From<tl::types::auth::SentCode> for PendingCode {
     fn from(c: tl::types::auth::SentCode) -> Self {
         Self {
@@ -568,6 +598,69 @@ impl Tg {
                     channels: Vec::new(),
                 }));
         }
+        Ok(())
+    }
+
+    /// Start a stepwise login flow: send the login code and return
+    /// the challenge a UI needs for `login_submit_code`.
+    pub async fn login_send_code(&self, phone: &str) -> Result<LoginChallenge> {
+        self.send_code(phone).await.map(LoginChallenge::from)
+    }
+
+    /// Re-deliver the login code through Telegram's next available channel.
+    pub async fn login_resend_code(
+        &self,
+        phone: &str,
+        challenge: &LoginChallenge,
+    ) -> Result<LoginChallenge> {
+        self.resend_code(phone, &challenge.pending.phone_code_hash)
+            .await
+            .map(LoginChallenge::from)
+    }
+
+    /// Submit the code Telegram sent. `PasswordNeeded` means the account
+    /// has two-factor authentication; finish with `login_submit_password`.
+    pub async fn login_submit_code(
+        &self,
+        phone: &str,
+        challenge: &LoginChallenge,
+        code: &str,
+    ) -> Result<LoginCodeResult> {
+        match self
+            .client
+            .invoke(&tl::functions::auth::SignIn {
+                phone_number: phone.to_string(),
+                phone_code_hash: challenge.pending.phone_code_hash.clone(),
+                phone_code: Some(code.trim().to_string()),
+                email_verification: None,
+            })
+            .await
+        {
+            Ok(tl::enums::auth::Authorization::Authorization(a)) => {
+                self.complete_login(a).await?;
+                Ok(LoginCodeResult::Done)
+            }
+            Ok(tl::enums::auth::Authorization::SignUpRequired(_)) => Err(Error::Mtproto(
+                "this number isn't registered on Telegram".into(),
+            )),
+            Err(e) if e.is("SESSION_PASSWORD_NEEDED") => Ok(LoginCodeResult::PasswordNeeded),
+            Err(e) if e.is("PHONE_CODE_*") => Err(Error::Mtproto("wrong code".into())),
+            Err(e) => Err(Error::Mtproto(format!("sign in: {e}"))),
+        }
+    }
+
+    /// Finish a login after Telegram reports `SESSION_PASSWORD_NEEDED`.
+    pub async fn login_submit_password(&self, password: &str) -> Result<()> {
+        let pw_info: tl::types::account::Password = self
+            .client
+            .invoke(&tl::functions::account::GetPassword {})
+            .await
+            .map_err(|e| Error::Mtproto(format!("2fa: {e}")))?
+            .into();
+        self.client
+            .check_password(PasswordToken::new(pw_info), password)
+            .await
+            .map_err(|e| Error::Mtproto(format!("2fa: {e}")))?;
         Ok(())
     }
 
