@@ -1194,6 +1194,63 @@ fn pending_prefix(bot_name: &str) -> String {
     format!("pending:{bot_name}:")
 }
 
+/// Model for this turn: trivial prompts take the fast lane —
+/// `VERITY_FAST_MODEL` replaces whatever the bot/provider is
+/// configured with for this turn only. Real work keeps the configured
+/// model (None → the provider spec's own default).
+fn turn_model(configured: &Option<String>, text: &str) -> Option<String> {
+    if quick_prompt(text) {
+        fast_model().or_else(|| configured.clone())
+    } else {
+        configured.clone()
+    }
+}
+
+/// `VERITY_FAST_MODEL` names the fast-lane model; `off`/`none`/empty
+/// disables the lane (every turn uses the configured model). Default
+/// `swe-2-flash-medium` — free and quick to first token.
+fn fast_model() -> Option<String> {
+    match std::env::var("VERITY_FAST_MODEL") {
+        Ok(v) => {
+            let v = v.trim();
+            (!v.is_empty() && !matches!(v, "off" | "none" | "None")).then(|| v.to_string())
+        }
+        Err(_) => Some("swe-2-flash-medium".into()),
+    }
+}
+
+/// Is this prompt clearly chitchat? Deliberately conservative — only
+/// short, single-line text with no markers, code, URLs, paths, or task
+/// vocabulary qualifies. A false negative just means the turn runs the
+/// full model, same as always; a false positive hands real work to the
+/// cheap model.
+fn quick_prompt(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty()
+        || t.chars().count() > 120
+        || t.contains('\n')
+        || t.starts_with('/')
+        || t.contains(":::")
+        || t.contains("```")
+        || t.contains("http")
+        || t.contains("www.")
+        || t.contains('/') // file paths, incl. the attachment note
+    {
+        return false;
+    }
+    let lower = t.to_lowercase();
+    // Vocabulary that implies tools, files, git, or state changes.
+    const HARD: &[&str] = &[
+        "build", "fix", "implement", "port", "refactor", "deploy", "debug", "commit", "push",
+        "merge", "review", "compile", "install", "remember", "backup", "restart", "shutdown",
+        "spawn", "tell ", "send", "snap", "test", " pr", "git", "code", "write", "creat",
+        "delete", "check", "look", "search", "find", "read", "open", "run ", "update",
+        "upgrade", "edit", "change", "make ", "do it", "try", "add ", "remove", "show",
+        "list", "download", "upload", "fetch", "clone", "pull",
+    ];
+    !HARD.iter().any(|k| lower.contains(k))
+}
+
 /// One turn of agent work for `bot` in `chat_id` (the owner's DM):
 /// context → harness → markers → memory, helpers, tells → rich reply.
 /// Shared by human turns (depth 0, via `handle_turn`) and `tell`-routed
@@ -1253,7 +1310,7 @@ async fn do_turn(
         peers,
         first_contact,
         cwd: std::env::current_dir().unwrap_or_else(|_| "/".into()),
-        model: bot.model.clone(),
+        model: turn_model(&bot.model, text),
         activity,
     };
 
@@ -1502,6 +1559,37 @@ async fn find_bot(db: &Path, name: &str) -> Option<Bot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_lane_takes_only_chitchat() {
+        for t in [
+            "hi",
+            "hey 👋",
+            "what's 2+2?",
+            "lol",
+            "good morning, how are you?",
+            "thanks!",
+            "what's the capital of France",
+        ] {
+            assert!(quick_prompt(t), "{t} should take the fast lane");
+        }
+        for t in [
+            "port chromium to rust",
+            "fix the bug in bridge.rs",
+            "can you check disk space",
+            "send a photo",
+            "remember that I like pizza",
+            "tell Healthity to say hi",
+            "hi\nwhat's up",
+            "look at /data/home/verity/src",
+            "https://example.com",
+            "what about this: ```code```",
+            &"x".repeat(200),
+            "",
+        ] {
+            assert!(!quick_prompt(t), "{t} should keep the full model");
+        }
+    }
 
     #[test]
     fn strips_remember_markers() {

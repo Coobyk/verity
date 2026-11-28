@@ -327,8 +327,24 @@ impl AcpHarness {
             .argv
             .split_first()
             .ok_or_else(|| Error::Harness("empty acp: provider spec".into()))?;
+        // `ctx.model` overrides the spec's --model — the bridge picks a
+        // faster model for trivial turns.
+        let mut args: Vec<String> = args.to_vec();
+        if let Some(m) = &ctx.model {
+            let mut i = 0;
+            while i < args.len() {
+                if args[i] == "--model" && i + 1 < args.len() {
+                    args.drain(i..=i + 1);
+                } else if args[i].starts_with("--model=") {
+                    args.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            args.extend(["--model".into(), m.clone()]);
+        }
         let mut cmd = Command::new(bin);
-        cmd.args(args)
+        cmd.args(&args)
             .current_dir(&ctx.cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
