@@ -779,6 +779,17 @@ impl Tg {
         Err(Error::Mtproto(format!("no dialog for user {user_id}")))
     }
 
+    /// Resolve a public @username to a peer, even when no dialog
+    /// exists yet — the bootstrap path for brand-new bot DMs.
+    pub async fn resolve_username_peer(&self, username: &str) -> Result<Option<PeerRef>> {
+        let peer = self
+            .client
+            .resolve_username(username)
+            .await
+            .map_err(|e| Error::Mtproto(format!("resolve: {e}")))?;
+        Ok(peer.as_ref().map(PeerRef::from))
+    }
+
     /// Every dialog in the account's chat list — the GUI's sidebar:
     /// user DMs (bots included), groups and channels alike.
     pub async fn list_dialogs(&self) -> Result<Vec<DialogInfo>> {

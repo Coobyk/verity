@@ -64,7 +64,7 @@ const RESTORE_SCAN: usize = 500;
 /// the Bot API's 20MB getFile ceiling, and dev trees don't help a
 /// restored machine run (the repo re-clones, the binary ships).
 fn skip(path: &Path, name: &str, skip_dirs: &[&str]) -> bool {
-    (path.is_dir() && (name == "target" || skip_dirs.contains(&name)))
+    (path.is_dir() && (name == "target" || name == "math-cache" || skip_dirs.contains(&name)))
         || name.ends_with("-wal")
         || name.ends_with("-shm")
         || name.ends_with(".part")
@@ -1049,6 +1049,7 @@ mod tests {
         for d in [
             home.join("sub"),
             home.join("target/release"),
+            home.join("math-cache"),
             user_home.join(".config/systemd/user"),
         ] {
             std::fs::create_dir_all(&d).unwrap();
@@ -1057,6 +1058,7 @@ mod tests {
         std::fs::write(home.join("state.sqlite"), "db").unwrap();
         std::fs::write(home.join("state.sqlite-wal"), "sidecar").unwrap();
         std::fs::write(home.join("sub/x.txt"), "x").unwrap();
+        std::fs::write(home.join("math-cache/formula.png"), "derived").unwrap();
         std::fs::write(home.join("target/big.bin"), "build output").unwrap();
         std::fs::write(home.join("target/release/verity"), "binary").unwrap();
         std::fs::write(home.join("x.part"), "temp").unwrap();
@@ -1104,6 +1106,7 @@ mod tests {
         assert!(got.contains(&"sub/x.txt".to_string()));
         assert!(got.contains(&"state.sqlite".to_string()));
         assert!(!got.iter().any(|n| n.contains("big.bin")));
+        assert!(!got.iter().any(|n| n.contains("math-cache")));
         assert!(!got
             .iter()
             .any(|n| n.ends_with("-wal") || n.ends_with(".part")));

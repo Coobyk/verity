@@ -26,16 +26,35 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Lint core crates
-        run: cargo clippy -p verity-core -p verity-cli --tests -- -D warnings
+        run: cargo clippy -p verity-core -p verity-cli -p verity-winui-host --tests -- -D warnings
 
       - name: Test core crates
-        run: cargo test -p verity-core -p verity-cli
+        run: cargo test -p verity-core -p verity-cli -p verity-winui-host
 
       - name: Test avatar renderer
         run: cargo test -p verity-pfp
 
       - name: Check WASM avatar crate
         run: cargo check -p verity-pfp-wasm
+
+  winui:
+    name: WinUI 3 Windows app
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Build Rust desktop host
+        run: cargo build -p verity-winui-host
+
+      - name: Restore WinUI project
+        run: dotnet restore windows\Verity.WinUI\Verity.WinUI.csproj -p:Platform=x64 -r win-x64
+
+      - name: Build WinUI project
+        run: dotnet build windows\Verity.WinUI\Verity.WinUI.csproj -p:Platform=x64 --no-restore
 
   android:
     name: Android debug APK

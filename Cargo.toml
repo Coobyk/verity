@@ -6,6 +6,7 @@ members = [
     "crates/verity-pfp",
     "crates/verity-pfp-wasm",
     "crates/verity-gui",
+    "crates/verity-winui-host",
     "crates/verity-math",
 ]
 

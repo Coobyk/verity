@@ -16,8 +16,8 @@ and any CLI implementing the Agent Client Protocol can be plugged in with
 - optional `/report` self-reflection posts written by the bots themselves
 - roster snapshots, backups, restores, and account transfer through
   encrypted setup keys
-- avatar generation, a web/WASM avatar demo, an Android TDLib client, and
-  a currently shelved GPUI desktop client
+- avatar generation, a web/WASM avatar demo, an Android TDLib client, a
+  native WinUI 3 Windows client, and a currently shelved GPUI desktop client
 
 ## Quick start
 
@@ -28,15 +28,19 @@ Bot tokens come from [@BotFather](https://t.me/BotFather).
 ```bash
 cargo build --release -p verity-cli
 
-# one-time account login; writes ~/verity/config.toml and tg.session
-verity login
-
-# register a bot token under the teammate name "scout"
-verity bot new scout --token <botfather-token>
+# interactive wizard: API credentials, login, harness, creates your
+# first bot via @BotFather. Also runs automatically on a bare `verity`
+# when nothing is configured yet.
+verity setup
 
 # wake the bot and talk to it
 verity say scout "say hello"
 ```
+
+Prefer manual control? The underlying commands are still there:
+`verity config` (API credentials), `verity login`, `verity bot create`
+(make a bot through @BotFather as your user) and `verity bot new`
+(register an existing token).
 
 `login` uses an isolated `~/verity/pi` home on first use so it can install
 the `pi` coding agent and the Telegram skills without changing your normal
@@ -196,6 +200,9 @@ companion/control API, but it is not required by the Android app.
 ## Other pieces
 
 - `web/` — browser demo for the deterministic avatar renderer
+- `windows/` — native WinUI 3 Windows shell; see
+  [windows/README.md](windows/README.md)
+- `crates/verity-winui-host` — Rust JSON-lines backend used by the WinUI shell
 - `crates/verity-gui` — shelved GPUI desktop client
 - `crates/verity-math` — Typst/mitex LaTeX-to-PNG renderer, exposed to
   Android through JNI
@@ -204,9 +211,11 @@ companion/control API, but it is not required by the Android app.
 
 ```bash
 cargo fmt
-cargo test -p verity-core -p verity-cli
+cargo test -p verity-core -p verity-cli -p verity-winui-host
 cargo test -p verity-pfp
 cargo check -p verity-pfp-wasm
 ```
 
-A JSON API harness and mock Bot API tests are included in `verity-core`.
+On Windows, `powershell -ExecutionPolicy Bypass -File windows\build.ps1`
+builds the WinUI shell and its Rust host. A JSON API harness and mock Bot
+API tests are included in `verity-core`.

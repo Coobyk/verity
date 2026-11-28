@@ -184,6 +184,9 @@ is especially important on Windows.
 - `crates/verity-core/src/api.rs` is an optional localhost/bearer-token
   JSON control API for companion tooling.
 - `web/` demonstrates the deterministic avatar renderer through WASM.
+- `windows/Verity.WinUI` is the native WinUI 3 Windows shell. It owns only
+  presentation and talks to `crates/verity-winui-host` over newline-delimited
+  JSON; the host owns Telegram, sessions, configuration, and roster state.
 - `crates/verity-gui` is a shelved GPUI desktop client.
 - `crates/verity-math` renders LaTeX through Typst/mitex and exposes the
   renderer to Android through JNI.

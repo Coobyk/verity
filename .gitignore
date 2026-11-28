@@ -10,3 +10,9 @@ media/
 android/.gradle/
 android/local.properties
 android/**/build/
+
+# WinUI / .NET build output
+windows/Verity.WinUI/bin/
+windows/Verity.WinUI/obj/
+windows/Verity.WinUI/AppPackages/
+windows/Verity.WinUI/BundleArtifacts/

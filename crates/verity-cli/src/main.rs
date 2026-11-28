@@ -1,5 +1,7 @@
 //! verity — manage teammate bots you chat with in 1:1 Telegram DMs.
 
+mod setup;
+
 use std::io::{BufRead, Write};
 
 use anyhow::{bail, Context, Result};
@@ -14,11 +16,7 @@ use verity_core::mtproto::Tg;
 use verity_core::store::{Bot, Store};
 
 #[derive(Parser)]
-#[command(
-    name = "verity",
-    about = "Named teammate bots in Telegram DMs",
-    arg_required_else_help = true
-)]
+#[command(name = "verity", about = "Named teammate bots in Telegram DMs")]
 struct Cli {
     /// Set up this machine from a `vsk1.` setup key: downloads the
     /// encrypted archive it points at and restores everything —
@@ -31,6 +29,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Interactive first-run wizard: API credentials, Telegram login,
+    /// harness choice, and bot creation end to end
+    Setup,
     /// Set api_id/api_hash (my.telegram.org) and the harness binary
     Config {
         #[arg(long)]
@@ -260,11 +261,15 @@ enum BotCmd {
     },
 }
 
-fn prompt(label: &str) -> Result<String> {
+pub(crate) fn prompt(label: &str) -> Result<String> {
     print!("{label}: ");
     std::io::stdout().flush()?;
     let mut s = String::new();
-    std::io::stdin().lock().read_line(&mut s)?;
+    // EOF (piped input running out, Ctrl-D/Ctrl-Z) must not become an
+    // endless series of empty answers in interactive retry loops.
+    if std::io::stdin().lock().read_line(&mut s)? == 0 {
+        bail!("input closed");
+    }
     Ok(s.trim().to_string())
 }
 
@@ -323,7 +328,7 @@ async fn dm_peer(tg: &Tg, bot: &Bot) -> Result<grammers_session::defs::PeerRef> 
 
 /// Render a BallsMaker avatar for `bot`, save pfp-<name>.png next to
 /// the db, and upload it via the Bot API.
-async fn set_pfp(bot: &Bot, seed: u64, hue: Option<f64>) -> Result<()> {
+pub(crate) async fn set_pfp(bot: &Bot, seed: u64, hue: Option<f64>) -> Result<()> {
     let png = verity_core::pfp::render_opts(seed, 512, hue)?;
     let out = Config::db_path()?
         .parent()
@@ -336,7 +341,7 @@ async fn set_pfp(bot: &Bot, seed: u64, hue: Option<f64>) -> Result<()> {
 }
 
 /// Entropy for `verity pfp random` — /dev/urandom, time as fallback.
-fn rand_u64() -> u64 {
+pub(crate) fn rand_u64() -> u64 {
     use std::io::Read;
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         let mut b = [0u8; 8];
@@ -404,10 +409,23 @@ async fn run() -> Result<()> {
         }
         return Ok(());
     }
-    // Unreachable on a bare `verity` — arg_required_else_help exits
-    // before this — but a key-less fallthrough stays impossible.
-    let Some(cmd) = cli.cmd else { return Ok(()) };
+    // Bare `verity`: on an unconfigured machine the wizard is the
+    // helpful default; once set up, print help like any other CLI.
+    let Some(cmd) = cli.cmd else {
+        if setup::needs_setup() {
+            println!("nothing configured yet — starting setup (use `verity setup` to re-run it)\n");
+            return setup::run().await;
+        }
+        use clap::CommandFactory;
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    };
     match cmd {
+        Cmd::Setup => {
+            setup::run().await?;
+        }
+
         Cmd::Config {
             api_id,
             api_hash,
