@@ -973,6 +973,88 @@ impl Tg {
         Ok(found)
     }
 
+    /// Send `text` to `peer` (a `/start` first to wake the bot) and
+    /// wait for incoming media — made for downloader bots: the reply
+    /// is a photo, a file, or a grouped album. Downloads each into
+    /// `dir` as `NN.<ext>` and returns the paths. Errors on timeout.
+    pub async fn fetch_media_reply(
+        &self,
+        peer: PeerRef,
+        text: &str,
+        dir: &Path,
+        secs: u64,
+    ) -> Result<Vec<std::path::PathBuf>> {
+        use std::time::{Duration, Instant};
+        let _ = self.send_message(peer, "/start").await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let after = self.last_msg_id(peer).await;
+        self.send_message(peer, text).await?;
+
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        let mut want: Vec<Message> = Vec::new();
+        let mut group: Option<i64> = None;
+        let mut last_seen = Instant::now();
+        while Instant::now() < deadline {
+            let mut it = self.client.iter_messages(peer);
+            while let Some(m) = it
+                .next()
+                .await
+                .map_err(|e| Error::Mtproto(format!("messages: {e}")))?
+            {
+                if m.id() <= after {
+                    break;
+                }
+                if m.outgoing() || m.media().is_none() {
+                    continue;
+                }
+                if want.iter().any(|w| w.id() == m.id()) {
+                    continue;
+                }
+                match group {
+                    None => {
+                        group = m.grouped_id();
+                        want.push(m.clone());
+                        last_seen = Instant::now();
+                    }
+                    Some(g) if m.grouped_id() == Some(g) => {
+                        want.push(m.clone());
+                        last_seen = Instant::now();
+                    }
+                    _ => {}
+                }
+            }
+            // once media landed, give the album a short window to fill
+            if !want.is_empty() && last_seen.elapsed() > Duration::from_secs(4) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        }
+        if want.is_empty() {
+            return Err(Error::Mtproto("timed out waiting for media".into()));
+        }
+
+        std::fs::create_dir_all(dir)?;
+        want.sort_by_key(|m| m.id());
+        let mut paths = Vec::new();
+        for (i, m) in want.iter().enumerate() {
+            let ext = match m.media() {
+                Some(Media::Document(d)) => d
+                    .name()
+                    .rsplit('.')
+                    .next()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "bin".into()),
+                _ => "jpg".into(),
+            };
+            let path = dir.join(format!("{:02}.{ext}", i + 1));
+            m.download_media(&path)
+                .await
+                .map_err(|e| Error::Mtproto(format!("download: {e}")))?;
+            paths.push(path);
+        }
+        Ok(paths)
+    }
+
     /// Wait for the next message from `peer` with id > `after_id`.
     /// Polls `iter_messages` (newest-first) up to ~30s.
     async fn wait_reply(&self, peer: PeerRef, after_id: i32) -> Result<String> {
